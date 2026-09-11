@@ -1,0 +1,25 @@
+# Python environments
+.venv/
+
+# Large generated artifacts
+/data/
+/models/
+/outputs/
+/transformers/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# RULER outputs (also covered by RULER/.gitignore)
+RULER/scripts/benchmark_root/
+RULER/scripts/data/synthetic/json/PaulGrahamEssays.json
