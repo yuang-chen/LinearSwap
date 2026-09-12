@@ -65,6 +65,28 @@ def tile_vec(v: torch.Tensor, reps: int) -> torch.Tensor:
     return v.repeat_interleave(reps, dim=0)
 
 
+def init_lowrank_tiled(seq: nn.Sequential, rows: torch.Tensor, reps: int, name: str = "") -> None:
+    """Initialise a rank-r MLP ``Linear(D->r) -> Linear(r->H*reps)`` (no bias) so that it
+    computes ``tile_rows(rows, reps) @ x`` exactly: ``W1[:H] = rows`` and ``W2`` is the 0/1
+    head selector.  Requires ``r >= H``.  The unused ``r - H`` bottleneck rows keep their
+    random init but have zero output weights, so they are invisible at init yet receive
+    gradient (through ``W2[:, H:]``) and can be used by fine-tuning."""
+    w1, w2 = seq[0], seq[-1]
+    H = rows.shape[0]
+    r = w1.weight.shape[0]
+    if r < H:
+        raise ValueError(f"{name}: bottleneck {r} < {H} rows; the tiled projection is not representable")
+    if w2.weight.shape[0] != H * reps:
+        raise ValueError(f"{name}: output dim {w2.weight.shape[0]} != {H}*{reps}")
+    with torch.no_grad():
+        w1.weight[:H].copy_(rows.to(w1.weight.dtype))
+        sel = torch.zeros(H * reps, r, dtype=w2.weight.dtype, device=w2.weight.device)
+        sel[torch.arange(H * reps), torch.arange(H * reps) // reps] = 1.0
+        w2.weight.copy_(sel)
+        if getattr(w2, "bias", None) is not None:
+            w2.bias.zero_()
+
+
 def copy_qkv_and_conv(layer: nn.Module, src: dict) -> None:
     """Split the fused Qwen q/k/v projection and depthwise conv into the separate
     ``q_proj/k_proj/v_proj`` and ``q_conv1d/k_conv1d/v_conv1d`` modules used by

@@ -13,17 +13,28 @@ Everything is driven by a kernel registry, so adding a kernel is one file and
 the same verification, training and evaluation tooling applies to it.
 
 ```
-kernel name    layer (flash-linear-attention)   init from GDN                         new params
-gdn            GatedDeltaNet                    exact copy (control)                  0.59M
-gdn2           GatedDeltaNet2                   scalar beta/decay tiled → b/w/f gates 113M
-kda            KimiDeltaAttention               scalar decay tiled → low-rank f_proj  7.4M
-kda_fullgate   KimiDeltaAttention               … with a dense f_proj                 38M
-deltanet       DeltaNet                         decay dropped (NOT exact)             0.29M
+kernel name    recurrence (flash-linear-attention kernel)      init from GDN                          new params  exact
+gdn            Gated DeltaNet                                  weight copy (control)                  0.59M       yes
+gdn2           Gated DeltaNet-2                                scalar beta/decay tiled → b/w/f gates  113M        yes
+kda            Kimi Delta Attention                            scalar decay tiled → low-rank f_proj   7.4M        yes
+kda_fullgate   Kimi Delta Attention                            … with a dense f_proj                  38M         yes
+rwkv7          RWKV-7 generalised delta rule (DPLR)            decay/beta tiled, removal key = key    14M         yes
+mamba2         Mamba-2 SSD (scalar decay, no delta rule)       shared weights copied, erase dropped   0.30M       no
+deltanet       DeltaNet (delta rule, no decay)                 shared weights copied, decay dropped   0.29M       no
 ```
+
+Kernels marked *exact* reproduce the pretrained model at step 0 and go
+straight to SFT.  The others cannot represent the pretrained layer; for them
+the pipeline first **distils** the swapped model from the original (layer-wise
+output matching, then end-to-end KL) and only then fine-tunes.  Mamba-1 and
+Mamba-3 are not included: their kernels only exist in `mamba_ssm`, whose
+current release needs a newer Triton than torch 2.6 allows and breaks
+`flash-linear-attention` when installed here (see docs/framework.md).
+
 
 ## Layout
 
-- `linswap.py` — the command line: `verify`, `posttrain`, `evaluate`, `run` (all three), `kernels`.
+- `linswap.py` — the command line: `verify`, `distill`, `posttrain`, `evaluate`, `run` (the whole chain), `kernels`.
 - `src/qwen_linswap/` — the framework: kernel registry, the Qwen3.5 backbone with pluggable linear layers, weight loading, data and SFT utilities. Kernels live in `src/qwen_linswap/kernels/`, one file each; that directory is the extension point. The workflow stages live in `src/qwen_linswap/pipeline/`.
 - `tests/test_kernels.py` — regression test over all registered kernels.
 - `RULER/` — the RULER benchmark, vendored with a wrapper for swapped models.
@@ -31,8 +42,9 @@ deltanet       DeltaNet                         decay dropped (NOT exact)       
 
 ## Workflow
 
-The workflow is **verify → posttrain → evaluate**; each stage is one command,
-and `run` chains them for one kernel.
+The workflow is **verify → (distill) → posttrain → evaluate**; each stage is one
+command, and `run` chains them for one kernel (distilling automatically when
+the kernel's init is not exact).
 
 ```bash
 source .venv/bin/activate
@@ -41,8 +53,12 @@ python tests/test_kernels.py                  # every kernel builds, loads, matc
 # 1. verify: is the swap function preserving?  (the `gdn` baseline column is the bf16/Triton noise floor)
 python linswap.py verify --kernel kda --baseline gdn
 
+# 1b. distill (inexact kernels only): layer-wise alignment + KL against the original model
+python linswap.py distill --kernel mamba2           # -> outputs/mamba2/distill/checkpoint-N
+
 # 2. posttrain: gate-only and full SFT with the standard recipe (SFT data is prepared on first use)
 python linswap.py posttrain --kernel kda            # -> outputs/kda/sft_gate_only, outputs/kda/sft_full
+python linswap.py posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
 
 # 3. evaluate: validation loss + RULER for any set of base swaps / checkpoints, one summary table
 python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \

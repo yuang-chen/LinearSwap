@@ -39,6 +39,7 @@ from .common import (
     copy_output_gate,
     copy_qkv_and_conv,
     get_gdn_source,
+    init_lowrank_tiled,
     mark_hf_initialized,
     tile_rows,
     tile_vec,
@@ -87,16 +88,7 @@ def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
     if isinstance(layer.f_proj, nn.Linear):
         copy_(layer.f_proj.weight, tile_rows(a_w, K), "f_proj")
     else:
-        w1, w2 = layer.f_proj[0], layer.f_proj[1]  # w1: [r, hidden], w2: [H*K, r]
-        r = w1.weight.shape[0]
-        if r < H:
-            raise ValueError(f"f_proj bottleneck {r} < num_v_heads {H}; tiled decay is not representable")
-        with torch.no_grad():
-            w1.weight[:H].copy_(a_w.to(w1.weight.dtype))
-            # rows H: keep their random init (trainable slack, inactive at init)
-            sel = torch.zeros(H * K, r, dtype=w2.weight.dtype, device=w2.weight.device)
-            sel[torch.arange(H * K), torch.arange(H * K) // K] = 1.0
-            w2.weight.copy_(sel)
+        init_lowrank_tiled(layer.f_proj, a_w, K, "f_proj")
 
     copy_(layer.A_log, src["A_log"], "A_log")
     copy_(layer.dt_bias, tile_vec(src["dt_bias"], K), "dt_bias")

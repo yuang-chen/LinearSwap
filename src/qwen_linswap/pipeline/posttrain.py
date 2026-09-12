@@ -36,6 +36,7 @@ def add_args(ap):
     ap.add_argument("--modes", default="gate_only,full", help="comma list of gate_only / full")
     ap.add_argument("--output_dir", default=None, help="default outputs/<kernel>")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
+    ap.add_argument("--init_ckpt", default=None, help="start from this checkpoint (e.g. a distill checkpoint)")
     ap.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     ap.add_argument("--data_max_length", type=int, default=262144, help="length the SFT data is prepared at")
     ap.add_argument("--max_length", type=int, default=131072, help="left-truncate examples to this many tokens")
@@ -96,7 +97,10 @@ def train_one(args, mode, data_dir, out_dir) -> Path:
     device = torch.device("cuda")
     spec = get_kernel(args.kernel)
     print(f"[posttrain] kernel={spec.name} mode={mode} steps={num_steps} -> {out_dir}")
-    model = build_model(args.kernel, base_model_dir=args.base_model_dir, device=device)
+    model = build_model(args.kernel, base_model_dir=args.base_model_dir, device=device,
+                        ckpt_dir=args.init_ckpt)
+    if args.init_ckpt:
+        print(f"  initialised from {args.init_ckpt}")
     model.train()
     model.gradient_checkpointing = True
 

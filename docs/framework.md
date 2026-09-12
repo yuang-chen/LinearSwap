@@ -16,13 +16,16 @@ src/qwen_linswap/
   kernels/gdn2.py      "gdn2"         Gated DeltaNet-2 (scalar beta/decay tiled into b/w/f gates)
   kernels/kda.py       "kda"          Kimi Delta Attention, low-rank per-channel decay gate (default KDA)
                        "kda_fullgate" KDA with a dense decay projection
+  kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
+  kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
   model.py             Qwen3_5LinearSwapModel(cfg, kernel) + SwapCache
   components.py        RMSNorm / GQA / MLP / RoPE;  config.py  QWEN3_5_CONFIG
   load_weights.py      build_model(kernel | ckpt_dir), HF-format and native checkpoint loading
   data.py              SFT data preparation (LongAlign / LongAlpaca / anti-haystack);  sft_utils.py  chunked CE etc.
   pipeline/verify.py     stage 1: function-preservation checks vs HF Qwen3.5
-  pipeline/posttrain.py  stage 2: gate-only / full SFT (prepares data on first use)
+  pipeline/distill.py    stage 1½ (inexact kernels): layer-wise alignment + KL distillation from the original
+  pipeline/posttrain.py  stage 2: gate-only / full SFT (prepares data on first use; --init_ckpt to start from distill)
   pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
   pipeline/run.py        the three stages chained for one kernel
 tests/test_kernels.py  regression test over all registered kernels
@@ -34,6 +37,7 @@ RULER/scripts/pred/model_wrappers.py::QwenLinearSwapModelWrapper, server types q
 ```bash
 source .venv/bin/activate
 python linswap.py verify    --kernel kda --baseline gdn
+python linswap.py distill   --kernel mamba2                      # inexact kernels: outputs/mamba2/distill
 python linswap.py posttrain --kernel kda                         # gate_only + full, outputs/kda/sft_*
 python linswap.py evaluate  --models kda outputs/kda/sft_full/checkpoint-50 --name kda   # outputs/eval/kda/summary.*
 python linswap.py run       --kernel kda                         # all three
@@ -105,6 +109,72 @@ implementation):
 | greedy generation vs HF (20 tokens) | identical | identical |
 | gradients of shared params, KDA vs GDN layer (T=256 / 4096) | rel diff ≤ 1.3 % | – |
 | validation CE at step 0 (10 batches ≤131K) | 1.6914 | 1.6920 (gdn2: 1.6914) |
+
+## RWKV-7 swap (exact)
+
+RWKV-7 (arXiv:2503.14456) uses the generalised delta rule with a
+diagonal-plus-rank-one transition, which FLA exposes as ``chunk_rwkv7`` /
+``chunk_dplr_delta_rule``:  ``S_t = Diag(e^{gk_t}) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T``.
+GDN is the special case ``a_t = k̂ ⊙ e^{g_t}``, ``b_t = -beta_t k̂``, ``k_t = beta_t k̂``,
+``gk_t = g_t``, so the swap is exact.  ``kernels/rwkv7.py`` keeps the RWKV-7
+parameterisation of what the kernel needs — a low-rank per-channel decay
+(``w_lora`` → ``f_proj``), a low-rank per-channel in-context learning rate
+(``a_lora`` → ``b_proj``) and a separately modulated removal key (``k_k``) —
+and Qwen's projections, convolutions and SiLU-gated output norm for the rest
+(token shift, value residual and GroupNorm of RWKV-7 are not used).  FLA's own
+``RWKV7Attention`` layer cannot be used: it fixes ``key_dim = hidden_size`` and
+bounds the per-step decay to ≥ 0.545, which the pretrained decays exceed.
+New parameters: 14M.  ``verify`` puts every check at the ``gdn`` noise level
+(top-1 agreement 1.0 at 8/512/4096 tokens, KL ≤ 1.6e-3, cached decode and
+generation identical).
+
+## Mamba-2 swap (inexact)
+
+Mamba-2's SSD recurrence ``S_t = exp(-Δ_t e^{A_log}) S_{t-1} + Δ_t B_t x_t^T``,
+``y_t = C_t^T S_t + D x_t`` is a scalar-decay linear RNN, i.e. FLA's
+``chunk_simple_gla``; ``kernels/mamba2.py`` builds it with one SSD group per
+head so B/C/x line up with Qwen's k/q/v, copies the decay (identical
+parameterisation to GDN's), gate and output weights, and starts ``D`` at 0.
+What GDN has and Mamba-2 lacks is the delta-rule erase, and Mamba-2 scales the
+write by Δ_t rather than beta_t, so the init is inexact (top-1 agreement with
+the original 0.07 on the test prompt) and the model is distilled first.
+``mamba_ssm`` is not required.
+
+### Mamba-1 and Mamba-3: not available here
+
+Both kernels exist only in ``mamba_ssm`` (selective-scan CUDA kernels for
+Mamba-1, Triton/TileLang kernels for Mamba-3).  Installing ``mamba-ssm``
+2.3.2 replaces torch with a CUDA-13 build, and even a ``--no-deps`` source
+build cannot be imported: the package needs ``triton.set_allocator`` (Triton
+≥ 3.3) while torch 2.6 pins Triton 3.2, and because FLA's ``fla.layers.mamba2``
+imports it at package-import time the broken import takes ``import fla`` down
+with it.  Mamba-1's per-(channel, state) decay also has no FLA equivalent.
+Adding them needs a separate environment (torch ≥ 2.7, Triton ≥ 3.3, FLA
+re-validated) — the kernel spec would then be a thin wrapper around FLA's
+``Mamba``/``Mamba3`` layers plus a partial weight copy, and the distill stage
+applies unchanged.
+
+## Distillation for inexact swaps (`linswap.py distill`)
+
+Teacher: ``gdn`` (exact copy of the original model).  Student: the swapped
+model.  Sequences: the SFT corpus, left-truncated to ``--max_length``
+(default 8192), all positions.
+
+1. **layer** (default 200 steps, lr 1e-4, linear-layer parameters only) —
+   each linear-attention layer of the student receives the teacher's input
+   to the corresponding layer and is trained with MSE to reproduce the
+   teacher layer's output.  All layers train in parallel from teacher
+   activations, so this stage is cheap and does not depend on the rest of
+   the student being right yet.
+2. **kl** (default 300 steps, lr 2e-5, all parameters) — end-to-end
+   ``KL(teacher ‖ student)`` on next-token distributions, computed in
+   2048-token vocabulary chunks with a chunk-wise backward so the full logits
+   are never materialised.
+
+The checkpoint (``outputs/<kernel>/distill/checkpoint-N``) then seeds
+``posttrain --init_ckpt``; ``run`` performs both automatically for kernels
+registered with ``exact_init=False`` and evaluates base, distilled and SFT
+checkpoints.
 
 ## DeltaNet swap (inexact)
 
