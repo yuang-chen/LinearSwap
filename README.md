@@ -106,27 +106,39 @@ validation cross-entropy on 40 held-out examples.  Full tables and discussion in
 | gdn base (exact copy) | – | 1.743 | 100 | 100 | 96.5 |
 | gdn2 base | – | 1.741 | 100 | 100 | 96.25 |
 | kda base | – | 1.742 | 100 | 100 | 95.75 |
+| rwkv7 base | – | 1.743 | 100 | 100 | 96.75 |
 | gdn gate-only 100 | 0.59M | 1.472 | 100 | 100 | 96.25 |
 | kda gate-only 100 | 7.4M | 1.427 | 100 | 100 | 97.5 |
 | kda_fullgate gate-only 100 | 38M | 1.413 | 100 | 98 | 99.0 |
 | gdn2 gate-only 100 | 113M | 1.378 | 100 | 99 | 96.5 |
+| rwkv7 gate-only 100 | 14M | 1.415 | 100 | 99 | 99.5 |
 | gdn full 50 | 752M | 1.388 | 100 | 100 | 99.0 |
 | kda full 50 | 759M | 1.388 | 100 | 100 | 99.5 |
 | gdn2 full 50 | 865M | 1.389 | 100 | 100 | 99.25 |
+| rwkv7 full 50 | 766M | 1.388 | 100 | 100 | 99.0 |
+| mamba2 base (inexact) | – | 6.854 | 0 | 0 | 0 |
+| mamba2 distill (layer 200 + KL 300, 8K) | 752M | 1.729 | 100 | 72 | 53.25 |
+| mamba2 distill → full SFT 50 | 752M | 1.491 | 100 | 77 | 73.5 |
 | deltanet base (inexact) | – | 12.845 | 0 | 0 | 0 |
-| deltanet full 50 (lr 1e-5) | 752M | 8.628 | – | – | – |
-| deltanet full 200 (lr 1e-5) | 752M | 7.174 | – | – | – |
-| deltanet full 200 (lr 1e-4) | 752M | 6.220 | 0 | 0 | 0 |
+| deltanet SFT only, 200 steps (lr 1e-4) | 752M | 6.220 | 0 | 0 | 0 |
+| deltanet distill (layer 200 + KL 300, 8K) | 752M | 2.461 | 0 | 0 | 0 |
+| deltanet distill → full SFT 50 | 752M | 2.092 | 0 | 0 | 0 |
 
 Take-aways: the exact swaps (GDN2, KDA) lose nothing at init; full SFT lands
 on the same loss and retrieval scores for every exact kernel; gate-only SFT is
 where kernels differ, and KDA's per-channel decay gate is a far cheaper
 gate-only handle for multi-value retrieval than GDN2's three dense gates.
-DeltaNet shows what an inexact swap costs: dropping the decay destroys the
-pretrained function (validation CE 12.8, retrieval 0 at init) and 200 full-SFT
-steps at a 10× higher learning rate do not rebuild it (CE 6.2, retrieval still
-0) — inexact swaps need a distillation-style schedule, not the short recipe
-that suffices for exact ones.
+Mamba-2 (no delta-rule erase) is the recoverable inexact swap: distillation
+brings it back to the original model's loss (6.85 → 1.73) and SFT to 1.49,
+still above the exact kernels' 1.39, with single-needle retrieval fully back
+but multi-key / multi-value retrieval at 77 / 73.5 versus 99+ — the erase
+term is what the pretrained backbone uses for those.  DeltaNet shows what an
+inexact swap costs when the missing piece is the decay: dropping the decay destroys the
+pretrained function (validation CE 12.8, retrieval 0 at init).  Plain SFT barely
+helps (CE 6.2 after 200 steps at a 10× learning rate), whereas distillation from
+the original model recovers most of the language modelling loss (2.46, then
+2.09 after SFT) — but 131K-token retrieval stays at 0: without decay the
+recurrent state has no way to forget over such spans.  At short context the distilled model does retrieve — `niah_single_1` / `niah_multikey_1` reach 56 / 36 at 4K tokens (25 samples) and 0 / 24 at 16K — so the failure is specifically the loss of long-range forgetting, not of the mechanism itself.
 
 ## Setup
 

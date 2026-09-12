@@ -226,17 +226,25 @@ error); the KDA backward kernel prints benign Triton 3.2 scheduling warnings.
 | gdn  base (exact copy) | – | 1.7432 | 5.72 |
 | gdn2 base (tiled init) | – | 1.7414 | 5.71 |
 | kda  base (tiled init) | – | 1.7419 | 5.71 |
+| rwkv7 base (tiled init) | – | 1.7430 | 5.71 |
 | gdn  gate-only 100 steps | 0.59M | 1.4720 | 4.36 |
 | kda  gate-only 100 steps | 7.41M | 1.4274 | 4.17 |
 | kda_fullgate gate-only 100 steps | 38.1M | 1.4131 | 4.11 |
 | gdn2 gate-only 100 steps | 113.3M | 1.3776 | 3.97 |
+| rwkv7 gate-only 100 steps | 14.2M | 1.4147 | 4.12 |
 | gdn  full 50 steps | 752M | 1.3884 | 4.01 |
 | kda  full 50 steps | 759M | 1.3884 | 4.01 |
 | gdn2 full 50 steps | 865M | 1.3885 | 4.01 |
+| rwkv7 full 50 steps | 766M | 1.3884 | 4.01 |
+| mamba2 base (inexact init) | – | 6.854 | 948 |
+| mamba2 distill (layer 200 + KL 300 @8K) | 752M | 1.7293 | 5.64 |
+| mamba2 distill → full 50 steps | 752M | 1.4908 | 4.44 |
 | deltanet base (inexact init) | – | 12.845 | 3.8e5 |
 | deltanet full 50 steps, lr 1e-5 | 752M | 8.628 | 5586 |
 | deltanet full 200 steps, lr 1e-5 | 752M | 7.174 | 1305 |
 | deltanet full 200 steps, lr 1e-4 | 752M | 6.220 | 502 |
+| deltanet distill (layer 200 + KL 300 @8K) | 752M | 2.461 | 11.7 |
+| deltanet distill → full 50 steps | 752M | 2.092 | 8.1 |
 
 The three bases are equal within kernel noise (function-preserving init).
 Under the identical recipe, full SFT lands on the same loss for all three
@@ -256,15 +264,23 @@ same `QwenLinearSwapModelWrapper`, chat template, greedy decoding and 128 new to
 | gdn  base (exact copy) | 100.0 | 100.0 | 96.5 |
 | gdn2 base (tiled init) | 100.0 | 100.0 | 96.25 |
 | kda  base (tiled init) | 100.0 | 100.0 | 95.75 |
+| rwkv7 base (tiled init) | 100.0 | 100.0 | 96.75 |
 | gdn  gate-only 100 (0.59M) | 100.0 | 100.0 | 96.25 |
 | kda  gate-only 100 (7.4M) | 100.0 | 100.0 | 97.5 |
 | kda_fullgate gate-only 100 (38M) | 100.0 | 98.0 | 99.0 |
 | gdn2 gate-only 100 (113M) | 100.0 | 99.0 | 96.5 |
+| rwkv7 gate-only 100 (14M) | 100.0 | 99.0 | 99.5 |
 | gdn  full 50 | 100.0 | 100.0 | 99.0 |
 | kda  full 50 | 100.0 | 100.0 | 99.5 |
 | gdn2 full 50 | 100.0 | 100.0 | 99.25 |
+| rwkv7 full 50 | 100.0 | 100.0 | 99.0 |
+| mamba2 base (inexact) | 0.0 | 0.0 | 0.0 |
+| mamba2 distill (500) | 100.0 | 72.0 | 53.25 |
+| mamba2 distill → full 50 | 100.0 | 77.0 | 73.5 |
 | deltanet base (inexact) | 0.0 | 0.0 | 0.0 |
-| deltanet full 200 (lr 1e-4) | 0.0 | 0.0 | 0.0 |
+| deltanet full 200 (lr 1e-4), no distill | 0.0 | 0.0 | 0.0 |
+| deltanet distill (500) | 0.0 | 0.0 | 0.0 |
+| deltanet distill → full 50 | 0.0 | 0.0 | 0.0 |
 
 Reading: the three function-preserving bases are indistinguishable (single- and
 multi-key retrieval saturated, multi-value 95.75–96.5, i.e. 1–2 wrong values
@@ -283,13 +299,21 @@ are: (i) the KDA swap is exact and loses nothing, (ii) full SFT equalises the
 kernels, (iii) a per-channel decay gate is a much cheaper gate-only handle
 than GDN2's three full-rank gates for long-context retrieval.
 
-The inexact DeltaNet swap is the counter-example: at init the model is
+The two inexact swaps ablate the pretrained recurrence.  Mamba-2 removes the
+delta-rule erase and keeps the decay: distillation returns it exactly to the
+original model's validation loss (6.85 → 1.73, the same 1.74 the bases have),
+SFT takes it to 1.49 (exact kernels: 1.39), single-needle retrieval is fully
+recovered but multi-key / multi-value retrieval stays at 77 / 73.5 against 99+
+for every kernel with an erase term — with 131K tokens of distractors a
+scalar-decay state cannot overwrite stale associations.  DeltaNet removes the
+decay and keeps the erase, and is the harsher counter-example: at init the model is
 unusable (validation CE 12.8, all NIAH scores 0), and 200 full-SFT steps at
-lr 1e-4 (4× the budget of the exact swaps, 10× their learning rate) only bring
-the loss to 6.2 with retrieval still at 0.  Dropping a component the
-pretrained network depends on is not something a short post-training run
-recovers; a kernel without decay would need a distillation-style schedule
-(or a smarter init) rather than the recipe that works for exact swaps.
+lr 1e-4 only bring the loss to 6.2.  Distillation (`linswap.py distill`,
+layer alignment 200 steps + KL 300 steps at 8K tokens, ~20 min) is far more
+effective — 2.46, and 2.09 after the standard 50-step SFT — yet 131K-token
+retrieval stays at 0: a state without decay accumulates every key it has ever
+seen, so at 30× the distillation length the recurrent memory is saturated.
+At short context the distilled model does retrieve — `niah_single_1` / `niah_multikey_1` reach 56 / 36 at 4K tokens (25 samples) and 0 / 24 at 16K — so the failure is specifically the loss of long-range forgetting, not of the mechanism itself.
 
 Compared with the earlier GDN2 numbers in docs/gdn2_experiment_log.md (different machine, old loss
 scaling): base 92.5 → full SFT 98.25 on `niah_multivalue`; here 96.25 → 99.25.
