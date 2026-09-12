@@ -86,22 +86,6 @@ MODEL_SELECT() {
             MODEL_TEMPLATE_TYPE="base"
             MODEL_FRAMEWORK="hf"
             ;;
-        linswap-nocache-*)
-            MODEL_PATH="${REPO_ROOT}/outputs/ruler_models/${MODEL_NAME#linswap-nocache-}"
-            MODEL_TEMPLATE_TYPE="base"
-            MODEL_FRAMEWORK="qwen_linswap_nocache"
-            TOKENIZER_PATH="${REPO_ROOT}/models/Qwen3.5-0.8B"
-            TOKENIZER_TYPE="hf"
-            ;;
-        linswap-*)
-            # Any kernel-swapped Qwen3.5 model registered under outputs/ruler_models/<name>
-            # (see scripts/register_ruler_model.py); config.json there names the kernel/checkpoint.
-            MODEL_PATH="${REPO_ROOT}/outputs/ruler_models/${MODEL_NAME#linswap-}"
-            MODEL_TEMPLATE_TYPE="base"
-            MODEL_FRAMEWORK="qwen_linswap"
-            TOKENIZER_PATH="${REPO_ROOT}/models/Qwen3.5-0.8B"
-            TOKENIZER_TYPE="hf"
-            ;;
     esac
 
 

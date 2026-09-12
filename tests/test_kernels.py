@@ -1,6 +1,6 @@
 """Fast regression test for the qwen_linswap framework (needs one GPU, ~1-2 min).
 
-    python scripts/test_linswap.py
+    python tests/test_kernels.py
 
 Checks, for every registered kernel:
   * the model builds, loads the pretrained HF weights and its logits agree with the

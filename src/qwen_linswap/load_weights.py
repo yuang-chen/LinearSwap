@@ -6,7 +6,7 @@ Two checkpoint formats are understood:
   pretrained Qwen3.5 checkpoint.  Non-linear layers are copied verbatim; each
   linear layer is initialised through ``kernel.init_from_gdn``.
 * **Native format** (``trf_blocks.{i}.token_mixer.*``): ``state_dict()`` of a
-  swapped model, as written by ``scripts/sft.py`` (``model.pt``).
+  swapped model, as written by ``linswap.py posttrain`` (``model.pt``).
 """
 
 from __future__ import annotations

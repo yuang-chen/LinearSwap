@@ -1,4 +1,4 @@
-"""Training utilities shared by scripts/sft.py and scripts/eval_val_loss.py.
+"""Training utilities shared by the posttrain and evaluate stages.
 
 Memory-efficient chunked cross-entropy: the LM head is applied to 2048-token
 chunks of the final hidden states, each chunk's loss is back-propagated

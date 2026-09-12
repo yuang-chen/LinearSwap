@@ -23,41 +23,46 @@ deltanet       DeltaNet                         decay dropped (NOT exact)       
 
 ## Layout
 
-- `src/qwen_linswap/` — the framework: kernel registry, the Qwen3.5 backbone with pluggable linear layers, weight loading, SFT utilities. Kernels live in `src/qwen_linswap/kernels/`, one file each; that directory is the extension point.
-- `scripts/` — `prepare_datasets.py`, `verify.py`, `sft.py`, `eval_val_loss.py`, `register_ruler_model.py` (see `scripts/README.md`).
+- `linswap.py` — the command line: `verify`, `posttrain`, `evaluate`, `run` (all three), `kernels`.
+- `src/qwen_linswap/` — the framework: kernel registry, the Qwen3.5 backbone with pluggable linear layers, weight loading, data and SFT utilities. Kernels live in `src/qwen_linswap/kernels/`, one file each; that directory is the extension point. The workflow stages live in `src/qwen_linswap/pipeline/`.
 - `tests/test_kernels.py` — regression test over all registered kernels.
 - `RULER/` — the RULER benchmark, vendored with a wrapper for swapped models.
 - `docs/` — design, per-kernel details and all results (`framework.md`), plus the notes and log of the original GDN→GDN2 experiment.
 
-## Quick start
+## Workflow
+
+The workflow is **verify → posttrain → evaluate**; each stage is one command,
+and `run` chains them for one kernel.
 
 ```bash
-source .venv/bin/activate                     # uv-managed venv; RULER's run.sh calls bare `python`
+source .venv/bin/activate
 python tests/test_kernels.py                  # every kernel builds, loads, matches the GDN control, round-trips
 
-# 1. verify a swap against HF Qwen3.5 (the `gdn` baseline column is the bf16/Triton noise floor)
-python scripts/verify.py --kernel kda --baseline gdn
+# 1. verify: is the swap function preserving?  (the `gdn` baseline column is the bf16/Triton noise floor)
+python linswap.py verify --kernel kda --baseline gdn
 
-# 2. post-train it (identical recipe for every kernel; ~5 min per run on one L20X)
-python scripts/prepare_datasets.py --max_length 262144           # once
-python scripts/sft.py --kernel kda --mode gate_only --output_dir outputs/sft_kda_gate \
-       --max_length 131072 --num_steps 100 --grad_accum_steps 2 --gate_lr 2e-4
-python scripts/sft.py --kernel kda --mode full --output_dir outputs/sft_kda_full \
-       --max_length 131072 --num_steps 50 --grad_accum_steps 2 --full_lr 1e-5
+# 2. posttrain: gate-only and full SFT with the standard recipe (SFT data is prepared on first use)
+python linswap.py posttrain --kernel kda            # -> outputs/kda/sft_gate_only, outputs/kda/sft_full
 
-# 3. evaluate
-python scripts/eval_val_loss.py --models kda-base kda-full-50 --batches 40
-python scripts/register_ruler_model.py --name kda-base --kernel kda
-python scripts/register_ruler_model.py --name kda-full-50 --ckpt outputs/sft_kda_full/checkpoint-50
-(cd RULER/scripts && bash run.sh linswap-kda-full-50 synthetic)   # tasks/lengths in config_tasks.sh / config_models.sh
+# 3. evaluate: validation loss + RULER for any set of base swaps / checkpoints, one summary table
+python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
+       --tasks niah_single_1,niah_multikey_1,niah_multivalue --lengths 131072 --samples 100 --name kda-vs-gdn
+                                                    # -> outputs/eval/kda-vs-gdn/summary.{csv,md,json}
+
+# all of the above for one kernel
+python linswap.py run --kernel kda
 ```
+
+Every stage accepts `--help`; the recipe knobs (steps, learning rates,
+training length, RULER tasks / lengths / sample count) are arguments, so
+comparisons between kernels use one command line with only `--kernel` changed.
 
 ```python
 import sys; sys.path.insert(0, "src")
 from qwen_linswap import build_model, list_kernels
-model = build_model("kda")                                          # Qwen3.5-0.8B weights, exact KDA init
-model = build_model(ckpt_dir="outputs/sft_kda_full/checkpoint-50")  # SFT checkpoint; kernel read from config.json
-out = model.generate(input_ids, max_new_tokens=32)                  # greedy, cached decode
+model = build_model("kda")                                       # Qwen3.5-0.8B weights, exact KDA init
+model = build_model(ckpt_dir="outputs/kda/sft_full/checkpoint-50")  # SFT checkpoint; kernel read from config.json
+out = model.generate(input_ids, max_new_tokens=32)               # greedy, cached decode
 ```
 
 ## Adding a kernel
@@ -72,13 +77,12 @@ call; import it in `kernels/__init__.py`.  Make architectural changes in
 loaded.  `kernels/common.py` documents the pretrained tensor layout and the GDN
 recurrence and provides the tiling / splitting helpers; `kernels/kda.py` is the
 template for an exact swap, `kernels/deltanet.py` for an inexact one.  Then run
-`tests/test_kernels.py` and `scripts/verify.py --kernel <name> --baseline gdn`.
+`tests/test_kernels.py` and `python linswap.py verify --kernel <name> --baseline gdn`.
 
 ## Results (131K context, identical SFT recipe)
 
 RULER at 131072 tokens, 100 samples per task, cached greedy decoding
-(`outputs/ruler_131k_summary.csv`); validation cross-entropy on 40 held-out
-examples (`outputs/val_loss_131k.json`).  Full tables and discussion in
+validation cross-entropy on 40 held-out examples.  Full tables and discussion in
 [docs/framework.md](docs/framework.md).
 
 | model | trainable | val CE | niah_single_1 | niah_multikey_1 | niah_multivalue |
@@ -111,9 +115,9 @@ that suffices for exact ones.
 ## Setup
 
 Python environment: the `uv`-managed `.venv` (torch 2.6, transformers 5.16,
-flash-linear-attention 0.6.0).  Put `Qwen/Qwen3.5-0.8B` in `models/` and run
-`scripts/prepare_datasets.py` once to build the SFT data; checkpoints, RULER
-registrations and results go to `outputs/`.  Hardware notes and kernel caveats
+flash-linear-attention 0.6.0).  Put `Qwen/Qwen3.5-0.8B` in `models/`; the SFT
+data is downloaded and tokenised on first use of `posttrain` / `evaluate`, and
+checkpoints and evaluation results go to `outputs/`.  Hardware notes and kernel caveats
 are in [docs/framework.md](docs/framework.md).
 
 ## Acknowledgements

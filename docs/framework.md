@@ -8,6 +8,7 @@ RULER — all through one kernel name.  The first new kernel is **Kimi Delta
 Attention (KDA)**.
 
 ```
+linswap.py             command line: verify | posttrain | evaluate | run | kernels
 src/qwen_linswap/
   registry.py          KernelSpec + register_kernel / get_kernel / list_kernels
   kernels/common.py    helpers shared by init recipes (pretrained tensor layout, split fused qkv/conv, tiling, Qwen output gate)
@@ -17,36 +18,31 @@ src/qwen_linswap/
                        "kda_fullgate" KDA with a dense decay projection
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
   model.py             Qwen3_5LinearSwapModel(cfg, kernel) + SwapCache
-  components.py        RMSNorm / GQA / MLP / RoPE;  config.py  QWEN3_5_CONFIG;  sft_utils.py  chunked CE etc.
+  components.py        RMSNorm / GQA / MLP / RoPE;  config.py  QWEN3_5_CONFIG
   load_weights.py      build_model(kernel | ckpt_dir), HF-format and native checkpoint loading
-scripts/
-  verify.py            --kernel X [--baseline gdn] [--ckpt DIR]  function-preservation checks vs HF Qwen3.5
-  sft.py               --kernel X --mode gate_only|full          SFT
-  eval_val_loss.py     validation CE / perplexity for a list of models
-  register_ruler_model.py  --name N (--kernel X | --ckpt DIR)   expose a model to RULER as linswap-N
+  data.py              SFT data preparation (LongAlign / LongAlpaca / anti-haystack);  sft_utils.py  chunked CE etc.
+  pipeline/verify.py     stage 1: function-preservation checks vs HF Qwen3.5
+  pipeline/posttrain.py  stage 2: gate-only / full SFT (prepares data on first use)
+  pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
+  pipeline/run.py        the three stages chained for one kernel
 tests/test_kernels.py  regression test over all registered kernels
-RULER/scripts/pred/model_wrappers.py::QwenLinearSwapModelWrapper, server types qwen_linswap[_nocache],
-config_models.sh pattern entries linswap-* / linswap-nocache-*
+RULER/scripts/pred/model_wrappers.py::QwenLinearSwapModelWrapper, server types qwen_linswap[_nocache]
 ```
 
 ## Using it
 
 ```bash
-source .venv/bin/activate                     # RULER's run.sh calls bare `python`
-python scripts/verify.py --kernel kda --baseline gdn
-python scripts/sft.py --kernel kda --mode gate_only --output_dir outputs/sft_kda_gate \
-       --max_length 131072 --num_steps 100 --grad_accum_steps 2 --gate_lr 2e-4
-python scripts/sft.py --kernel kda --mode full --output_dir outputs/sft_kda_full \
-       --max_length 131072 --num_steps 50 --grad_accum_steps 2 --full_lr 1e-5
-python scripts/register_ruler_model.py --name kda-base --kernel kda
-python scripts/register_ruler_model.py --name kda-full-50 --ckpt outputs/sft_kda_full/checkpoint-50
-cd RULER/scripts && bash run.sh linswap-kda-full-50 synthetic      # tasks/lengths from config_tasks.sh / config_models.sh
+source .venv/bin/activate
+python linswap.py verify    --kernel kda --baseline gdn
+python linswap.py posttrain --kernel kda                         # gate_only + full, outputs/kda/sft_*
+python linswap.py evaluate  --models kda outputs/kda/sft_full/checkpoint-50 --name kda   # outputs/eval/kda/summary.*
+python linswap.py run       --kernel kda                         # all three
 ```
 
 ```python
 from qwen_linswap import build_model, list_kernels
-model = build_model("kda")                                    # Qwen3.5-0.8B weights, exact KDA init
-model = build_model(ckpt_dir="outputs/sft_kda_full/checkpoint-50")   # kernel read from config.json
+model = build_model("kda")                                       # Qwen3.5-0.8B weights, exact KDA init
+model = build_model(ckpt_dir="outputs/kda/sft_full/checkpoint-50")   # SFT checkpoint (kernel from config.json)
 ```
 
 ## Adding a kernel
@@ -68,7 +64,7 @@ Write `src/qwen_linswap/kernels/<name>.py` with
   `kernels/__init__.py`.  `new_param_names` are the parameter components
   trained by `--mode gate_only`.
 
-Then `tests/test_kernels.py` and `scripts/verify.py --kernel <name> --baseline gdn` tell you whether the
+Then `tests/test_kernels.py` and `python linswap.py verify --kernel <name> --baseline gdn` tell you whether the
 init is function preserving: every number should sit at the same level as the
 `gdn` column, which is pure Triton/bf16 noise.
 
@@ -95,7 +91,7 @@ which keeps them invisible at init but gives them non-zero gradient so SFT
 can use the extra rank.  `kda_fullgate` uses a dense 2048×1024 `f_proj`
 instead.  New parameters: 7.4M (`kda`) / 38M (`kda_fullgate`) vs 113M for GDN2.
 
-### Verification (`scripts/verify.py --kernel kda --baseline gdn`)
+### Verification (`python linswap.py verify --kernel kda --baseline gdn`)
 
 All numbers are at the level of the `gdn` control (bf16 Triton noise vs HF's
 implementation):
@@ -134,7 +130,7 @@ what post-training then has to recover (results below).
 
 ## SFT and benchmark results
 
-Recipe (identical for every kernel, `scripts/sft.py`): data
+Recipe (identical for every kernel, `linswap.py posttrain`): data
 `data/sft/len262144` left-truncated to 131072, bf16, gradient checkpointing,
 micro-batch 1 × 2 accumulation, AdamW, clip 1.0, seed 42.
 `gate_only`: 100 steps, lr 2e-4 on `new_param_names`, backbone frozen.
@@ -153,7 +149,7 @@ error); the KDA backward kernel prints benign Triton 3.2 scheduling warnings.
 > ~1000).  It is fixed in this revision; all runs below use the fixed loss.
 > The GDN2 numbers in docs/gdn2_experiment_log.md were produced with the old loss.
 
-### Validation cross-entropy (`scripts/eval_val_loss.py`, first 40 validation examples ≤131K, `outputs/val_loss_131k.json`)
+### Validation cross-entropy (first 40 validation examples ≤131K)
 
 | model | trainable params | val CE | ppl |
 |---|---|---|---|
@@ -181,8 +177,8 @@ between GDN's scalar gates and GDN2's three full-rank gates, and the dense
 
 ### RULER at 131072 tokens (100 samples per task, cached decode)
 
-Scores from `RULER/scripts/benchmark_root/linswap-<model>/synthetic/131072/pred/summary.csv`
-(`niah_multivalue` is value-level accuracy).  Every model was evaluated with the
+`niah_multivalue` is value-level accuracy.  (These runs predate the `evaluate` stage; today
+`linswap.py evaluate` writes the same numbers to `outputs/eval/<name>/summary.csv`.)  Every model was evaluated with the
 same `QwenLinearSwapModelWrapper`, chat template, greedy decoding and 128 new tokens.
 
 | model | niah_single_1 | niah_multikey_1 | niah_multivalue |

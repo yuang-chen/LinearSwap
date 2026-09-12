@@ -1,9 +1,8 @@
-"""Kernel-agnostic verification of a swapped Qwen3.5 model against HF Qwen3.5.
+"""Stage 1 — verify: is the swapped model a function-preserving replacement of HF Qwen3.5?
 
-Usage:
-    python scripts/verify.py --kernel kda [--baseline gdn] [--checks layer,logits,layerwise,cache,generation]
-                                  [--lengths 8,64,512,4096]
-    python scripts/verify.py --ckpt outputs/sft_kda_full/checkpoint-50 --checks cache,generation
+    python linswap.py verify --kernel kda [--baseline gdn] [--checks layer,logits,layerwise,cache,generation]
+                                          [--lengths 8,64,512,4096]
+    python linswap.py verify --ckpt outputs/kda/sft_full/checkpoint-50 --checks cache,generation
 
 Checks (all use the pretrained Qwen3.5-0.8B weights, function-preserving init):
     layer       pretrained linear layers 0/1/2 in isolation vs transformers'
@@ -22,18 +21,14 @@ be read against pure kernel/bf16 noise (the ``gdn`` kernel is an exact weight
 copy of the original architecture on FLA Triton kernels).
 """
 
-import argparse
-import sys
 import time
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "src"))
 
 import torch
 import torch.nn.functional as F
 
-from qwen_linswap import QWEN3_5_CONFIG, DEFAULT_BASE_MODEL_DIR, build_model, get_kernel, load_hf_state_dict
+from ..config import QWEN3_5_CONFIG
+from ..load_weights import DEFAULT_BASE_MODEL_DIR, build_model, load_hf_state_dict, read_checkpoint_kernel
+from ..registry import get_kernel
 
 
 def fmt(x):
@@ -154,21 +149,20 @@ def check_generation(model, hf, tokenizer, device, kernel, prompt="The capital o
 
 
 # ------------------------------------------------------------------------------ main
-def main():
-    ap = argparse.ArgumentParser()
+def add_args(ap):
     ap.add_argument("--kernel", default=None)
     ap.add_argument("--ckpt", default=None, help="SFT checkpoint dir (kernel read from its config.json)")
     ap.add_argument("--baseline", default=None, help="second kernel to run for comparison, e.g. gdn")
     ap.add_argument("--checks", default="layer,logits,layerwise,cache,generation")
     ap.add_argument("--lengths", default="8,64,512,4096")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
-    args = ap.parse_args()
-    if args.ckpt:
-        from qwen_linswap import read_checkpoint_kernel
 
+
+def main(args):
+    if args.ckpt:
         args.kernel = args.kernel or read_checkpoint_kernel(args.ckpt)
     if args.kernel is None:
-        ap.error("--kernel or --ckpt is required")
+        raise SystemExit("verify: --kernel or --ckpt is required")
 
     checks = set(args.checks.split(","))
     if args.ckpt:
@@ -209,7 +203,3 @@ def main():
             check_generation(model, hf, tokenizer, device, kernel)
         del model
         torch.cuda.empty_cache()
-
-
-if __name__ == "__main__":
-    main()
