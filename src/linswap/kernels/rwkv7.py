@@ -16,7 +16,7 @@ is exactly GDN's delta-rule erase and ``k v^T = beta k̂ v^T`` its write.  The
 layer below is parameterised the RWKV-7 way — per-channel decay from a
 low-rank projection (``w_lora``), a per-channel in-context learning rate
 (``a_lora``, here ``b_proj``) and a separately modulated removal key
-(``k_k``) — but keeps Qwen's q/k/v projections, short convolutions and
+(``k_k``) — but keeps the backbone's q/k/v projections, short convolutions and
 SiLU-gated output norm, exactly like the KDA kernel replaces KDA's output
 gate.  RWKV-7's token shift, value residual and GroupNorm are not used.
 
@@ -26,7 +26,7 @@ the scalar beta row into the low-rank per-channel ``b_proj``, ``dt_bias`` is
 tiled, ``A_log`` copied and ``k_k = 1`` so the removal key equals ``k̂``.
 
 FLA's own ``RWKV7Attention`` layer is not used because it fixes
-``key_dim = hidden_size`` (Qwen's linear layers use key_dim = 2·hidden) and
+``key_dim = hidden_size`` (the backbone's linear layers use key_dim = 2·hidden) and
 bounds the decay to ``exp(-0.607·sigmoid(·)) ≥ 0.545`` per step, which cannot
 represent the pretrained decays."""
 

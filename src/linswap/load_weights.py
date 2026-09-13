@@ -3,7 +3,7 @@
 Two checkpoint formats are understood:
 
 * **HF format** (``model.language_model.layers.{i}.linear_attn.*``): the
-  pretrained Qwen3.5 checkpoint.  Non-linear layers are copied verbatim; each
+  pretrained backbone checkpoint.  Non-linear layers are copied verbatim; each
   linear layer is initialised through ``kernel.init_from_gdn``.
 * **Native format** (``trf_blocks.{i}.token_mixer.*``): ``state_dict()`` of a
   swapped model, as written by ``linswap.py posttrain`` (``model.pt``).
@@ -16,8 +16,8 @@ from pathlib import Path
 
 import torch
 
-from .config import QWEN3_5_CONFIG
-from .model import Qwen3_5LinearSwapModel
+from .backbones import load_backbone_config
+from .model import LinearSwapModel
 from .registry import get_kernel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,8 +48,8 @@ def _assign(left, right, name):
         left.copy_(right.to(dtype=left.dtype, device=left.device))
 
 
-def load_weights_from_gdn(model: Qwen3_5LinearSwapModel, params: dict) -> None:
-    """Load an HF-format Qwen3.5 (GDN) checkpoint into a swapped model."""
+def load_weights_from_gdn(model: LinearSwapModel, params: dict) -> None:
+    """Load an HF-format GDN-hybrid checkpoint (Qwen3-Next / Qwen3.5 naming) into a swapped model."""
     if "model.embed_tokens.weight" in params:
         model_prefix = "model"
     elif "model.language_model.embed_tokens.weight" in params:
@@ -98,11 +98,11 @@ def load_weights_from_gdn(model: Qwen3_5LinearSwapModel, params: dict) -> None:
         model.out_head.weight = model.tok_emb.weight
 
 
-def load_native_checkpoint(model: Qwen3_5LinearSwapModel, ckpt_dir, strict=True) -> None:
+def load_native_checkpoint(model: LinearSwapModel, ckpt_dir, strict=True) -> None:
     state = torch.load(Path(ckpt_dir) / "model.pt", map_location="cpu", weights_only=True)
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if missing or unexpected:
-        print(f"[qwen_linswap] load_native_checkpoint: missing={missing[:5]} unexpected={unexpected[:5]}")
+        print(f"[linswap] load_native_checkpoint: missing={missing[:5]} unexpected={unexpected[:5]}")
 
 
 def read_checkpoint_kernel(ckpt_dir) -> str | None:
@@ -117,7 +117,7 @@ def build_model(kernel: str | None = None, base_model_dir=DEFAULT_BASE_MODEL_DIR
                 device="cuda", dtype=torch.bfloat16, cfg=None, hf_weights: dict | None = None):
     """One-stop model construction.
 
-    1. build ``Qwen3_5LinearSwapModel(cfg, kernel)``
+    1. read the architecture from ``base_model_dir/config.json`` and build ``LinearSwapModel(cfg, kernel)``
     2. initialise from the pretrained HF GDN checkpoint (function preserving)
     3. if ``ckpt_dir`` contains ``model.pt``, overwrite with that native checkpoint.
 
@@ -127,8 +127,8 @@ def build_model(kernel: str | None = None, base_model_dir=DEFAULT_BASE_MODEL_DIR
         kernel = read_checkpoint_kernel(ckpt_dir)
     if kernel is None:
         raise ValueError("kernel must be given or recorded in ckpt_dir/config.json")
-    cfg = cfg or QWEN3_5_CONFIG
-    model = Qwen3_5LinearSwapModel(cfg, kernel)
+    cfg = cfg or load_backbone_config(base_model_dir, dtype=dtype)
+    model = LinearSwapModel(cfg, kernel)
     if hf_weights is None:
         hf_weights = load_hf_state_dict(base_model_dir)
     load_weights_from_gdn(model, hf_weights)

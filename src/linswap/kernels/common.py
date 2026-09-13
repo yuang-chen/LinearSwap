@@ -1,7 +1,7 @@
 """Shared helpers for writing kernel init recipes.
 
-Qwen3.5's pretrained linear-attention layer (HF ``Qwen3_5GatedDeltaNet``) has
-the following parameters under ``{model_prefix}.layers.{i}.linear_attn.``:
+The pretrained Gated-DeltaNet layer of the backbone (HF ``Qwen3_5GatedDeltaNet`` /
+Qwen3-Next naming) has the following parameters under ``{model_prefix}.layers.{i}.linear_attn.``:
 
     in_proj_qkv.weight  [2*key_dim + value_dim, hidden]   fused q/k/v projection
     conv1d.weight       [2*key_dim + value_dim, 1, k]     fused depthwise causal conv
@@ -88,7 +88,7 @@ def init_lowrank_tiled(seq: nn.Sequential, rows: torch.Tensor, reps: int, name: 
 
 
 def copy_qkv_and_conv(layer: nn.Module, src: dict) -> None:
-    """Split the fused Qwen q/k/v projection and depthwise conv into the separate
+    """Split the fused q/k/v projection of the pretrained layer and depthwise conv into the separate
     ``q_proj/k_proj/v_proj`` and ``q_conv1d/k_conv1d/v_conv1d`` modules used by
     FLA layers.  Depthwise conv + SiLU is channel-wise, so the split is exact."""
     key_dim, value_dim = layer.key_dim, layer.value_dim
@@ -103,7 +103,7 @@ def copy_qkv_and_conv(layer: nn.Module, src: dict) -> None:
 
 
 def use_qwen_output_gate(layer: nn.Module, hidden_size: int, value_dim: int, head_v_dim: int, eps: float) -> None:
-    """Replace a layer's output gate with Qwen's parameterisation:
+    """Replace a layer's output gate with the backbone's parameterisation:
     full-rank ``g_proj`` (no bias) followed by RMSNorm(o) * SiLU(g)."""
     ref = layer.o_proj.weight
     layer.g_proj = nn.Linear(hidden_size, value_dim, bias=False, device=ref.device, dtype=ref.dtype)

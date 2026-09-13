@@ -3,7 +3,7 @@
     python linswap.py distill --kernel deltanet                 # layer alignment, then KL distillation
     python linswap.py distill --kernel mamba2 --stages kl --kl_steps 500
 
-Teacher: the original model (``gdn`` kernel, exact copy of HF Qwen3.5).
+Teacher: the original model (``gdn`` kernel, exact copy of the HF backbone).
 Student: the swapped model.  Two stages, both on the SFT corpus truncated to
 ``--max_length`` tokens (all positions, not only assistant tokens):
 

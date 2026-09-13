@@ -57,8 +57,8 @@ SERVER_TYPES = (
     'gemini',
     'hf',
     'mamba',
-    'qwen_linswap',
-    'qwen_linswap_nocache',
+    'linswap',
+    'linswap_nocache',
 )
 
 
@@ -98,7 +98,7 @@ parser.add_argument("--batch_size", type=int, default=1)
 
 args = parser.parse_args()
 args.stop_words = list(filter(None, args.stop_words.split(',')))
-if args.server_type == 'hf' or args.server_type == 'gemini' or args.server_type.startswith('qwen_linswap'):
+if args.server_type == 'hf' or args.server_type == 'gemini' or args.server_type.startswith('linswap'):
     args.threads = 1
 
 
@@ -200,9 +200,9 @@ def get_llm(tokens_to_generate):
             max_new_tokens=tokens_to_generate,
         )
         
-    elif args.server_type in ('qwen_linswap', 'qwen_linswap_nocache'):
-        from model_wrappers import QwenLinearSwapModelWrapper
-        llm = QwenLinearSwapModelWrapper(
+    elif args.server_type in ('linswap', 'linswap_nocache'):
+        from model_wrappers import LinearSwapModelWrapper
+        llm = LinearSwapModelWrapper(
             name_or_path=args.model_name_or_path,
             do_sample=args.temperature > 0,
             repetition_penalty=1,
@@ -212,7 +212,7 @@ def get_llm(tokens_to_generate):
             stop=args.stop_words,
             max_new_tokens=tokens_to_generate,
             use_chat_template=True,
-            use_cache=args.server_type == 'qwen_linswap',
+            use_cache=args.server_type == 'linswap',
         )
 
     else:

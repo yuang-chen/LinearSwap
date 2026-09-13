@@ -1,6 +1,6 @@
 """Long-context SFT data: LongAlign-10k + LongAlpaca-12k + anti-haystack.
 
-Each example is rendered with Qwen's chat format, tokenised, non-assistant
+Each example is rendered with the backbone's chat format (`<|im_start|>role ... <|im_end|>`), tokenised, non-assistant
 tokens are masked with -100 and the sequence is left-truncated to
 ``max_length`` (so the answer tail survives).  The three sets are concatenated,
 shuffled (seed 42) and split 98/2 into ``{output_dir}/len{max_length}/{train,validation}``.

@@ -1,8 +1,8 @@
-"""Kernel registry for the Qwen3.5 linear-attention swap framework.
+"""Kernel registry for the LinearSwap framework.
 
 A *kernel* here is a complete linear-attention token mixer (an ``nn.Module``
 with the FLA layer interface) plus a recipe for initialising it from the
-pretrained Qwen3.5 Gated-DeltaNet weights.  Registering a new kernel is the
+pretrained Gated-DeltaNet weights of the backbone.  Registering a new kernel is the
 only thing needed to make it available to the model builder, the weight
 loader, the verification script, the SFT script and the RULER wrapper.
 """

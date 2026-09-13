@@ -35,7 +35,8 @@ DEFAULT_TASKS = "niah_single_1,niah_multikey_1,niah_multivalue"
 
 
 def add_args(ap):
-    ap.add_argument("--models", nargs="+", required=True, help="kernel names and/or checkpoint dirs")
+    ap.add_argument("--models", nargs="+", required=True,
+                    help="kernel names and/or checkpoint dirs; prefix with label= to name a row")
     ap.add_argument("--name", default=None, help="run name -> outputs/eval/<name> (default: timestamp)")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--tasks", default=DEFAULT_TASKS, help="RULER synthetic tasks, comma separated")
@@ -51,7 +52,15 @@ def add_args(ap):
 
 # ----------------------------------------------------------------------------- models
 def resolve_model(spec: str, base_model_dir):
-    """kernel name | checkpoint dir  ->  (display name, kernel, base_model_dir, ckpt_dir | None)."""
+    """kernel name | checkpoint dir | label=spec  ->  (display name, kernel, base_model_dir, ckpt_dir | None)."""
+    label = None
+    if "=" in spec:
+        label, spec = spec.split("=", 1)
+    out = _resolve_model(spec, base_model_dir)
+    return (label or out[0],) + out[1:]
+
+
+def _resolve_model(spec: str, base_model_dir):
     if spec in list_kernels():
         return f"{spec}-base", spec, Path(base_model_dir), None
     d = Path(spec).resolve()  # RULER runs from its own directory, so paths must be absolute
@@ -101,19 +110,26 @@ def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, us
         data_dir, pred_dir = res_dir / "data", res_dir / "pred"
         data_dir.mkdir(parents=True, exist_ok=True)
         pred_dir.mkdir(parents=True, exist_ok=True)
+        failed = []
         for task in tasks:
             t = time.time()
-            _run([sys.executable, "data/prepare.py", "--save_dir", data_dir, "--benchmark", "synthetic",
-                  "--task", task, "--tokenizer_path", base_model_dir, "--tokenizer_type", "hf",
-                  "--max_seq_length", L, "--model_template_type", "base", "--num_samples", samples], log_file)
-            _run([sys.executable, "pred/call_api.py", "--data_dir", data_dir, "--save_dir", pred_dir,
-                  "--benchmark", "synthetic", "--task", task,
-                  "--server_type", "qwen_linswap" if use_cache else "qwen_linswap_nocache",
-                  "--model_name_or_path", model_dir, "--temperature", "0.0", "--top_k", "32", "--top_p", "1.0",
-                  "--batch_size", "1"], log_file)
-            print(f"    {name} L={L} {task}: {time.time()-t:.0f}s", flush=True)
+            try:
+                _run([sys.executable, "data/prepare.py", "--save_dir", data_dir, "--benchmark", "synthetic",
+                      "--task", task, "--tokenizer_path", base_model_dir, "--tokenizer_type", "hf",
+                      "--max_seq_length", L, "--model_template_type", "base", "--num_samples", samples], log_file)
+                _run([sys.executable, "pred/call_api.py", "--data_dir", data_dir, "--save_dir", pred_dir,
+                      "--benchmark", "synthetic", "--task", task,
+                      "--server_type", "linswap" if use_cache else "linswap_nocache",
+                      "--model_name_or_path", model_dir, "--temperature", "0.0", "--top_k", "32", "--top_p", "1.0",
+                      "--batch_size", "1"], log_file)
+                print(f"    {name} L={L} {task}: {time.time()-t:.0f}s", flush=True)
+            except RuntimeError as e:  # keep going; the task is reported as missing
+                print(f"    {name} L={L} {task}: FAILED ({e})", flush=True)
+                failed.append(task)
         _run([sys.executable, "eval/evaluate.py", "--data_dir", pred_dir, "--benchmark", "synthetic"], log_file)
         results[L] = _read_summary(pred_dir)
+        for task in failed:
+            results[L].setdefault(task, None)
         print(f"  {name} L={L}: {results[L]}", flush=True)
     return results
 

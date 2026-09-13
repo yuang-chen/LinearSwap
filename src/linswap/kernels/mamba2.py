@@ -17,9 +17,9 @@ copied from q/k/v/decay/gate/output, ``D`` starts at 0 (no skip, like GDN) and
 (``exact_init=False``).
 
 Layout choices: one SSD "group" per head (``n_groups = num_heads``) so B and C
-have the same shape as Qwen's k and q; q/k are L2-normalised and scaled by
+have the same shape as the backbone's k and q; q/k are L2-normalised and scaled by
 1/sqrt(N) as in the pretrained GDN (Mamba-2 itself does neither, but the
-pretrained projections were trained under it); Qwen's SiLU-gated output norm
+pretrained projections were trained under it); the backbone's SiLU-gated output norm
 is ``norm_before_gate=True`` in Mamba-2 terms.  Mamba-2's own CUDA/Triton
 kernels (``mamba_ssm``) are not needed."""
 

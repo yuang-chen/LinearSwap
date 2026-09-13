@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from qwen_linswap.pipeline import STAGES  # noqa: E402
-from qwen_linswap.registry import get_kernel, list_kernels  # noqa: E402
+from linswap.pipeline import STAGES  # noqa: E402
+from linswap.registry import get_kernel, list_kernels  # noqa: E402
 
 
 def main():

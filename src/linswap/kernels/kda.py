@@ -6,7 +6,7 @@ channel* forget gate:
     S_t = (I - beta_t k_t k_t^T) Diag(exp(g_t)) S_{t-1} + beta_t k_t v_t^T,
     g_t[h, :] = -exp(A_log[h]) * softplus(f_proj(x)[h, :] + dt_bias[h, :])   in R^{head_k_dim}
 
-whereas Qwen3.5's GDN uses a scalar gate per head.  A scalar decay commutes
+whereas the backbone's GDN uses a scalar gate per head.  A scalar decay commutes
 with the delta-rule projector, so tiling the pretrained scalar decay row
 across the ``head_k_dim`` channels of each head recovers GDN exactly.  ``beta``,
 ``A_log``, q/k/v, the short convs and the output path carry over unchanged.
@@ -24,9 +24,9 @@ gradient (grad W2[:, H:] = dL/da ⊗ (W1[H:] x) != 0), so SFT can use it.
 Variant ``kda_fullgate`` uses a dense ``f_proj`` instead (more parameters,
 same function at init).
 
-KDA's default output gate is a low-rank *sigmoid*-gated norm; Qwen's is a
+KDA's default output gate is a low-rank *sigmoid*-gated norm; the backbone's is a
 full-rank *SiLU*-gated norm, which is not representable, so ``g_proj`` and
-``o_norm`` are replaced by Qwen's parameterisation.
+``o_norm`` are replaced by the backbone's parameterisation.
 """
 
 import torch

@@ -1,4 +1,4 @@
-"""Fast regression test for the qwen_linswap framework (needs one GPU, ~1-2 min).
+"""Fast regression test for the linswap framework (needs one GPU, ~1-2 min).
 
     python tests/test_kernels.py
 
@@ -20,14 +20,14 @@ import torch.nn.functional as F
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-from qwen_linswap import build_model, get_kernel, list_kernels, load_hf_state_dict  # noqa: E402
+from linswap import build_model, get_kernel, list_kernels, load_hf_state_dict  # noqa: E402
 
 
 def main():
     device = torch.device("cuda")
     weights = load_hf_state_dict()
     from transformers import AutoTokenizer
-    from qwen_linswap import DEFAULT_BASE_MODEL_DIR
+    from linswap import DEFAULT_BASE_MODEL_DIR
 
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_BASE_MODEL_DIR)
     text = ("The quick brown fox jumps over the lazy dog. In 1815 the Congress of Vienna redrew the map of "

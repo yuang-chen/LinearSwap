@@ -94,7 +94,7 @@ class HuggingFaceModel:
             if text.startswith(prompt):
                 text = text[len(prompt):]
 
-            # Strip Qwen3.5 thinking blocks if present.
+            # Strip <think> blocks if present.
             if "<think>" in text and "</think>" in text:
                 text = text.split("</think>")[-1]
 
@@ -145,12 +145,12 @@ class MambaModel:
         return [self.__call__(prompt, **kwargs) for prompt in prompts]
 
 
-class QwenLinearSwapModelWrapper:
-    """RULER wrapper for kernel-swapped Qwen3.5 models built with ``qwen_linswap``.
+class LinearSwapModelWrapper:
+    """RULER wrapper for kernel-swapped hybrid models built with ``linswap``.
 
     ``name_or_path`` is a directory whose ``config.json`` records:
         linear_kernel   registry name of the kernel (e.g. "kda", "gdn2", "gdn", "deltanet")
-        base_model_dir  (optional) HF Qwen3.5 checkpoint used for the function-preserving init
+        base_model_dir  (optional) HF backbone checkpoint used for the function-preserving init
         ckpt_dir        (optional) directory holding a native ``model.pt``; defaults to ``name_or_path``
     SFT checkpoints written by ``scripts/sft.py`` already carry these fields;
     ``scripts/register_ruler_model.py`` creates such a directory under
@@ -167,7 +167,7 @@ class QwenLinearSwapModelWrapper:
 
         repo = Path(__file__).resolve().parents[3]
         sys.path.insert(0, str(repo / "src"))
-        from qwen_linswap import DEFAULT_BASE_MODEL_DIR, build_model
+        from linswap import DEFAULT_BASE_MODEL_DIR, build_model
 
         model_dir = Path(name_or_path)
         cfg = {}
@@ -181,7 +181,7 @@ class QwenLinearSwapModelWrapper:
         ckpt_dir = Path(cfg["ckpt_dir"]) if cfg.get("ckpt_dir") else model_dir
         if not (ckpt_dir / "model.pt").exists():
             ckpt_dir = None
-        print(f"[QwenLinearSwapModelWrapper] kernel={kernel} base={base_model_dir} ckpt={ckpt_dir}")
+        print(f"[LinearSwapModelWrapper] kernel={kernel} base={base_model_dir} ckpt={ckpt_dir}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_dir, trust_remote_code=True)
         self.device = torch.device("cuda")
@@ -215,7 +215,7 @@ class QwenLinearSwapModelWrapper:
                     use_cache=self.use_cache,
                 )
             text = self.tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
-            # Strip Qwen3.5 thinking blocks and keep only the final answer.
+            # Strip <think> blocks and keep only the final answer.
             if "<think>" in text and "</think>" in text:
                 text = text.split("</think>")[-1]
             if self.stop is not None:

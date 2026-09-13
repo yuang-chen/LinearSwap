@@ -1,4 +1,4 @@
-"""Stage 1 — verify: is the swapped model a function-preserving replacement of HF Qwen3.5?
+"""Stage 1 — verify: is the swapped model a function-preserving replacement of the HF backbone?
 
     python linswap.py verify --kernel kda [--baseline gdn] [--checks layer,logits,layerwise,cache,generation]
                                           [--lengths 8,64,512,4096]
@@ -26,7 +26,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from ..config import QWEN3_5_CONFIG
+from ..backbones import load_backbone_config
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, build_model, load_hf_state_dict, read_checkpoint_kernel
 from ..registry import get_kernel
 
@@ -43,7 +43,7 @@ def check_layer(kernel, weights, device, base_model_dir, layers=(0, 1, 2), lengt
     hf_cfg = AutoConfig.from_pretrained(base_model_dir)
     hf_cfg = getattr(hf_cfg, "text_config", hf_cfg)
     spec = get_kernel(kernel)
-    cfg = QWEN3_5_CONFIG
+    cfg = load_backbone_config(base_model_dir)
     rows = []
     for l in layers:
         ref = Qwen3_5GatedDeltaNet(hf_cfg, l).to(device=device, dtype=torch.bfloat16)
@@ -171,7 +171,7 @@ def main(args):
     device = torch.device("cuda")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print("Purpose: check that the swapped model is a function-preserving replacement of HF Qwen3.5 "
+    print("Purpose: check that the swapped model is a function-preserving replacement of the HF backbone "
           f"(kernel={args.kernel}, baseline={args.baseline}, ckpt={args.ckpt}).")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_dir)
     weights = load_hf_state_dict(args.base_model_dir)

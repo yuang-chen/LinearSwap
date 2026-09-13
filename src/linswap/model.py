@@ -1,4 +1,4 @@
-"""Qwen3.5 backbone with pluggable linear-attention token mixers.
+"""Hybrid (Gated-DeltaNet + full attention) backbone with pluggable linear-attention token mixers.
 
 Full-attention layers, MLPs and norms come from ``components.py``; the
 linear-attention layers are built by the kernel registry.
@@ -58,8 +58,8 @@ class TransformerBlock(nn.Module):
         return x + shortcut, next_kv_cache
 
 
-class Qwen3_5LinearSwapModel(nn.Module):
-    """Qwen3.5 with every ``linear_attention`` layer replaced by ``kernel``."""
+class LinearSwapModel(nn.Module):
+    """The backbone with every ``linear_attention`` layer replaced by ``kernel``."""
 
     def __init__(self, cfg, kernel: str | KernelSpec = "gdn"):
         super().__init__()

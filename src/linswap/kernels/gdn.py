@@ -1,6 +1,6 @@
 """Original Gated DeltaNet via FLA's ``GatedDeltaNet`` layer (control kernel).
 
-Weight copy is exact (no tiling); this reproduces the pretrained Qwen3.5
+Weight copy is exact (no tiling); this reproduces the pretrained
 linear layer with the FLA Triton kernels and is the natural baseline for any
 other swap."""
 

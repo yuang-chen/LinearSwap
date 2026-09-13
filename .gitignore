@@ -23,3 +23,5 @@ __pycache__/
 # RULER outputs (also covered by RULER/.gitignore)
 RULER/scripts/benchmark_root/
 RULER/scripts/data/synthetic/json/PaulGrahamEssays.json
+RULER/scripts/data/synthetic/json/squad.json
+RULER/scripts/data/synthetic/json/hotpotqa.json

@@ -9,7 +9,7 @@ channels) and makes the decay channel-wise (``f_proj``, key_dim channels):
 With ``b_t = w_t = beta_t·1`` and ``g_t`` constant across channels this is GDN,
 so tiling the pretrained scalar projections across channels is exact
 (docs/gdn2_swap_notes.md).  As for KDA, GDN2's default low-rank gate MLPs and
-sigmoid-gated output norm are replaced by Qwen's parameterisation (dense
+sigmoid-gated output norm are replaced by the backbone's parameterisation (dense
 ``f_proj``/``g_proj``, SiLU-gated RMSNorm) so the init is representable.
 New parameters: ~113M (three dense 2048×1024 gates per layer)."""
 

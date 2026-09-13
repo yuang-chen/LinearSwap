@@ -1,15 +1,15 @@
-# Linear-kernel swap framework for Qwen3.5 (`qwen_linswap`)
+# LinearSwap: the kernel-swap framework (`linswap`)
 
 Generalises the GDN→GDN2 in-place swap (docs/gdn2_experiment_log.md,
-docs/gdn2_swap_notes.md) into a small framework that can replace Qwen3.5's Gated-DeltaNet (GDN) linear-attention
-layers with *any* linear-attention kernel, initialise the new layer so that the
+docs/gdn2_swap_notes.md) into a small framework that can replace the Gated-DeltaNet (GDN) linear-attention
+layers of a pretrained hybrid backbone (Qwen3.5-0.8B in all experiments here) with *any* linear-attention kernel, initialise the new layer so that the
 pretrained function is preserved, verify it, fine-tune it and benchmark it on
 RULER — all through one kernel name.  The first new kernel is **Kimi Delta
 Attention (KDA)**.
 
 ```
 linswap.py             command line: verify | posttrain | evaluate | run | kernels
-src/qwen_linswap/
+src/linswap/
   registry.py          KernelSpec + register_kernel / get_kernel / list_kernels
   kernels/common.py    helpers shared by init recipes (pretrained tensor layout, split fused qkv/conv, tiling, Qwen output gate)
   kernels/gdn.py       "gdn"          original GDN on FLA kernels (exact copy; control baseline)
@@ -19,8 +19,8 @@ src/qwen_linswap/
   kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
-  model.py             Qwen3_5LinearSwapModel(cfg, kernel) + SwapCache
-  components.py        RMSNorm / GQA / MLP / RoPE;  config.py  QWEN3_5_CONFIG
+  model.py             LinearSwapModel(cfg, kernel) + SwapCache
+  components.py        RMSNorm / GQA / MLP / RoPE;  backbones.py  load_backbone_config() from the HF config
   load_weights.py      build_model(kernel | ckpt_dir), HF-format and native checkpoint loading
   data.py              SFT data preparation (LongAlign / LongAlpaca / anti-haystack);  sft_utils.py  chunked CE etc.
   pipeline/verify.py     stage 1: function-preservation checks vs HF Qwen3.5
@@ -29,7 +29,7 @@ src/qwen_linswap/
   pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
   pipeline/run.py        the three stages chained for one kernel
 tests/test_kernels.py  regression test over all registered kernels
-RULER/scripts/pred/model_wrappers.py::QwenLinearSwapModelWrapper, server types qwen_linswap[_nocache]
+RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linswap[_nocache]
 ```
 
 ## Using it
@@ -44,14 +44,14 @@ python linswap.py run       --kernel kda                         # all three
 ```
 
 ```python
-from qwen_linswap import build_model, list_kernels
+from linswap import build_model, list_kernels
 model = build_model("kda")                                       # Qwen3.5-0.8B weights, exact KDA init
 model = build_model(ckpt_dir="outputs/kda/sft_full/checkpoint-50")   # SFT checkpoint (kernel from config.json)
 ```
 
 ## Adding a kernel
 
-Write `src/qwen_linswap/kernels/<name>.py` with
+Write `src/linswap/kernels/<name>.py` with
 
 * `build(cfg, layer_idx) -> nn.Module` returning a token mixer with the FLA
   layer interface `forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`.
@@ -193,9 +193,10 @@ expected deviation:
 | full-model top-1 agreement with HF, T=8 / 512 / 4096 | 0.375 / 0.221 / 0.027 | 1.0 / 1.0 / 1.0 |
 | validation CE at step 0 | 13.84 | 1.69 |
 
-The un-decayed state grows without bound over long inputs, which is why the
-deviation increases with length and gradient norms in SFT start in the
-thousands.  This kernel is kept as the worked example of an inexact swap and of
+Without decay the state never contracts (for unit keys and β∈[0,1] the
+transition is non-expansive, so it does not blow up, but stale associations
+persist until they are explicitly overwritten), which is why the deviation
+increases with length and gradient norms in SFT start in the thousands.  This kernel is kept as the worked example of an inexact swap and of
 what post-training then has to recover (results below).
 
 ## SFT and benchmark results
@@ -214,7 +215,7 @@ so FLA's short convolution falls back to PyTorch (a printed notice, not an
 error); the KDA backward kernel prints benign Triton 3.2 scheduling warnings.
 
 > Note: the original `scripts/sft.py::chunked_cross_entropy_with_backward` (now
-> `qwen_linswap/sft_utils.py`) had a scaling bug (the LM-head / tied-embedding gradient was a token *sum* while the
+> `linswap/sft_utils.py`) had a scaling bug (the LM-head / tied-embedding gradient was a token *sum* while the
 > hidden-state gradient was a token *mean*, inflating the pre-clip grad norm to
 > ~1000).  It is fixed in this revision; all runs below use the fixed loss.
 > The GDN2 numbers in docs/gdn2_experiment_log.md were produced with the old loss.
@@ -241,7 +242,7 @@ error); the KDA backward kernel prints benign Triton 3.2 scheduling warnings.
 | mamba2 distill → full 50 steps | 752M | 1.4908 | 4.44 |
 | deltanet base (inexact init) | – | 12.845 | 3.8e5 |
 | deltanet full 50 steps, lr 1e-5 | 752M | 8.628 | 5586 |
-| deltanet full 200 steps, lr 1e-5 | 752M | 7.174 | 1305 |
+| deltanet full 200 / 500 steps, lr 1e-5 | 752M | 7.174 / 6.145 | 1305 / 466 |
 | deltanet full 200 steps, lr 1e-4 | 752M | 6.220 | 502 |
 | deltanet distill (layer 200 + KL 300 @8K) | 752M | 2.461 | 11.7 |
 | deltanet distill → full 50 steps | 752M | 2.092 | 8.1 |
@@ -257,7 +258,7 @@ between GDN's scalar gates and GDN2's three full-rank gates, and the dense
 
 `niah_multivalue` is value-level accuracy.  (These runs predate the `evaluate` stage; today
 `linswap.py evaluate` writes the same numbers to `outputs/eval/<name>/summary.csv`.)  Every model was evaluated with the
-same `QwenLinearSwapModelWrapper`, chat template, greedy decoding and 128 new tokens.
+same `LinearSwapModelWrapper`, chat template, greedy decoding and 128 new tokens.
 
 | model | niah_single_1 | niah_multikey_1 | niah_multivalue |
 |---|---|---|---|
@@ -276,10 +277,12 @@ same `QwenLinearSwapModelWrapper`, chat template, greedy decoding and 128 new to
 | rwkv7 full 50 | 100.0 | 100.0 | 99.0 |
 | mamba2 base (inexact) | 0.0 | 0.0 | 0.0 |
 | mamba2 distill (500) | 100.0 | 72.0 | 53.25 |
+| mamba2 SFT only, 50 / 500 steps | 0.0 / 95.0 | 0.0 / 66.0 | 1.0 / 55.0 |
 | mamba2 distill → full 50 | 100.0 | 77.0 | 73.5 |
 | deltanet base (inexact) | 0.0 | 0.0 | 0.0 |
 | deltanet full 200 (lr 1e-4), no distill | 0.0 | 0.0 | 0.0 |
 | deltanet distill (500) | 0.0 | 0.0 | 0.0 |
+| deltanet SFT only, 500 steps | 0.0 | 0.0 | 0.0 |
 | deltanet distill → full 50 | 0.0 | 0.0 | 0.0 |
 
 Reading: the three function-preserving bases are indistinguishable (single- and
@@ -304,16 +307,67 @@ delta-rule erase and keeps the decay: distillation returns it exactly to the
 original model's validation loss (6.85 → 1.73, the same 1.74 the bases have),
 SFT takes it to 1.49 (exact kernels: 1.39), single-needle retrieval is fully
 recovered but multi-key / multi-value retrieval stays at 77 / 73.5 against 99+
-for every kernel with an erase term — with 131K tokens of distractors a
-scalar-decay state cannot overwrite stale associations.  DeltaNet removes the
+for every kernel with an erase term — consistent with a scalar-decay state
+being unable to overwrite stale associations, with the caveat that the adapter
+also changes the write scaling (see the Mamba-2 section).  DeltaNet removes the
 decay and keeps the erase, and is the harsher counter-example: at init the model is
 unusable (validation CE 12.8, all NIAH scores 0), and 200 full-SFT steps at
 lr 1e-4 only bring the loss to 6.2.  Distillation (`linswap.py distill`,
 layer alignment 200 steps + KL 300 steps at 8K tokens, ~20 min) is far more
 effective — 2.46, and 2.09 after the standard 50-step SFT — yet 131K-token
-retrieval stays at 0: a state without decay accumulates every key it has ever
-seen, so at 30× the distillation length the recurrent memory is saturated.
+retrieval stays at 0: a state without decay never forgets, so at 16× the distillation length it is
+full of stale associations.
 At short context the distilled model does retrieve — `niah_single_1` / `niah_multikey_1` reach 56 / 36 at 4K tokens (25 samples) and 0 / 24 at 16K — so the failure is specifically the loss of long-range forgetting, not of the mechanism itself.
+
+### Hard RULER tasks at 131072 tokens (50 samples per task)
+
+`niah_multikey_2/3` (essay haystack, distractor needles), `niah_multiquery`,
+`vt` (variable tracking), `cwe` / `fwe` (common / frequent word extraction),
+`qa_1` (SQuAD) and `qa_2` (HotpotQA); `outputs/eval/hard/summary.csv`.
+
+| model | val CE | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
+|---|---|---|---|---|---|---|---|---|---|---|
+| gdn-base |  | 100.0 | 98.0 | 100.0 | 0.0 | 36.4 | 87.3 | 36.0 | 36.0 | 61.7 |
+| gdn-full-50 |  | 96.0 | 94.0 | 100.0 | 19.2 | 2.2 | 97.3 | 42.0 | 46.0 | 62.1 |
+| gdn2-full-50 |  | 96.0 | 94.0 | 100.0 | 19.2 | 3.0 | 97.3 | 40.0 | 44.0 | 61.7 |
+| kda-full-50 |  | 96.0 | 94.0 | 100.0 | 19.2 | 3.2 | 98.0 | 44.0 | 46.0 | 62.5 |
+| rwkv7-full-50 |  | 96.0 | 94.0 | 100.0 | 19.2 | 2.2 | 96.7 | 42.0 | 42.0 | 61.5 |
+| kda-gate-100 |  | 100.0 | 96.0 | 100.0 | 5.6 | 3.0 | 92.7 | 40.0 | 34.0 | 58.9 |
+| rwkv7-gate-100 |  | 100.0 | 92.0 | 100.0 | 4.4 | 0.4 | 90.7 | 32.0 | 34.0 | 56.7 |
+| mamba2-sft-50 | 2.655 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 7.3 | 2.0 | 0.0 | 1.2 |
+| mamba2-sft-500 | 1.709 | 12.0 | 2.0 | 6.5 | 0.0 | 1.0 | 30.7 | 10.0 | 0.0 | 7.8 |
+| mamba2-distill-500 | 1.729 | 52.0 | 16.0 | 49.0 | 0.4 | 0.4 | 6.0 | 10.0 | 24.0 | 19.7 |
+| mamba2-distill-sft-50 |  | 62.0 | 6.0 | 83.5 | 20.4 | 0.4 | 59.3 | 26.0 | 32.0 | 36.2 |
+| deltanet-sft-50 | 8.584 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| deltanet-sft-500 | 6.145 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| deltanet-distill-500 | 2.461 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| deltanet-distill-sft-50 | 2.092 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 4.0 | 0.5 |
+
+Reading (50 samples ⇒ ±7 points): the four exact kernels' full-SFT checkpoints
+are indistinguishable on every task, including the ones that separate models
+(variable tracking, QA), confirming the easy-NIAH conclusion.  Mamba-2 without
+the delta-rule erase collapses on the distractor-heavy needle tasks (6 on
+`niah_multikey_3`) and on frequent-word extraction — consistent with the missing
+delta-rule erase, although this adapter also changes β-scaled writes to Δ-scaled
+writes, and a control that keeps β-scaled writes is needed before attributing
+the gap to the erase alone.  Two SFT effects are visible for
+every kernel: the 50-step retrieval-flavoured SFT lifts variable tracking (0 →
+19) and QA, but destroys common-word extraction (36 → ~3): the fine-tuned
+models answer the counting task with confident, fabricated lists.  Gate-only
+checkpoints keep the base model's needle scores but gain far less on `vt`
+(5) than full SFT (19).
+
+Distillation vs SFT alone for the approximate targets (val CE = validation loss
+on the same 40 examples; 25 samples per task for DeltaNet, 50 otherwise):
+Mamba-2 trained with SFT only reaches the *same* validation loss after 500
+steps as distillation does (1.71 vs 1.73) yet retrieves far worse (multikey_2
+12 vs 52, multiquery 6.5 vs 49), and the recipe-matched 50-step SFT-only run is
+at zero; distillation followed by the standard 50-step SFT is best on every
+retrieval task (avg 36).  The validation loss on SFT data therefore does not
+measure what the swap broke; matching the teacher's distributions transfers the
+retrieval behaviour that SFT alone does not.  DeltaNet is 0 everywhere at
+131K regardless of recipe (SFT-only 500 steps: 6.14 val CE; distill: 2.46;
+distill+SFT: 2.09) — see the short-context numbers above.
 
 Compared with the earlier GDN2 numbers in docs/gdn2_experiment_log.md (different machine, old loss
 scaling): base 92.5 → full SFT 98.25 on `niah_multivalue`; here 96.25 → 99.25.

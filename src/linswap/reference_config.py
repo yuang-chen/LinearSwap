@@ -1,6 +1,9 @@
 import torch
 
-QWEN3_5_CONFIG = {
+"""Reference architecture dict for Qwen/Qwen3.5-0.8B (what ``backbones.load_backbone_config`` returns for it).
+Kept for tests and as documentation of the config keys; models are normally configured from the HF config."""
+
+QWEN3_5_0_8B_CONFIG = {
     "vocab_size": 248_320,
     "context_length": 262_144,
     "emb_dim": 1_024,

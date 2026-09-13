@@ -1,157 +1,257 @@
-# qwen-linswap — swapping the linear-attention kernel of Qwen3.5 in place
+<div align="center">
+  <img src="docs/logo.png" width="520" alt="LinearSwap">
+</div>
 
-Qwen3.5-0.8B is a hybrid model: three Gated-DeltaNet (GDN) linear-attention
-layers for every full-attention layer.  This repository replaces those GDN
-layers with **other linear-attention kernels** — Gated DeltaNet-2, Kimi Delta
-Attention, DeltaNet, … — *without retraining from scratch*: the new layer is
-initialised from the pretrained GDN weights so that (whenever the new kernel
-contains GDN as a special case) the model computes exactly the same function
-at step 0, and is then post-trained with long-context SFT and benchmarked on
-RULER.
+<div align="center">
 
-Everything is driven by a kernel registry, so adding a kernel is one file and
-the same verification, training and evaluation tooling applies to it.
+**Swap the linear-attention kernel of a pretrained hybrid LLM in place — no pretraining.**
 
-```
-kernel name    recurrence (flash-linear-attention kernel)      init from GDN                          new params  exact
-gdn            Gated DeltaNet                                  weight copy (control)                  0.59M       yes
-gdn2           Gated DeltaNet-2                                scalar beta/decay tiled → b/w/f gates  113M        yes
-kda            Kimi Delta Attention                            scalar decay tiled → low-rank f_proj   7.4M        yes
-kda_fullgate   Kimi Delta Attention                            … with a dense f_proj                  38M         yes
-rwkv7          RWKV-7 generalised delta rule (DPLR)            decay/beta tiled, removal key = key    14M         yes
-mamba2         Mamba-2 SSD (scalar decay, no delta rule)       shared weights copied, erase dropped   0.30M       no
-deltanet       DeltaNet (delta rule, no decay)                 shared weights copied, decay dropped   0.29M       no
-```
+</div>
 
-Kernels marked *exact* reproduce the pretrained model at step 0 and go
-straight to SFT.  The others cannot represent the pretrained layer; for them
-the pipeline first **distils** the swapped model from the original (layer-wise
-output matching, then end-to-end KL) and only then fine-tunes.  Mamba-1 and
-Mamba-3 are not included: their kernels only exist in `mamba_ssm`, whose
-current release needs a newer Triton than torch 2.6 allows and breaks
-`flash-linear-attention` when installed here (see docs/framework.md).
+LinearSwap replaces the linear-attention layers of a pretrained hybrid language model
+(a backbone that interleaves Gated DeltaNet layers with full attention, such as
+Qwen3-Next / Qwen3.5 / Qwen3.6 / Qwen3.8) with **other linear recurrences** —
+Gated DeltaNet-2, Kimi Delta Attention, RWKV-7, Mamba-2, DeltaNet — and keeps the
+rest of the network.  When the target recurrence contains Gated DeltaNet as a
+special case, the new layer is initialised so that the model computes *exactly
+the same function* at step 0 (verified to bf16 noise); when it does not, the
+model is distilled from the original.  Both are then post-trained with
+long-context SFT and benchmarked on RULER, all through one command line with
+`--kernel <name>` as the only thing that changes between experiments.
 
+Because every kernel starts from the same pretrained function, LinearSwap turns
+"which recurrence is better?" into a controlled post-training experiment instead
+of a set of incomparable pretraining runs.  The kernels come from
+[flash-linear-attention](https://github.com/fla-org/flash-linear-attention).
 
-## Layout
+* [Kernels](#kernels)
+* [Installation](#installation)
+* [Usage](#usage)
+  * [Building a swapped model](#building-a-swapped-model)
+  * [Token mixing layers](#token-mixing-layers)
+  * [Adding a kernel](#adding-a-kernel)
+* [Training](#training)
+* [Evaluation](#evaluation)
+* [Benchmarks](#benchmarks)
+* [Citation](#citation)
+* [Acknowledgements](#acknowledgements)
 
-- `linswap.py` — the command line: `verify`, `distill`, `posttrain`, `evaluate`, `run` (the whole chain), `kernels`.
-- `src/qwen_linswap/` — the framework: kernel registry, the Qwen3.5 backbone with pluggable linear layers, weight loading, data and SFT utilities. Kernels live in `src/qwen_linswap/kernels/`, one file each; that directory is the extension point. The workflow stages live in `src/qwen_linswap/pipeline/`.
-- `tests/test_kernels.py` — regression test over all registered kernels.
-- `RULER/` — the RULER benchmark, vendored with a wrapper for swapped models.
-- `docs/` — design, per-kernel details and all results (`framework.md`), plus the notes and log of the original GDN→GDN2 experiment.
+## Kernels
 
-## Workflow
+| name | recurrence (FLA kernel) | init from the pretrained GDN layer | new params | exact |
+|---|---|---|---|---|
+| `gdn` | Gated DeltaNet | weight copy (control) | 0.59M | yes |
+| `gdn2` | Gated DeltaNet-2 | scalar beta/decay tiled into b/w/f gates | 113M | yes |
+| `kda` | Kimi Delta Attention | scalar decay tiled into the low-rank per-channel gate | 7.4M | yes |
+| `kda_fullgate` | Kimi Delta Attention | … with a dense decay projection | 38M | yes |
+| `rwkv7` | RWKV-7-style DPLR generalised delta rule | decay/beta tiled, removal key = key | 14M | yes |
+| `mamba2` | Mamba-2-style SSD (scalar decay, no erase) | shared weights copied, erase dropped | 0.30M | no |
+| `deltanet` | DeltaNet (erase, no decay) | shared weights copied, decay dropped | 0.29M | no |
 
-The workflow is **verify → (distill) → posttrain → evaluate**; each stage is one
-command, and `run` chains them for one kernel (distilling automatically when
-the kernel's init is not exact).
+"Exact" kernels reproduce the pretrained model at initialisation and go straight
+to SFT; the others are distilled first (`linswap.py distill`).  Parameter counts
+are for the 0.8B backbone.  Every target is the *recurrence* of the named
+architecture inside a backbone-compatible block (the backbone's projections,
+short convolutions and gated output norm are kept; e.g. RWKV-7's token shift and
+GroupNorm are not used) — see [docs/framework.md](docs/framework.md) for each
+mapping and why FLA's native RWKV-7 / Mamba-2 layers cannot express the
+pretrained weights.  Mamba-1 and Mamba-3 are not included: their kernels exist
+only in `mamba_ssm`, which needs a newer Triton than the pinned torch allows.
+
+## Installation
+
+Requirements: Python 3.11, PyTorch 2.6 (CUDA 12.4), Triton 3.2,
+`flash-linear-attention` 0.6, `transformers` ≥ 5.16, `datasets`, `einops`.
+The repository ships a `uv`-managed environment:
 
 ```bash
-source .venv/bin/activate
-python tests/test_kernels.py                  # every kernel builds, loads, matches the GDN control, round-trips
-
-# 1. verify: is the swap function preserving?  (the `gdn` baseline column is the bf16/Triton noise floor)
-python linswap.py verify --kernel kda --baseline gdn
-
-# 1b. distill (inexact kernels only): layer-wise alignment + KL against the original model
-python linswap.py distill --kernel mamba2           # -> outputs/mamba2/distill/checkpoint-N
-
-# 2. posttrain: gate-only and full SFT with the standard recipe (SFT data is prepared on first use)
-python linswap.py posttrain --kernel kda            # -> outputs/kda/sft_gate_only, outputs/kda/sft_full
-python linswap.py posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
-
-# 3. evaluate: validation loss + RULER for any set of base swaps / checkpoints, one summary table
-python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
-       --tasks niah_single_1,niah_multikey_1,niah_multivalue --lengths 131072 --samples 100 --name kda-vs-gdn
-                                                    # -> outputs/eval/kda-vs-gdn/summary.{csv,md,json}
-
-# all of the above for one kernel
-python linswap.py run --kernel kda
+git clone https://github.com/yuang-chen/LinearSwap && cd LinearSwap
+uv venv .venv && source .venv/bin/activate
+uv pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+uv pip install flash-linear-attention transformers datasets einops safetensors nltk wonderwords scipy beautifulsoup4 html2text pandas pyyaml
+uv pip install --no-build-isolation causal-conv1d      # optional: fast short-conv path
+huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
+python tests/test_kernels.py                            # every kernel builds, matches the control, round-trips
 ```
 
-Every stage accepts `--help`; the recipe knobs (steps, learning rates,
-training length, RULER tasks / lengths / sample count) are arguments, so
-comparisons between kernels use one command line with only `--kernel` changed.
+Do **not** install `mamba_ssm` into this environment (see
+[docs/framework.md](docs/framework.md#mamba-1-and-mamba-3-not-available-here)).
+RULER's word list and QA datasets are fetched by
+`RULER/scripts/data/synthetic/json/download_*.{py,sh}`.
+
+## Usage
+
+### Building a swapped model
 
 ```python
 import sys; sys.path.insert(0, "src")
-from qwen_linswap import build_model, list_kernels
-model = build_model("kda")                                       # Qwen3.5-0.8B weights, exact KDA init
-model = build_model(ckpt_dir="outputs/kda/sft_full/checkpoint-50")  # SFT checkpoint; kernel read from config.json
-out = model.generate(input_ids, max_new_tokens=32)               # greedy, cached decode
+from linswap import build_model, list_kernels
+
+model = build_model("kda", base_model_dir="models/Qwen3.5-0.8B")     # exact KDA init from the pretrained weights
+model = build_model(ckpt_dir="outputs/kda/sft_full/checkpoint-50")     # a checkpoint; kernel read from its config.json
+logits = model(input_ids)                                              # [B, T, vocab]
+out = model.generate(input_ids, max_new_tokens=32)                     # greedy, cached decode (KV + recurrent state)
 ```
 
-## Adding a kernel
+The architecture is read from the backbone's HF `config.json`; any GDN-based
+hybrid with the Qwen3-Next layer layout loads.  `python linswap.py kernels` lists
+the registered kernels.
 
-Create `src/qwen_linswap/kernels/<name>.py` with a `build(cfg, layer_idx)`
-that returns a token mixer with the FLA layer interface
-(`forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`),
-an `init_from_gdn(layer, hf_state_dict, layer_idx, model_prefix)` that copies
-or tiles the pretrained GDN tensors, and a `register_kernel(KernelSpec(...))`
-call; import it in `kernels/__init__.py`.  Make architectural changes in
-`build` (not in init) so the module structure is fixed before weights are
-loaded.  `kernels/common.py` documents the pretrained tensor layout and the GDN
-recurrence and provides the tiling / splitting helpers; `kernels/kda.py` is the
-template for an exact swap, `kernels/deltanet.py` for an inexact one.  Then run
-`tests/test_kernels.py` and `python linswap.py verify --kernel <name> --baseline gdn`.
+### Token mixing layers
 
-## Results (131K context, identical SFT recipe)
+Each kernel is an `nn.Module` with the flash-linear-attention layer interface,
+usable on its own:
 
-RULER at 131072 tokens, 100 samples per task, cached greedy decoding
-validation cross-entropy on 40 held-out examples.  Full tables and discussion in
+```python
+from linswap import get_kernel, load_hf_state_dict, load_backbone_config
+cfg = load_backbone_config("models/Qwen3.5-0.8B")
+spec = get_kernel("rwkv7")
+layer = spec.build(cfg, layer_idx=0)                                   # RWKV7DeltaLayer
+spec.init_from_gdn(layer, load_hf_state_dict("models/Qwen3.5-0.8B"), 0, "model.language_model")
+y, _, cache = layer(x)                                                 # x: [B, T, hidden]
+```
+
+### Adding a kernel
+
+One file, `src/linswap/kernels/<name>.py`, with
+
+* `build(cfg, layer_idx) -> nn.Module` — the token mixer, FLA layer interface
+  (`forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`).
+  Fix the module structure here so checkpoints load strictly.
+* `init_from_gdn(layer, hf_state_dict, layer_idx, model_prefix)` — copy or tile
+  the pretrained GDN tensors (`kernels/common.py` documents their layout and the
+  GDN recurrence and provides the splitting / tiling / low-rank-embedding helpers).
+* `register_kernel(KernelSpec(name, build, init_from_gdn, new_param_names, exact_init))`
+  and an import in `kernels/__init__.py`.
+
+`kernels/kda.py` is the template for an exact swap, `kernels/deltanet.py` for an
+inexact one.  Then `python tests/test_kernels.py` and
+`python linswap.py verify --kernel <name> --baseline gdn`: an exact swap sits at
+the `gdn` control's noise level on every check.
+
+## Training
+
+The workflow is **verify → (distill) → posttrain → evaluate**, one command each;
+`run` chains them for one kernel and distils automatically when the kernel's
+init is not exact.
+
+```bash
+python linswap.py verify    --kernel kda --baseline gdn        # layer / logits / layer-wise / cache / generation vs HF
+python linswap.py distill   --kernel mamba2                    # inexact kernels: layer alignment (200) + KL (300) @8K
+python linswap.py posttrain --kernel kda                       # gate-only (100 steps, 2e-4) and full SFT (50 steps, 1e-5)
+python linswap.py posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
+python linswap.py run       --kernel rwkv7                     # everything, results in outputs/eval/rwkv7/
+```
+
+SFT data (LongAlign-10k, LongAlpaca-12k, anti-haystack; Qwen chat format,
+non-assistant tokens masked, left-truncated) is prepared on first use.  The
+recipe is identical for every kernel — bf16, gradient checkpointing, chunked
+cross-entropy, micro-batch 1 × 2 accumulation, 131K training length — and every
+knob is a command-line argument.  Checkpoints record their kernel in
+`config.json`.  On one 143 GiB GPU a 131K micro-step takes ~10 s (262K: ~36 s,
+54 GiB); most SFT examples are far shorter, so a run takes minutes.
+
+## Evaluation
+
+```bash
+python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
+    --tasks niah_multikey_2,niah_multikey_3,niah_multiquery,vt,cwe,fwe,qa_1,qa_2 \
+    --lengths 131072 --samples 100 --name kda-vs-gdn                  # -> outputs/eval/kda-vs-gdn/summary.{csv,md,json}
+```
+
+`--models` takes kernel names (the base swap) and/or checkpoint directories
+(`label=path` to name a row).  The stage computes validation loss and drives
+RULER's own scripts (vendored under `RULER/`, with a wrapper for swapped
+models) for any tasks / lengths / sample counts, then writes one summary table.
+
+## Benchmarks
+
+Backbone Qwen3.5-0.8B, one seed, identical recipe.  Validation loss is the
+assistant-token SFT loss on 40 held-out examples (≤131K).  RULER at 131,072
+tokens with cached greedy decoding; the easy set uses 100 samples per task, the
+hard set 50 (≈ ±7 points).  Full tables and discussion in
 [docs/framework.md](docs/framework.md).
 
-| model | trainable | val CE | niah_single_1 | niah_multikey_1 | niah_multivalue |
+**Easy NIAH** (`niah_single_1` / `niah_multikey_1` / `niah_multivalue`)
+
+| model | trainable | val CE | single | multikey | multivalue |
 |---|---|---|---|---|---|
 | gdn base (exact copy) | – | 1.743 | 100 | 100 | 96.5 |
-| gdn2 base | – | 1.741 | 100 | 100 | 96.25 |
-| kda base | – | 1.742 | 100 | 100 | 95.75 |
-| rwkv7 base | – | 1.743 | 100 | 100 | 96.75 |
+| gdn2 / kda / rwkv7 base (tiled init) | – | 1.741–1.743 | 100 | 100 | 95.75–96.75 |
 | gdn gate-only 100 | 0.59M | 1.472 | 100 | 100 | 96.25 |
 | kda gate-only 100 | 7.4M | 1.427 | 100 | 100 | 97.5 |
+| rwkv7 gate-only 100 | 14M | 1.415 | 100 | 99 | 99.5 |
 | kda_fullgate gate-only 100 | 38M | 1.413 | 100 | 98 | 99.0 |
 | gdn2 gate-only 100 | 113M | 1.378 | 100 | 99 | 96.5 |
-| rwkv7 gate-only 100 | 14M | 1.415 | 100 | 99 | 99.5 |
-| gdn full 50 | 752M | 1.388 | 100 | 100 | 99.0 |
-| kda full 50 | 759M | 1.388 | 100 | 100 | 99.5 |
-| gdn2 full 50 | 865M | 1.389 | 100 | 100 | 99.25 |
-| rwkv7 full 50 | 766M | 1.388 | 100 | 100 | 99.0 |
+| gdn / gdn2 / kda / rwkv7 full 50 | all | 1.388–1.389 | 100 | 100 | 99.0–99.5 |
 | mamba2 base (inexact) | – | 6.854 | 0 | 0 | 0 |
-| mamba2 distill (layer 200 + KL 300, 8K) | 752M | 1.729 | 100 | 72 | 53.25 |
-| mamba2 distill → full SFT 50 | 752M | 1.491 | 100 | 77 | 73.5 |
+| mamba2 SFT only, 500 steps | all | 1.709 | 95 | 66 | 55 |
+| mamba2 distill only (500) | all | 1.729 | 100 | 72 | 53.25 |
+| mamba2 distill → full 50 | all | 1.491 | 100 | 77 | 73.5 |
 | deltanet base (inexact) | – | 12.845 | 0 | 0 | 0 |
-| deltanet SFT only, 200 steps (lr 1e-4) | 752M | 6.220 | 0 | 0 | 0 |
-| deltanet distill (layer 200 + KL 300, 8K) | 752M | 2.461 | 0 | 0 | 0 |
-| deltanet distill → full SFT 50 | 752M | 2.092 | 0 | 0 | 0 |
+| deltanet SFT only, 500 steps | all | 6.145 | 0 | 0 | 0 |
+| deltanet distill → full 50 | all | 2.092 | 0 | 0 | 0 |
 
-Take-aways: the exact swaps (GDN2, KDA) lose nothing at init; full SFT lands
-on the same loss and retrieval scores for every exact kernel; gate-only SFT is
-where kernels differ, and KDA's per-channel decay gate is a far cheaper
-gate-only handle for multi-value retrieval than GDN2's three dense gates.
-Mamba-2 (no delta-rule erase) is the recoverable inexact swap: distillation
-brings it back to the original model's loss (6.85 → 1.73) and SFT to 1.49,
-still above the exact kernels' 1.39, with single-needle retrieval fully back
-but multi-key / multi-value retrieval at 77 / 73.5 versus 99+ — the erase
-term is what the pretrained backbone uses for those.  DeltaNet shows what an
-inexact swap costs when the missing piece is the decay: dropping the decay destroys the
-pretrained function (validation CE 12.8, retrieval 0 at init).  Plain SFT barely
-helps (CE 6.2 after 200 steps at a 10× learning rate), whereas distillation from
-the original model recovers most of the language modelling loss (2.46, then
-2.09 after SFT) — but 131K-token retrieval stays at 0: without decay the
-recurrent state has no way to forget over such spans.  At short context the distilled model does retrieve — `niah_single_1` / `niah_multikey_1` reach 56 / 36 at 4K tokens (25 samples) and 0 / 24 at 16K — so the failure is specifically the loss of long-range forgetting, not of the mechanism itself.
+**Hard RULER** (`multikey_2` / `multikey_3` / `multiquery` / `vt` / `cwe` / `fwe` / `qa_1` / `qa_2`, average)
 
-## Setup
+| model | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
+|---|---|---|---|---|---|---|---|---|---|
+| gdn base | 100 | 98 | 100 | 0 | 36.4 | 87.3 | 36 | 36 | 61.7 |
+| gdn full 50 | 96 | 94 | 100 | 19.2 | 2.2 | 97.3 | 42 | 46 | 62.1 |
+| gdn2 full 50 | 96 | 94 | 100 | 19.2 | 3.0 | 97.3 | 40 | 44 | 61.7 |
+| kda full 50 | 96 | 94 | 100 | 19.2 | 3.2 | 98.0 | 44 | 46 | 62.5 |
+| rwkv7 full 50 | 96 | 94 | 100 | 19.2 | 2.2 | 96.7 | 42 | 42 | 61.5 |
+| kda gate-only 100 | 100 | 96 | 100 | 5.6 | 3.0 | 92.7 | 40 | 34 | 58.9 |
+| rwkv7 gate-only 100 | 100 | 92 | 100 | 4.4 | 0.4 | 90.7 | 32 | 34 | 56.7 |
+| mamba2 SFT only, 50 steps | 0 | 0 | 0 | 0 | 0 | 7.3 | 2 | 0 | 1.2 |
+| mamba2 SFT only, 500 steps | 12 | 2 | 6.5 | 0 | 1.0 | 30.7 | 10 | 0 | 7.8 |
+| mamba2 distill only (500) | 52 | 16 | 49 | 0.4 | 0.4 | 6.0 | 10 | 24 | 19.7 |
+| mamba2 distill → full 50 | 62 | 6 | 83.5 | 20.4 | 0.4 | 59.3 | 26 | 32 | 36.2 |
+| deltanet (any variant) | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0–4 | ~0 |
 
-Python environment: the `uv`-managed `.venv` (torch 2.6, transformers 5.16,
-flash-linear-attention 0.6.0).  Put `Qwen/Qwen3.5-0.8B` in `models/`; the SFT
-data is downloaded and tokenised on first use of `posttrain` / `evaluate`, and
-checkpoints and evaluation results go to `outputs/`.  Hardware notes and kernel caveats
-are in [docs/framework.md](docs/framework.md).
+What the numbers say:
+
+* The exact swaps lose nothing at init, and after the identical short full-SFT
+  recipe all four exact kernels tie on every task, easy and hard.  At this budget
+  the backbone dominates; the recurrence is invisible.
+* Gate-only SFT is where kernels differ: a per-channel decay gate (KDA, RWKV-7)
+  is a cheap handle for multi-value retrieval, GDN2's three dense gates are not,
+  despite the lowest validation loss.
+* Inexact swaps ablate the pretrained recurrence.  Mamba-2 (no erase) is brought
+  back to the original loss by distillation but plateaus on distractor-heavy
+  multi-key retrieval; DeltaNet (no decay) recovers loss and short-context
+  retrieval but nothing at 131K.  Distillation beats SFT alone at equal steps
+  (DeltaNet 2.46 vs 6.70 val CE after 500 steps), and for Mamba-2 it transfers
+  retrieval behaviour that SFT does not even at equal validation loss (multikey_2
+  52 vs 12 at val CE 1.73 vs 1.71).
+* The retrieval-flavoured SFT lifts variable tracking (0 → 19) but destroys
+  common-word extraction (36 → ~3) for every kernel — the fine-tuning data, not
+  the swap.
+
+## Citation
+
+If you use LinearSwap, please cite the repository:
+
+```bibtex
+@misc{linearswap2026,
+  title  = {LinearSwap: in-place swapping of linear-attention kernels in pretrained hybrid language models},
+  author = {Chen, Yuang},
+  year   = {2026},
+  url    = {https://github.com/yuang-chen/LinearSwap}
+}
+```
 
 ## Acknowledgements
 
-The Qwen3.5 backbone implementation started from Sebastian Raschka's
-[Qwen3.5 from-scratch notebook](https://github.com/rasbt/LLMs-from-scratch)
-(LLMs-from-scratch, bonus material).  Kernels come from
-[flash-linear-attention](https://github.com/fla-org/flash-linear-attention);
-evaluation uses NVIDIA's [RULER](https://github.com/NVIDIA/RULER).
+LinearSwap grew out of the GDN → GDN-2 in-place swap on Qwen3.5-0.8B
+([write-up](https://lutet.industries/posts/gdn2-swap/),
+[code](https://github.com/lutetjeff/gdn2-in-place)), whose function-preserving
+gate tiling, SFT recipe and RULER integration this project generalises; its
+experiment log is kept in [docs/gdn2_experiment_log.md](docs/gdn2_experiment_log.md).
+The backbone implementation started from Sebastian Raschka's
+[Qwen3.5 from-scratch notebook](https://github.com/rasbt/LLMs-from-scratch).
+Kernels come from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+(Songlin Yang, Yu Zhang and contributors); evaluation uses NVIDIA's
+[RULER](https://github.com/NVIDIA/RULER).  The architectures swapped in are
+Gated DeltaNet-2, Kimi Delta Attention (Kimi Linear), RWKV-7, Mamba-2 and DeltaNet,
+by their respective authors.
