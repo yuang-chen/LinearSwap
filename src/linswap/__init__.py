@@ -17,12 +17,18 @@ from .load_weights import (
 )
 from .model import LinearSwapModel, SwapCache
 from .registry import KernelSpec, get_kernel, list_kernels, register_kernel
+from .hf import LinearSwapCache, LinearSwapConfig, LinearSwapForCausalLM, register_auto_classes
+
+register_auto_classes()
 
 __all__ = [
     "describe",
     "load_backbone_config",
     "DEFAULT_BASE_MODEL_DIR",
     "KernelSpec",
+    "LinearSwapCache",
+    "LinearSwapConfig",
+    "LinearSwapForCausalLM",
     "LinearSwapModel",
     "SwapCache",
     "build_model",

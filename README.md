@@ -61,17 +61,16 @@ only in `mamba_ssm`, which needs a newer Triton than the pinned torch allows.
 ## Installation
 
 Requirements: Python 3.11, PyTorch 2.6 (CUDA 12.4), Triton 3.2,
-`flash-linear-attention` 0.6, `transformers` ≥ 5.16, `datasets`, `einops`.
-The repository ships a `uv`-managed environment:
+`flash-linear-attention` 0.6, `transformers` ≥ 5.16.
 
 ```bash
 git clone https://github.com/yuang-chen/LinearSwap && cd LinearSwap
 uv venv .venv && source .venv/bin/activate
 uv pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-uv pip install flash-linear-attention transformers datasets einops safetensors nltk wonderwords scipy beautifulsoup4 html2text pandas pyyaml
-uv pip install --no-build-isolation causal-conv1d      # optional: fast short-conv path
+uv pip install -e ".[eval]"                              # linswap + the `linswap` command; [eval] adds RULER's deps
+uv pip install --no-build-isolation causal-conv1d       # optional: fast short-conv path
 huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
-python tests/test_kernels.py                            # every kernel builds, matches the control, round-trips
+python tests/test_kernels.py && python tests/test_hf.py  # kernels match the control; HF round-trip is exact
 ```
 
 Do **not** install `mamba_ssm` into this environment (see
@@ -84,7 +83,6 @@ RULER's word list and QA datasets are fetched by
 ### Building a swapped model
 
 ```python
-import sys; sys.path.insert(0, "src")
 from linswap import build_model, list_kernels
 
 model = build_model("kda", base_model_dir="models/Qwen3.5-0.8B")     # exact KDA init from the pretrained weights
@@ -94,8 +92,39 @@ out = model.generate(input_ids, max_new_tokens=32)                     # greedy,
 ```
 
 The architecture is read from the backbone's HF `config.json`; any GDN-based
-hybrid with the Qwen3-Next layer layout loads.  `python linswap.py kernels` lists
-the registered kernels.
+hybrid with the Qwen3-Next layer layout loads.  `linswap kernels` lists the
+registered kernels.
+
+### Hugging Face `transformers`
+
+Swapped models are `PreTrainedModel`s (`LinearSwapForCausalLM`, architecture
+`linswap`, registered with the Auto classes on `import linswap`), so they save,
+load, generate and evaluate like any HF model:
+
+```bash
+linswap export --kernel kda --out hf/Qwen3.5-0.8B-KDA                        # base swap
+linswap export --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
+```
+
+```python
+import torch, linswap                                                  # `import linswap` registers the architecture
+from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained("hf/Qwen3.5-0.8B-KDA")
+model = AutoModelForCausalLM.from_pretrained("hf/Qwen3.5-0.8B-KDA", dtype=torch.bfloat16).cuda()
+ids = tok.apply_chat_template([{"role": "user", "content": "Hi"}], add_generation_prompt=True, return_tensors="pt", return_dict=True).to("cuda")
+print(tok.decode(model.generate(**ids, max_new_tokens=32, do_sample=False)[0]))
+```
+
+`LinearSwapForCausalLM.from_swap("kda")` does the conversion in memory;
+`save_pretrained` / `push_to_hub` write a Hub-ready checkpoint (config,
+safetensors, tokenizer, model card).  Checkpoints use **Qwen's tensor layout**:
+`model.embed_tokens`, `model.layers.{i}.{self_attn,mlp,input_layernorm,post_attention_layernorm}`,
+`model.norm`, `lm_head` are byte-identical to the backbone's tensors (194 of 194
+for the `gdn` kernel), and only `model.layers.{i}.linear_attn.*` differs per
+kernel — so quantisers, converters and diff tools see "Qwen with a different
+linear layer".  Native `model.pt` checkpoints use the same keys (older
+`trf_blocks.*` checkpoints are converted on load).  Current limits: batch size 1 without
+padding, greedy or sampling decoding (the model is stateful, so no beam search).
 
 ### Token mixing layers
 
@@ -141,7 +170,10 @@ python linswap.py distill   --kernel mamba2                    # inexact kernels
 python linswap.py posttrain --kernel kda                       # gate-only (100 steps, 2e-4) and full SFT (50 steps, 1e-5)
 python linswap.py posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
 python linswap.py run       --kernel rwkv7                     # everything, results in outputs/eval/rwkv7/
+python linswap.py export    --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
 ```
+
+(`linswap <stage>` after `pip install -e .`, `python linswap.py <stage>` from a bare checkout.)
 
 SFT data (LongAlign-10k, LongAlpaca-12k, anti-haystack; Qwen chat format,
 non-assistant tokens masked, left-truncated) is prepared on first use.  The

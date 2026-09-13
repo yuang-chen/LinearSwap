@@ -25,3 +25,8 @@ RULER/scripts/benchmark_root/
 RULER/scripts/data/synthetic/json/PaulGrahamEssays.json
 RULER/scripts/data/synthetic/json/squad.json
 RULER/scripts/data/synthetic/json/hotpotqa.json
+
+# packaging artifacts
+*.egg-info/
+build/
+dist/

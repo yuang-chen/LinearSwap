@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "src"))  # works without `pip install -e .`
 
 from linswap import build_model, get_kernel, list_kernels, load_hf_state_dict  # noqa: E402
 

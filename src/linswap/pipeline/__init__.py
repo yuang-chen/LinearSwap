@@ -4,7 +4,7 @@ Every stage module exposes ``add_args(parser)`` and ``main(args)`` and is wired
 into the ``linswap.py`` command-line entry point at the repository root.
 """
 
-from . import distill, evaluate, posttrain, run, verify  # noqa: F401
+from . import distill, evaluate, export, posttrain, run, verify  # noqa: F401
 
 STAGES = {
     "verify": verify,
@@ -12,4 +12,5 @@ STAGES = {
     "posttrain": posttrain,
     "evaluate": evaluate,
     "run": run,
+    "export": export,
 }

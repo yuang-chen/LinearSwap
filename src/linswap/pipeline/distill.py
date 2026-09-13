@@ -67,11 +67,11 @@ def add_args(ap):
 
 # ------------------------------------------------------------------- helpers
 def linear_blocks(model):
-    return [(i, b) for i, b in enumerate(model.trf_blocks) if b.layer_type == "linear_attention"]
+    return [(i, b) for i, b in enumerate(model.layers) if b.layer_type == "linear_attention"]
 
 
 def linear_params(model):
-    return [p for _, b in linear_blocks(model) for p in b.token_mixer.parameters()]
+    return [p for _, b in linear_blocks(model) for p in b.linear_attn.parameters()]
 
 
 @torch.no_grad()
@@ -79,8 +79,8 @@ def teacher_layer_io(teacher, ids):
     """Inputs and outputs of every linear-attention layer of the teacher."""
     ins, outs, hooks = {}, {}, []
     for i, b in linear_blocks(teacher):
-        hooks.append(b.norm1.register_forward_hook(lambda m, a, o, i=i: ins.__setitem__(i, o.detach())))
-        hooks.append(b.token_mixer.register_forward_hook(lambda m, a, o, i=i: outs.__setitem__(i, o[0].detach())))
+        hooks.append(b.input_layernorm.register_forward_hook(lambda m, a, o, i=i: ins.__setitem__(i, o.detach())))
+        hooks.append(b.linear_attn.register_forward_hook(lambda m, a, o, i=i: outs.__setitem__(i, o[0].detach())))
     teacher(ids, return_hidden_before_norm=True)
     for h in hooks:
         h.remove()
@@ -142,7 +142,7 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
                     t_in, t_out = teacher_layer_io(teacher, ids)
                     loss = 0.0
                     for i, b in linear_blocks(student):
-                        o, _, _ = b.token_mixer(t_in[i])
+                        o, _, _ = b.linear_attn(t_in[i])
                         loss = loss + F.mse_loss(o.float(), t_out[i].float())
                     (loss / args.grad_accum_steps).backward()
                     acc += loss.item()
@@ -150,7 +150,7 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
                     with torch.no_grad():
                         t_hidden = teacher(ids, return_hidden=True)
                     s_hidden = student(ids, return_hidden=True)
-                    acc += chunked_kl_with_backward(s_hidden, t_hidden, student.out_head, teacher.out_head,
+                    acc += chunked_kl_with_backward(s_hidden, t_hidden, student.lm_head, teacher.lm_head,
                                                     args.ce_chunk_size, args.kl_temperature,
                                                     1.0 / args.grad_accum_steps)
         gn = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)

@@ -165,9 +165,11 @@ class LinearSwapModelWrapper:
 
         from transformers import AutoTokenizer
 
-        repo = Path(__file__).resolve().parents[3]
-        sys.path.insert(0, str(repo / "src"))
-        from linswap import DEFAULT_BASE_MODEL_DIR, build_model
+        try:
+            from linswap import DEFAULT_BASE_MODEL_DIR, build_model
+        except ImportError:  # not pip-installed: fall back to the checkout
+            sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+            from linswap import DEFAULT_BASE_MODEL_DIR, build_model
 
         model_dir = Path(name_or_path)
         cfg = {}

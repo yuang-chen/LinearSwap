@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linswap"
+version = "0.1.0"
+description = "In-place swapping of linear-attention kernels in pretrained hybrid language models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Yuang Chen" }]
+keywords = ["linear attention", "gated deltanet", "kda", "rwkv", "mamba", "flash-linear-attention", "llm"]
+dependencies = [
+    "torch>=2.6",
+    "transformers>=5.16",
+    "flash-linear-attention>=0.6",
+    "einops",
+    "safetensors",
+    "huggingface_hub",
+    "datasets",
+    "numpy",
+]
+
+[project.optional-dependencies]
+eval = ["nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm"]
+
+[project.scripts]
+linswap = "linswap.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yuang-chen/LinearSwap"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+linswap = ["py.typed"]

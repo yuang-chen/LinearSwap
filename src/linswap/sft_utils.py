@@ -97,9 +97,9 @@ def chunked_cross_entropy_eval(hidden_states, labels, lm_head, chunk_size=2048, 
 def compute_loss(model, batch, chunk_size=2048, do_backward=False, loss_scale=1.0):
     hidden = model(batch["input_ids"], return_hidden=True)
     if do_backward:
-        return chunked_cross_entropy_with_backward(hidden, batch["labels"], model.out_head,
+        return chunked_cross_entropy_with_backward(hidden, batch["labels"], model.lm_head,
                                                    chunk_size=chunk_size, loss_scale=loss_scale)
-    return chunked_cross_entropy_eval(hidden, batch["labels"], model.out_head, chunk_size=chunk_size)
+    return chunked_cross_entropy_eval(hidden, batch["labels"], model.lm_head, chunk_size=chunk_size)
 
 
 @torch.no_grad()

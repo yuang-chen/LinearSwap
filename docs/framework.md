@@ -8,8 +8,10 @@ RULER — all through one kernel name.  The first new kernel is **Kimi Delta
 Attention (KDA)**.
 
 ```
-linswap.py             command line: verify | posttrain | evaluate | run | kernels
+pyproject.toml         `pip install -e .` -> the `linswap` command (src/linswap/cli.py); linswap.py is a checkout launcher
 src/linswap/
+  hf.py                LinearSwapConfig / LinearSwapCache / LinearSwapForCausalLM (transformers PreTrainedModel,
+                       registered with AutoConfig / AutoModelForCausalLM on import) + export()
   registry.py          KernelSpec + register_kernel / get_kernel / list_kernels
   kernels/common.py    helpers shared by init recipes (pretrained tensor layout, split fused qkv/conv, tiling, Qwen output gate)
   kernels/gdn.py       "gdn"          original GDN on FLA kernels (exact copy; control baseline)
@@ -19,7 +21,8 @@ src/linswap/
   kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
-  model.py             LinearSwapModel(cfg, kernel) + SwapCache
+  model.py             LinearSwapBackbone (model.embed_tokens / layers / norm) + LinearSwapModel (adds lm_head)
+                       — Qwen's module tree and state-dict keys; SwapCache
   components.py        RMSNorm / GQA / MLP / RoPE;  backbones.py  load_backbone_config() from the HF config
   load_weights.py      build_model(kernel | ckpt_dir), HF-format and native checkpoint loading
   data.py              SFT data preparation (LongAlign / LongAlpaca / anti-haystack);  sft_utils.py  chunked CE etc.
@@ -27,8 +30,9 @@ src/linswap/
   pipeline/distill.py    stage 1½ (inexact kernels): layer-wise alignment + KL distillation from the original
   pipeline/posttrain.py  stage 2: gate-only / full SFT (prepares data on first use; --init_ckpt to start from distill)
   pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
-  pipeline/run.py        the three stages chained for one kernel
-tests/test_kernels.py  regression test over all registered kernels
+  pipeline/run.py        the stages chained for one kernel
+  pipeline/export.py     write a swapped model / checkpoint as an HF checkpoint (safetensors + tokenizer + card)
+tests/test_kernels.py  regression test over all registered kernels;  tests/test_hf.py  HF save/load/generate round-trip
 RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linswap[_nocache]
 ```
 

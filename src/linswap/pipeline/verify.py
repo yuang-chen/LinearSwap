@@ -103,7 +103,7 @@ def check_layerwise(model, hf, tokenizer, device, kernel, length=256):
         return _h
 
     hs = []
-    for i, blk in enumerate(model.trf_blocks):
+    for i, blk in enumerate(model.layers):
         hs.append(blk.register_forward_hook(hook(ours_tr, i)))
     for i, blk in enumerate(hf.model.layers):
         hs.append(blk.register_forward_hook(hook(hf_tr, i)))
@@ -114,9 +114,9 @@ def check_layerwise(model, hf, tokenizer, device, kernel, length=256):
         h.remove()
     print(f"  [{kernel}] per-block output diff vs HF (T={length}); L=linear, A=full attention")
     line = []
-    for i in range(len(model.trf_blocks)):
+    for i in range(len(model.layers)):
         d = (ours_tr[i] - hf_tr[i]).abs()
-        tag = "L" if model.trf_blocks[i].layer_type == "linear_attention" else "A"
+        tag = "L" if model.layers[i].layer_type == "linear_attention" else "A"
         line.append(f"{i:02d}{tag}:{d.max().item():.3f}/{d.mean().item():.4f}")
         if len(line) == 4:
             print("    " + "  ".join(line)); line = []

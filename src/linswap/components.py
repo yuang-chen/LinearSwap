@@ -77,15 +77,12 @@ class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         dtype = cfg["dtype"]
-        self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=dtype, bias=False)
-        self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=dtype, bias=False)
-        self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=dtype, bias=False)
+        self.gate_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=dtype, bias=False)
+        self.up_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=dtype, bias=False)
+        self.down_proj = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=dtype, bias=False)
 
     def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = F.silu(x_fc1) * x_fc2
-        return self.fc3(x)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class GroupedQueryAttention(nn.Module):
@@ -104,11 +101,11 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
 
-        self.W_query = nn.Linear(d_in, self.d_out * 2, bias=False, dtype=dtype)
-        self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
-        self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
-
-        self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
+        # Qwen3.5 gated attention: q_proj produces queries and the sigmoid output gate.
+        self.q_proj = nn.Linear(d_in, self.d_out * 2, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
 
         if qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=1e-6)
@@ -119,13 +116,13 @@ class GroupedQueryAttention(nn.Module):
     def forward(self, x, mask, cos, sin, start_pos=0, cache=None, use_cache=False):
         b, num_tokens, _ = x.shape
 
-        q_and_gate = self.W_query(x)
+        q_and_gate = self.q_proj(x)
         q_and_gate = q_and_gate.view(b, num_tokens, self.num_heads, self.head_dim * 2)
         queries, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(b, num_tokens, self.d_out)
 
-        keys = self.W_key(x)
-        values = self.W_value(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
         queries = queries.transpose(1, 2)
         keys_new = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
@@ -196,5 +193,5 @@ class GroupedQueryAttention(nn.Module):
 
         context = attn_output.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         context = context * torch.sigmoid(gate)
-        out = self.out_proj(context)
+        out = self.o_proj(context)
         return out, next_cache
