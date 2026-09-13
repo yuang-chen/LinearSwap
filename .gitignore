@@ -1,5 +1,6 @@
 # Python environments
 .venv/
+.venv-*
 
 # Large generated artifacts
 /data/

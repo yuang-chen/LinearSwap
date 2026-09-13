@@ -1,7 +1,7 @@
 """Stage 0 — run: verify → (distill) → posttrain → evaluate for one kernel with the standard recipe.
 
-    python linswap.py run --kernel kda                      # full pipeline, results in outputs/eval/kda
-    python linswap.py run --kernel kda --modes full --tasks niah_single_1 --lengths 4096 --samples 10
+    linswap run --kernel kda                      # full pipeline, results in outputs/eval/kda
+    linswap run --kernel kda --modes full --tasks niah_single_1 --lengths 4096 --samples 10
 
 Kernels registered with ``exact_init=False`` (or ``--distill``) are distilled from
 the original model first and SFT starts from the distilled checkpoint.  The base

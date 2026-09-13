@@ -18,12 +18,22 @@ from fla.modules.l2norm import l2_norm
 
 
 class BackboneMixer(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, conv_size=4, norm_eps=1e-6, layer_idx=None, qk_l2norm=True):
+    """``num_v_heads`` may be a multiple of ``num_heads`` (grouped value heads, as in the larger Qwen
+    backbones): q/k are computed for ``num_heads`` and repeated per value-head group before the
+    recurrence, so ``recurrence`` always sees q, k, v with ``num_v_heads`` heads."""
+
+    def __init__(self, hidden_size, head_dim, num_heads, num_v_heads=None, conv_size=4, norm_eps=1e-6,
+                 layer_idx=None, qk_l2norm=True):
         super().__init__()
         self.hidden_size = hidden_size
         self.head_k_dim = self.head_v_dim = head_dim
-        self.num_heads = self.num_v_heads = num_heads
-        self.key_dim = self.value_dim = num_heads * head_dim
+        self.num_heads = num_heads
+        self.num_v_heads = num_v_heads or num_heads
+        if self.num_v_heads % num_heads:
+            raise ValueError(f"num_v_heads={self.num_v_heads} must be a multiple of num_heads={num_heads}")
+        self.v_groups = self.num_v_heads // num_heads
+        self.key_dim = num_heads * head_dim
+        self.value_dim = self.num_v_heads * head_dim
         self.layer_idx = layer_idx
         self.qk_l2norm = qk_l2norm
         self.use_short_conv = True
@@ -55,18 +65,22 @@ class BackboneMixer(nn.Module):
         q, conv_q = self.q_conv1d(x=self.q_proj(hidden_states), cache=conv_q, output_final_state=use_cache)
         k, conv_k = self.k_conv1d(x=self.k_proj(hidden_states), cache=conv_k, output_final_state=use_cache)
         v, conv_v = self.v_conv1d(x=self.v_proj(hidden_states), cache=conv_v, output_final_state=use_cache)
-        q, k, v = (rearrange(x, "b t (h d) -> b t h d", h=H) for x in (q, k, v))
+        q, k = (rearrange(x, "b t (h d) -> b t h d", h=H) for x in (q, k))
+        v = rearrange(v, "b t (h d) -> b t h d", h=self.num_v_heads)
         if self.qk_l2norm:
             q, k = l2_norm(q), l2_norm(k)
+        if self.v_groups > 1:  # grouped value heads: share each q/k head across its value-head group
+            q, k = (x.repeat_interleave(self.v_groups, dim=2) for x in (q, k))
         state = last_state["recurrent_state"] if last_state is not None else None
         o, state = self.recurrence(hidden_states, q, k, v, state, use_cache)
         update_layer_cache(self, past_key_values, recurrent_state=state, conv_state=(conv_q, conv_k, conv_v), offset=T)
-        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "b t (h d) -> b t h d", h=H))
+        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "b t (h d) -> b t h d", h=self.num_v_heads))
         return self.o_proj(rearrange(o, "b t h d -> b t (h d)")), None, past_key_values
 
 
 def build_backbone_mixer(mixer_cls, cfg, layer_idx, **extra):
-    if cfg["linear_num_key_heads"] != cfg["linear_num_value_heads"] or cfg["linear_key_head_dim"] != cfg["linear_value_head_dim"]:
-        raise ValueError(f"{mixer_cls.__name__}: matching key/value head counts and dims are required")
+    if cfg["linear_key_head_dim"] != cfg["linear_value_head_dim"]:
+        raise ValueError(f"{mixer_cls.__name__}: key and value head dims must match")
     return mixer_cls(hidden_size=cfg["emb_dim"], head_dim=cfg["linear_key_head_dim"], num_heads=cfg["linear_num_key_heads"],
-                     conv_size=cfg["linear_conv_kernel_dim"], norm_eps=cfg.get("rms_norm_eps", 1e-6), layer_idx=layer_idx, **extra)
+                     num_v_heads=cfg["linear_num_value_heads"], conv_size=cfg["linear_conv_kernel_dim"],
+                     norm_eps=cfg.get("rms_norm_eps", 1e-6), layer_idx=layer_idx, **extra)

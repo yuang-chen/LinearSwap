@@ -12,7 +12,8 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Yuang Chen" }]
 keywords = ["linear attention", "gated deltanet", "kda", "rwkv", "mamba", "flash-linear-attention", "llm"]
 dependencies = [
-    "torch>=2.6",
+    "torch>=2.7",
+    "triton>=3.3",
     "transformers>=5.16",
     "flash-linear-attention>=0.6,<0.7",
     "einops",
@@ -24,6 +25,10 @@ dependencies = [
 
 [project.optional-dependencies]
 eval = ["nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm"]
+# Mamba-1 / Mamba-3 kernels (mamba_ssm needs triton>=3.5, i.e. torch>=2.9).  Install these with
+#   pip install --no-deps --no-build-isolation --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
+# so that mamba-ssm cannot replace your torch build; see README "Installation".
+mamba = ["causal-conv1d>=1.5", "mamba-ssm>=2.3.2"]
 
 [project.scripts]
 linswap = "linswap.cli:main"

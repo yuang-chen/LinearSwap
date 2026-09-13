@@ -64,7 +64,8 @@ def build_fla_layer(layer_cls, cfg: dict, layer_idx: int, layer_kwargs: dict | C
 def register_fla_kernel(name: str, layer_cls, *, description: str, new_param_names=(), exact_init: bool,
                         layer_kwargs=None, output_gate: str = "qwen", gate_attr: str = "g_proj",
                         norm_attr: str = "o_norm", post_build: Callable[[nn.Module, dict], None] | None = None,
-                        init_extra: Callable[[nn.Module, dict], None] | None = None, notes: str = "") -> KernelSpec:
+                        init_extra: Callable[[nn.Module, dict], None] | None = None, notes: str = "",
+                        copy_shared: bool = True) -> KernelSpec:
     def build(cfg, layer_idx):
         layer = build_fla_layer(layer_cls, cfg, layer_idx, layer_kwargs, output_gate, gate_attr, norm_attr)
         if post_build is not None:
@@ -73,7 +74,8 @@ def register_fla_kernel(name: str, layer_cls, *, description: str, new_param_nam
 
     def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
         src = get_gdn_source(gdn_state, layer_idx, model_prefix)
-        copy_shared_from_gdn(layer, src, gate_attr, norm_attr)
+        if copy_shared:  # layers with fused projections (Mamba-1/3) do the whole mapping in init_extra
+            copy_shared_from_gdn(layer, src, gate_attr, norm_attr)
         if init_extra is not None:
             init_extra(layer, src)
         mark_hf_initialized(layer)

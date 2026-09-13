@@ -8,7 +8,7 @@ RULER — all through one kernel name.  The first new kernel is **Kimi Delta
 Attention (KDA)**.
 
 ```
-pyproject.toml         `pip install -e .` -> the `linswap` command (src/linswap/cli.py); linswap.py is a checkout launcher
+pyproject.toml         `pip install -e .` -> the `linswap` command (src/linswap/cli.py; also `python -m linswap`)
 src/linswap/
   hf.py                LinearSwapConfig / LinearSwapCache / LinearSwapForCausalLM (transformers PreTrainedModel,
                        registered with AutoConfig / AutoModelForCausalLM on import) + export()
@@ -24,6 +24,8 @@ src/linswap/
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
   kernels/gla.py       "gla"          Gated Linear Attention, stock FLA layer, no custom code — inexact swap
+  kernels/mamba3.py    "mamba3"       FLA Mamba3 (mamba_ssm kernels), GDN decay mapped into the fused in_proj — inexact
+  kernels/mamba1.py    "mamba1"       FLA Mamba (mamba_ssm kernels), values/gate/conv copied — inexact
   model.py             LinearSwapBackbone (model.embed_tokens / layers / norm) + LinearSwapModel (adds lm_head)
                        — Qwen's module tree and state-dict keys; SwapCache
   components.py        RMSNorm / GQA / MLP / RoPE;  backbones.py  load_backbone_config() from the HF config
@@ -35,7 +37,8 @@ src/linswap/
   pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
   pipeline/run.py        the stages chained for one kernel
   pipeline/export.py     write a swapped model / checkpoint as an HF checkpoint (safetensors + tokenizer + card)
-tests/test_kernels.py  regression test over all registered kernels;  tests/test_hf.py  HF save/load/generate round-trip
+tests/                 test_kernels.py (all kernels vs control), test_hf.py (HF round-trip), test_batch.py (padded batches), test_gva.py (grouped value heads)
+examples/quickstart.ipynb
 RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linswap[_nocache]
 ```
 
@@ -43,11 +46,11 @@ RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linsw
 
 ```bash
 source .venv/bin/activate
-python linswap.py verify    --kernel kda --baseline gdn
-python linswap.py distill   --kernel mamba2                      # inexact kernels: outputs/mamba2/distill
-python linswap.py posttrain --kernel kda                         # gate_only + full, outputs/kda/sft_*
-python linswap.py evaluate  --models kda outputs/kda/sft_full/checkpoint-50 --name kda   # outputs/eval/kda/summary.*
-python linswap.py run       --kernel kda                         # all three
+linswap verify    --kernel kda --baseline gdn
+linswap distill   --kernel mamba2                      # inexact kernels: outputs/mamba2/distill
+linswap posttrain --kernel kda                         # gate_only + full, outputs/kda/sft_*
+linswap evaluate  --models kda outputs/kda/sft_full/checkpoint-50 --name kda   # outputs/eval/kda/summary.*
+linswap run       --kernel kda                         # all three
 ```
 
 ```python
@@ -75,7 +78,7 @@ Write `src/linswap/kernels/<name>.py` with
   `kernels/__init__.py`.  `new_param_names` are the parameter components
   trained by `--mode gate_only`.
 
-Then `tests/test_kernels.py` and `python linswap.py verify --kernel <name> --baseline gdn` tell you whether the
+Then `tests/test_kernels.py` and `linswap verify --kernel <name> --baseline gdn` tell you whether the
 init is function preserving: every number should sit at the same level as the
 `gdn` column, which is pure Triton/bf16 noise.
 
@@ -102,7 +105,7 @@ which keeps them invisible at init but gives them non-zero gradient so SFT
 can use the extra rank.  `kda_fullgate` uses a dense 2048×1024 `f_proj`
 instead.  New parameters: 7.4M (`kda`) / 38M (`kda_fullgate`) vs 113M for GDN2.
 
-### Verification (`python linswap.py verify --kernel kda --baseline gdn`)
+### Verification (`linswap verify --kernel kda --baseline gdn`)
 
 All numbers are at the level of the `gdn` control (bf16 Triton noise vs HF's
 implementation):
@@ -147,21 +150,41 @@ write by Δ_t rather than beta_t, so the init is inexact (top-1 agreement with
 the original 0.07 on the test prompt) and the model is distilled first.
 ``mamba_ssm`` is not required.
 
-### Mamba-1 and Mamba-3: not available here
+### Mamba-1 and Mamba-3 (via ``mamba_ssm``)
 
-Both kernels exist only in ``mamba_ssm`` (selective-scan CUDA kernels for
-Mamba-1, Triton/TileLang kernels for Mamba-3).  Installing ``mamba-ssm``
-2.3.2 replaces torch with a CUDA-13 build, and even a ``--no-deps`` source
-build cannot be imported: the package needs ``triton.set_allocator`` (Triton
-≥ 3.3) while torch 2.6 pins Triton 3.2, and because FLA's ``fla.layers.mamba2``
-imports it at package-import time the broken import takes ``import fla`` down
-with it.  Mamba-1's per-(channel, state) decay also has no FLA equivalent.
-Adding them needs a separate environment (torch ≥ 2.7, Triton ≥ 3.3, FLA
-re-validated) — the kernel spec would then be a thin wrapper around FLA's
-``Mamba``/``Mamba3`` layers plus a partial weight copy, and the distill stage
-applies unchanged.
+Both kernels wrap FLA's ``Mamba`` / ``Mamba3`` layers, whose scan kernels come
+from ``mamba_ssm`` (selective-scan CUDA for Mamba-1, Triton for Mamba-3's SISO
+path).  ``mamba_ssm`` 2.3.2 requires Triton ≥ 3.5 (its Mamba-3 kernel uses a
+``tl.dot`` shape Triton 3.4 rejects), which means torch ≥ 2.9; the project
+environment was therefore moved from torch 2.6 / Triton 3.2 — below FLA's own
+``torch>=2.7, triton>=3.3`` requirement — to torch 2.9.1 / Triton 3.5.1, and
+all test suites and the ``verify`` numbers were re-checked there (same noise
+floor).  Install ``mamba_ssm`` only with ``--no-deps --no-build-isolation``:
+resolved normally it pulls a different torch build.  The two kernels register
+only when the kernels import (``fla.layers.mamba{,3}.is_fast_path_available``).
 
-## Distillation for inexact swaps (`linswap.py distill`)
+* ``mamba3``: one SSM group per head so B/C have k/q's shape; ``z``, ``x``, ``B``,
+  ``C`` and ``dd_dt`` rows of the fused ``in_proj`` are copied from the gate,
+  value, key, query and decay projections; the data-dependent ``A`` rows are
+  zeroed with a bias equal to the inverse-softplus of ``exp(A_log)`` so the
+  decay starts exactly at GDN's; rotary angles and the trapezoid coefficient
+  are zeroed (identity rotation, neutral mixing); ``B_norm`` / ``C_norm``
+  weights are ``1/√S`` so the RMSNorms act as GDN's L2 normalisation, with the
+  ``1/√K`` query scale folded into ``C_norm``; ``D``, ``B_bias``, ``C_bias``
+  start at 0; the per-head SiLU-gated output norm gets the backbone's norm
+  weight tiled.  Still different from GDN: no erase, Δ-scaled writes, no
+  short convolution — inexact, distil first.  Cached single-token decoding uses
+  `mamba_ssm`'s CuTe-DSL step kernel (`nvidia-cutlass-dsl`, `quack-kernels`); with
+  cutlass-dsl 4.7.1 the published `quack-kernels` releases either lack an API the
+  kernel needs (0.3.x) or pass one cutlass rejects (0.6.5), so decode is
+  unsupported here — evaluate Mamba-3 with `--no_cache` (full-prefix recompute
+  per token) at moderate lengths until the upstream versions line up.
+* ``mamba1``: per-channel selective SSM with ``state_size = 128`` (the same
+  number of state entries as GDN); values, gate, the value convolution and
+  ``out_proj`` are copied, the SSM parameters keep Mamba's init and the output
+  is gated without a norm — the least GDN-like target in the registry.
+
+## Distillation for inexact swaps (`linswap distill`)
 
 Teacher: ``gdn`` (exact copy of the original model).  Student: the swapped
 model.  Sequences: the SFT corpus, left-truncated to ``--max_length``
@@ -208,7 +231,7 @@ what post-training then has to recover (results below).
 
 ## SFT and benchmark results
 
-Recipe (identical for every kernel, `linswap.py posttrain`): data
+Recipe (identical for every kernel, `linswap posttrain`): data
 `data/sft/len262144` left-truncated to 131072, bf16, gradient checkpointing,
 micro-batch 1 × 2 accumulation, AdamW, clip 1.0, seed 42.
 `gate_only`: 100 steps, lr 2e-4 on `new_param_names`, backbone frozen.
@@ -216,10 +239,12 @@ micro-batch 1 × 2 accumulation, AdamW, clip 1.0, seed 42.
 a 131K micro-step takes ~10 s, a 262K micro-step ~36 s / 54 GiB, so every run
 finishes in well under 10 minutes because most examples are short (median 9K tokens).
 
-Environment: Python 3.11 in the `uv` venv with torch 2.6, transformers 5.16,
-flash-linear-attention 0.6.0 and Triton 3.2.  `causal-conv1d` is not installed,
-so FLA's short convolution falls back to PyTorch (a printed notice, not an
-error); the KDA backward kernel prints benign Triton 3.2 scheduling warnings.
+Environment: Python 3.11 in the `uv` venv.  The 0.8B results in this document
+were produced with torch 2.6 / Triton 3.2 (FLA's short convolution on its
+PyTorch fallback until `causal-conv1d` was built); the environment was later
+moved to torch 2.9.1 / CUDA 12.8 / Triton 3.5.1 with `causal-conv1d` and
+`mamba_ssm` built from source, where every exact kernel re-verifies at the
+same noise floor.
 
 > Note: the original `scripts/sft.py::chunked_cross_entropy_with_backward` (now
 > `linswap/sft_utils.py`) had a scaling bug (the LM-head / tied-embedding gradient was a token *sum* while the
@@ -264,7 +289,7 @@ between GDN's scalar gates and GDN2's three full-rank gates, and the dense
 ### RULER at 131072 tokens (100 samples per task, cached decode)
 
 `niah_multivalue` is value-level accuracy.  (These runs predate the `evaluate` stage; today
-`linswap.py evaluate` writes the same numbers to `outputs/eval/<name>/summary.csv`.)  Every model was evaluated with the
+`linswap evaluate` writes the same numbers to `outputs/eval/<name>/summary.csv`.)  Every model was evaluated with the
 same `LinearSwapModelWrapper`, chat template, greedy decoding and 128 new tokens.
 
 | model | niah_single_1 | niah_multikey_1 | niah_multivalue |
@@ -319,7 +344,7 @@ being unable to overwrite stale associations, with the caveat that the adapter
 also changes the write scaling (see the Mamba-2 section).  DeltaNet removes the
 decay and keeps the erase, and is the harsher counter-example: at init the model is
 unusable (validation CE 12.8, all NIAH scores 0), and 200 full-SFT steps at
-lr 1e-4 only bring the loss to 6.2.  Distillation (`linswap.py distill`,
+lr 1e-4 only bring the loss to 6.2.  Distillation (`linswap distill`,
 layer alignment 200 steps + KL 300 steps at 8K tokens, ~20 min) is far more
 effective — 2.46, and 2.09 after the standard 50-step SFT — yet 131K-token
 retrieval stays at 0: a state without decay never forgets, so at 16× the distillation length it is

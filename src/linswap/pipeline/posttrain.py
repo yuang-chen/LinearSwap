@@ -1,10 +1,10 @@
 """Stage 2 — posttrain: SFT of a swapped model (data preparation included).
 
-    python linswap.py posttrain --kernel kda                       # gate_only then full, standard recipe
-    python linswap.py posttrain --kernel kda --modes full --full_steps 200 --full_lr 1e-4
+    linswap posttrain --kernel kda                       # gate_only then full, standard recipe
+    linswap posttrain --kernel kda --modes full --full_steps 200 --full_lr 1e-4
 
 Recipe (identical for every kernel): bf16, gradient checkpointing, chunked
-cross-entropy, micro-batch 1 × ``--grad_accum_steps``, AdamW, grad-clip 1.0.
+cross-entropy, micro-batch ``--batch_size`` (right-padded) × ``--grad_accum_steps``, AdamW, grad-clip 1.0.
 ``gate_only`` trains only the kernel's ``new_param_names``; ``full`` trains
 everything (optionally after ``--warmup_gate_steps`` gate-only steps).  The SFT
 data is prepared on first use.  Checkpoints go to
@@ -46,6 +46,7 @@ def add_args(ap):
     ap.add_argument("--full_lr", type=float, default=1e-5)
     ap.add_argument("--warmup_gate_steps", type=int, default=0, help="full mode: gate-only optimizer steps first")
     ap.add_argument("--grad_accum_steps", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=1, help="examples per micro-batch (right-padded)")
     ap.add_argument("--eval_every", type=int, default=25)
     ap.add_argument("--eval_batches", type=int, default=10)
     ap.add_argument("--save_every", type=int, default=25)
@@ -136,7 +137,7 @@ def train_one(args, mode, data_dir, out_dir) -> Path:
     train_ds = TruncatedDataset(load_from_disk(Path(data_dir) / "train"), args.max_length)
     val_ds = TruncatedDataset(load_from_disk(Path(data_dir) / "validation"), args.max_length)
     g = torch.Generator().manual_seed(args.seed + global_step)
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_fn, generator=g)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, generator=g)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
     train_iter = iter(train_loader)
 

@@ -1,7 +1,7 @@
 """Stage — export: write a swapped model as a Hugging Face checkpoint.
 
-    python linswap.py export --kernel kda --out hf/Qwen3.5-0.8B-KDA                 # base swap
-    python linswap.py export --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
+    linswap export --kernel kda --out hf/Qwen3.5-0.8B-KDA                 # base swap
+    linswap export --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
 
 The result loads with ``AutoModelForCausalLM.from_pretrained`` after ``import linswap``
 and can be pushed to the Hub with ``huggingface-cli upload`` / ``push_to_hub``.

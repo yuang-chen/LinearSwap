@@ -174,24 +174,36 @@ class LinearSwapModel(nn.Module):
     # ---- generate
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens, eos_token_id=None, temperature=0.0, top_k=1, top_p=1.0,
-                 use_cache=True):
-        """Greedy decoding (sampling arguments are accepted for API compatibility)."""
+                 use_cache=True, pad_token_id=None):
+        """Greedy decoding for a batch of equal-length (unpadded) prompts; sampling arguments are
+        accepted for API compatibility.  Rows that hit ``eos_token_id`` (an int or a list) are
+        frozen and padded with ``pad_token_id`` (default: the EOS id) until every row is finished."""
+        if max_new_tokens <= 0:
+            return input_ids
+        eos = None
+        if eos_token_id is not None:
+            eos = torch.as_tensor(eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id],
+                                  device=input_ids.device)
+        pad = pad_token_id if pad_token_id is not None else (int(eos[0]) if eos is not None else 0)
         self.reset_cache_state()
         prefix = input_ids
+        B = input_ids.shape[0]
+        finished = torch.zeros(B, dtype=torch.bool, device=input_ids.device)
         cache = SwapCache(len(self.model.layers)) if use_cache else None
-        logits = self(prefix, cache=cache, use_cache=use_cache, last_logits_only=True)
-        next_token = logits.argmax(dim=-1, keepdim=True)
-        prefix = torch.cat([prefix, next_token], dim=1)
-        if eos_token_id is not None and next_token.item() == eos_token_id:
-            return prefix
-        for _ in range(max_new_tokens - 1):
-            if use_cache:
+        next_token = None
+        for step in range(max_new_tokens):
+            if step == 0:
+                logits = self(prefix, cache=cache, use_cache=use_cache, last_logits_only=True)
+            elif use_cache:
                 logits = self(next_token, cache=cache, use_cache=True, last_logits_only=True)
             else:
                 logits = self(prefix, last_logits_only=True)
             next_token = logits.argmax(dim=-1, keepdim=True)
+            if eos is not None:
+                next_token = torch.where(finished[:, None], torch.full_like(next_token, pad), next_token)
+                finished |= (next_token == eos).any(dim=-1)
             prefix = torch.cat([prefix, next_token], dim=1)
-            if eos_token_id is not None and next_token.item() == eos_token_id:
+            if eos is not None and bool(finished.all()):
                 break
         return prefix
 

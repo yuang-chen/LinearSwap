@@ -1,8 +1,8 @@
 """Stage 1 — verify: is the swapped model a function-preserving replacement of the HF backbone?
 
-    python linswap.py verify --kernel kda [--baseline gdn] [--checks layer,logits,layerwise,cache,generation]
+    linswap verify --kernel kda [--baseline gdn] [--checks layer,logits,layerwise,cache,generation]
                                           [--lengths 8,64,512,4096]
-    python linswap.py verify --ckpt outputs/kda/sft_full/checkpoint-50 --checks cache,generation
+    linswap verify --ckpt outputs/kda/sft_full/checkpoint-50 --checks cache,generation
 
 Checks (all use the pretrained Qwen3.5-0.8B weights, function-preserving init):
     layer       pretrained linear layers 0/1/2 in isolation vs transformers'

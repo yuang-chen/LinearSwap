@@ -1,7 +1,7 @@
 """Stage 1½ — distill: recover the pretrained function for an *inexact* swap.
 
-    python linswap.py distill --kernel deltanet                 # layer alignment, then KL distillation
-    python linswap.py distill --kernel mamba2 --stages kl --kl_steps 500
+    linswap distill --kernel deltanet                 # layer alignment, then KL distillation
+    linswap distill --kernel mamba2 --stages kl --kl_steps 500
 
 Teacher: the original model (``gdn`` kernel, exact copy of the HF backbone).
 Student: the swapped model.  Two stages, both on the SFT corpus truncated to

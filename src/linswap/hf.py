@@ -10,9 +10,9 @@
     model = LinearSwapForCausalLM.from_swap("kda", base_model_dir="models/Qwen3.5-0.8B")
     model.save_pretrained("hf/Qwen3.5-0.8B-KDA")
 
-Limitations (inherited from the backbone implementation): batch size 1 without padding
-(an ``attention_mask`` containing zeros is rejected); greedy / sampling decoding only —
-the model is stateful (recurrent state + KV cache), so beam search is unsupported.
+Limitations: batches must be unpadded or right-padded (loss / logits); generation needs
+equal-length prompts; greedy / sampling decoding only — the model is stateful (recurrent
+state + KV cache), so beam search is unsupported.
 """
 
 from __future__ import annotations
@@ -173,7 +173,12 @@ class LinearSwapForCausalLM(LinearSwapPreTrainedModel, GenerationMixin):
         if inputs_embeds is not None:
             raise ValueError("LinearSwapForCausalLM takes input_ids, not inputs_embeds")
         if attention_mask is not None and not bool(attention_mask.all()):
-            raise ValueError("padding is not supported: use batch size 1 / unpadded sequences")
+            # Right padding is exact for a causal model (padded positions never influence real ones);
+            # left padding would need a mask inside attention / a recurrent-state reset.
+            if not bool((attention_mask.cummin(dim=1).values == attention_mask).all()):
+                raise ValueError("left padding is not supported: pad on the right (tokenizer.padding_side = 'right')")
+            if past_key_values is not None or use_cache:
+                raise ValueError("padded batches are supported for loss / logits only, not for cached generation")
         use_cache = self.config.use_cache if use_cache is None else use_cache
         if use_cache and past_key_values is None:
             past_key_values = LinearSwapCache(len(self.model.layers))

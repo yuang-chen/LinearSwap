@@ -1,7 +1,7 @@
 """Stage 3 — evaluate: validation loss + RULER for any set of swapped models.
 
-    python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn --name kda-vs-gdn
-    python linswap.py evaluate --models kda --tasks niah_single_1 --lengths 4096,32768 --samples 20
+    linswap evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn --name kda-vs-gdn
+    linswap evaluate --models kda --tasks niah_single_1 --lengths 4096,32768 --samples 20
 
 ``--models`` entries are kernel names (the base, function-preserving swap) or
 checkpoint directories written by ``posttrain``.  Results go to

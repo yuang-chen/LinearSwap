@@ -48,34 +48,48 @@ of a set of incomparable pretraining runs.  The kernels come from
 | `mamba2` | Mamba-2-style SSD (scalar decay, no erase) | shared weights copied, erase dropped | 0.30M | no |
 | `deltanet` | DeltaNet (erase, no decay) | shared weights copied, decay dropped | 0.29M | no |
 | `gla` | Gated Linear Attention (per-channel decay, no erase) | shared weights copied, decay MLP at FLA init | 0.92M | no |
+| `mamba3` † | Mamba-3 (data-dependent decay, trapezoidal, rotary state) | GDN decay / projections mapped into the fused `in_proj`, rotary and trapezoid neutral | 0.05M | no |
+| `mamba1` † | Mamba-1 selective SSM (per-channel, no q/k) | values, gate, conv and `out_proj` copied; SSM params at Mamba init | 19M | no |
 
 "Exact" kernels reproduce the pretrained model at initialisation and go straight
-to SFT; the others are distilled first (`linswap.py distill`).  Parameter counts
-are for the 0.8B backbone.  Every target is the *recurrence* of the named
+to SFT; the others are distilled first (`linswap distill`).  Parameter counts
+are for the 0.8B backbone.  † `mamba1` / `mamba3` use `mamba_ssm`'s kernels through
+FLA's `Mamba` / `Mamba3` layers and are registered only when those import (see
+Installation).  Mamba-3's single-token decode step additionally needs `mamba_ssm`'s
+CuTe-DSL kernel (`nvidia-cutlass-dsl` + `quack-kernels`), which did not run with the
+currently published versions; prefill, training and distillation work, and `evaluate
+--no_cache` recomputes the prefix per generated token instead.  Every target is the *recurrence* of the named
 architecture inside a backbone-compatible block (the backbone's projections,
 short convolutions and gated output norm are kept; e.g. RWKV-7's token shift and
 GroupNorm are not used) — see [docs/framework.md](docs/framework.md) for each
 mapping and why FLA's native RWKV-7 / Mamba-2 layers cannot express the
-pretrained weights.  Mamba-1 and Mamba-3 are not included: their kernels exist
-only in `mamba_ssm`, which needs a newer Triton than the pinned torch allows.
+pretrained weights.
 
 ## Installation
 
-Requirements: Python 3.11, PyTorch 2.6 (CUDA 12.4), Triton 3.2,
+Requirements: Python 3.11, PyTorch ≥ 2.7 with a matching Triton ≥ 3.3
+(FLA's requirement; tested with torch 2.9.1 / CUDA 12.8 / Triton 3.5.1),
 `flash-linear-attention` 0.6, `transformers` ≥ 5.16.
 
 ```bash
 git clone https://github.com/yuang-chen/LinearSwap && cd LinearSwap
-uv venv .venv && source .venv/bin/activate
-uv pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+uv venv .venv --python 3.11 && source .venv/bin/activate
+uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 uv pip install -e ".[eval]"                              # linswap + the `linswap` command; [eval] adds RULER's deps
-uv pip install --no-build-isolation causal-conv1d       # optional: fast short-conv path
 huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 python tests/test_kernels.py && python tests/test_hf.py  # kernels match the control; HF round-trip is exact
+                                                         # (also tests/test_batch.py, tests/test_gva.py)
 ```
 
-Do **not** install `mamba_ssm` into this environment (see
-[docs/framework.md](docs/framework.md#mamba-1-and-mamba-3-not-available-here)).
+Optional, for the fast short-convolution path and the `mamba1` / `mamba3` kernels
+(`mamba_ssm` needs Triton ≥ 3.5, i.e. torch ≥ 2.9; always build it *without*
+dependency resolution or it will replace your torch):
+
+```bash
+CUDA_HOME=/usr/local/cuda MAX_JOBS=32 uv pip install --no-deps --no-build-isolation \
+    --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
+```
+
 RULER's word list and QA datasets are fetched by
 `RULER/scripts/data/synthetic/json/download_*.{py,sh}`.
 
@@ -93,7 +107,8 @@ out = model.generate(input_ids, max_new_tokens=32)                     # greedy,
 ```
 
 The architecture is read from the backbone's HF `config.json`; any GDN-based
-hybrid with the Qwen3-Next layer layout loads.  `linswap kernels` lists the
+hybrid with the Qwen3-Next layer layout loads, including the grouped-value-head
+configurations of the larger Qwen models (all kernels except `gla` and `deltanet`).  `linswap kernels` lists the
 registered kernels.
 
 ### Hugging Face `transformers`
@@ -118,14 +133,16 @@ print(tok.decode(model.generate(**ids, max_new_tokens=32, do_sample=False)[0]))
 
 `LinearSwapForCausalLM.from_swap("kda")` does the conversion in memory;
 `save_pretrained` / `push_to_hub` write a Hub-ready checkpoint (config,
-safetensors, tokenizer, model card).  Checkpoints use **Qwen's tensor layout**:
+safetensors, tokenizer, model card) — e.g. `huggingface-cli upload <user>/Qwen3.5-0.8B-KDA hf/Qwen3.5-0.8B-KDA`.  Checkpoints use **Qwen's tensor layout**:
 `model.embed_tokens`, `model.layers.{i}.{self_attn,mlp,input_layernorm,post_attention_layernorm}`,
 `model.norm`, `lm_head` are byte-identical to the backbone's tensors (194 of 194
 for the `gdn` kernel), and only `model.layers.{i}.linear_attn.*` differs per
 kernel — so quantisers, converters and diff tools see "Qwen with a different
 linear layer".  Native `model.pt` checkpoints use the same keys (older
-`trf_blocks.*` checkpoints are converted on load).  Current limits: batch size 1 without
-padding, greedy or sampling decoding (the model is stateful, so no beam search).
+`trf_blocks.*` checkpoints are converted on load).  Limits: batches must be unpadded or
+right-padded for loss / logits, generation takes equal-length prompts (rows
+that finish are padded until all are done), and decoding is greedy or
+sampling only (the model is stateful, so no beam search).
 
 ### Token mixing layers
 
@@ -187,20 +204,20 @@ The workflow is **verify → (distill) → posttrain → evaluate**, one command
 init is not exact.
 
 ```bash
-python linswap.py verify    --kernel kda --baseline gdn        # layer / logits / layer-wise / cache / generation vs HF
-python linswap.py distill   --kernel mamba2                    # inexact kernels: layer alignment (200) + KL (300) @8K
-python linswap.py posttrain --kernel kda                       # gate-only (100 steps, 2e-4) and full SFT (50 steps, 1e-5)
-python linswap.py posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
-python linswap.py run       --kernel rwkv7                     # everything, results in outputs/eval/rwkv7/
-python linswap.py export    --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
+linswap verify    --kernel kda --baseline gdn        # layer / logits / layer-wise / cache / generation vs HF
+linswap distill   --kernel mamba2                    # inexact kernels: layer alignment (200) + KL (300) @8K
+linswap posttrain --kernel kda                       # gate-only (100 steps, 2e-4) and full SFT (50 steps, 1e-5)
+linswap posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
+linswap run       --kernel rwkv7                     # everything, results in outputs/eval/rwkv7/
+linswap export    --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
 ```
 
-(`linswap <stage>` after `pip install -e .`, `python linswap.py <stage>` from a bare checkout.)
+(`linswap <stage>` after `pip install -e .`, `linswap <stage>` from a bare checkout.)
 
 SFT data (LongAlign-10k, LongAlpaca-12k, anti-haystack; Qwen chat format,
 non-assistant tokens masked, left-truncated) is prepared on first use.  The
 recipe is identical for every kernel — bf16, gradient checkpointing, chunked
-cross-entropy, micro-batch 1 × 2 accumulation, 131K training length — and every
+cross-entropy, micro-batch 1 (or `--batch_size N`, right-padded) × 2 accumulation, 131K training length — and every
 knob is a command-line argument.  Checkpoints record their kernel in
 `config.json`.  On one 143 GiB GPU a 131K micro-step takes ~10 s (262K: ~36 s,
 54 GiB); most SFT examples are far shorter, so a run takes minutes.
@@ -208,7 +225,7 @@ knob is a command-line argument.  Checkpoints record their kernel in
 ## Evaluation
 
 ```bash
-python linswap.py evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
+linswap evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
     --tasks niah_multikey_2,niah_multikey_3,niah_multiquery,vt,cwe,fwe,qa_1,qa_2 \
     --lengths 131072 --samples 100 --name kda-vs-gdn                  # -> outputs/eval/kda-vs-gdn/summary.{csv,md,json}
 ```

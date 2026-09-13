@@ -38,15 +38,17 @@ from .common import copy_, copy_shared_from_gdn, get_gdn_source, mark_hf_initial
 
 
 class Mamba2SSDLayer(BackboneMixer):
-    def __init__(self, hidden_size, head_dim, num_heads, conv_size=4, norm_eps=1e-6, layer_idx=None, qk_l2norm=True):
-        super().__init__(hidden_size, head_dim, num_heads, conv_size, norm_eps, layer_idx, qk_l2norm=qk_l2norm)
-        self.dt_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.A_log = nn.Parameter(torch.log(torch.empty(num_heads, dtype=torch.float32).uniform_(1, 16)))
+    def __init__(self, hidden_size, head_dim, num_heads, num_v_heads=None, conv_size=4, norm_eps=1e-6, layer_idx=None,
+                 qk_l2norm=True):
+        super().__init__(hidden_size, head_dim, num_heads, num_v_heads, conv_size, norm_eps, layer_idx, qk_l2norm=qk_l2norm)
+        HV = self.num_v_heads                       # Δ, A, D are per value head (SSD head)
+        self.dt_proj = nn.Linear(hidden_size, HV, bias=False)
+        self.A_log = nn.Parameter(torch.log(torch.empty(HV, dtype=torch.float32).uniform_(1, 16)))
         self.A_log._no_weight_decay = True
-        dt = torch.exp(torch.rand(num_heads) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
+        dt = torch.exp(torch.rand(HV) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
         self.dt_bias._no_weight_decay = True
-        self.D = nn.Parameter(torch.zeros(num_heads))
+        self.D = nn.Parameter(torch.zeros(HV))
         self.D._no_weight_decay = True
 
     def recurrence(self, hidden_states, q, k, v, state, use_cache):

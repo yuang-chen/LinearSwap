@@ -46,25 +46,28 @@ from .common import copy_, copy_shared_from_gdn, get_gdn_source, init_lowrank_ti
 
 
 class RWKV7DeltaLayer(BackboneMixer):
-    def __init__(self, hidden_size, head_dim, num_heads, conv_size=4, norm_eps=1e-6, layer_idx=None, lora_rank=128):
-        super().__init__(hidden_size, head_dim, num_heads, conv_size, norm_eps, layer_idx, qk_l2norm=True)
+    def __init__(self, hidden_size, head_dim, num_heads, num_v_heads=None, conv_size=4, norm_eps=1e-6, layer_idx=None,
+                 lora_rank=128):
+        super().__init__(hidden_size, head_dim, num_heads, num_v_heads, conv_size, norm_eps, layer_idx, qk_l2norm=True)
+        HV, K = self.num_v_heads, self.head_k_dim
+        self.gate_dim = HV * K                      # gates are per value head, per key channel
         # per-channel log decay:  g = -exp(A_log[h]) * softplus(f_proj(x) + dt_bias)   (RWKV-7's w_lora)
         self.f_proj = nn.Sequential(nn.Linear(hidden_size, lora_rank, bias=False),
-                                    nn.Linear(lora_rank, self.key_dim, bias=False))
-        self.A_log = nn.Parameter(torch.log(torch.empty(num_heads, dtype=torch.float32).uniform_(1, 16)))
+                                    nn.Linear(lora_rank, self.gate_dim, bias=False))
+        self.A_log = nn.Parameter(torch.log(torch.empty(HV, dtype=torch.float32).uniform_(1, 16)))
         self.A_log._no_weight_decay = True
-        dt = torch.exp(torch.rand(self.key_dim) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
+        dt = torch.exp(torch.rand(self.gate_dim) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
         self.dt_bias._no_weight_decay = True
         # per-channel in-context learning rate (RWKV-7's a_lora):  beta = sigmoid(b_proj(x))
         self.b_proj = nn.Sequential(nn.Linear(hidden_size, lora_rank, bias=False),
-                                    nn.Linear(lora_rank, self.key_dim, bias=False))
-        # removal-key modulation (RWKV-7's k_k):  kappa = l2norm(k * k_k)
-        self.k_k = nn.Parameter(torch.ones(self.key_dim))
+                                    nn.Linear(lora_rank, self.gate_dim, bias=False))
+        # removal-key modulation (RWKV-7's k_k):  kappa = l2norm(k * k_k), per value head
+        self.k_k = nn.Parameter(torch.ones(self.gate_dim))
         self.k_k._no_weight_decay = True
 
     def recurrence(self, hidden_states, q, k, v, state, use_cache):
-        B, T, H, K = k.shape
+        B, T, H, K = k.shape  # H == num_v_heads here (q/k already repeated per value-head group)
         g = -self.A_log.float().exp().view(1, 1, H, 1) * F.softplus(
             self.f_proj(hidden_states).float().view(B, T, H, K) + self.dt_bias.float().view(1, 1, H, K))
         beta = torch.sigmoid(self.b_proj(hidden_states).float()).view(B, T, H, K)
