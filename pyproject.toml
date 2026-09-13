@@ -14,7 +14,7 @@ keywords = ["linear attention", "gated deltanet", "kda", "rwkv", "mamba", "flash
 dependencies = [
     "torch>=2.6",
     "transformers>=5.16",
-    "flash-linear-attention>=0.6",
+    "flash-linear-attention>=0.6,<0.7",
     "einops",
     "safetensors",
     "huggingface_hub",

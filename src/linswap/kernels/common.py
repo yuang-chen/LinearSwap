@@ -102,19 +102,29 @@ def copy_qkv_and_conv(layer: nn.Module, src: dict) -> None:
     copy_(layer.v_conv1d.weight, cv, "v_conv1d")
 
 
-def use_qwen_output_gate(layer: nn.Module, hidden_size: int, value_dim: int, head_v_dim: int, eps: float) -> None:
+def use_qwen_output_gate(layer: nn.Module, hidden_size: int, value_dim: int, head_v_dim: int, eps: float,
+                         gate_attr: str = "g_proj", norm_attr: str = "o_norm") -> None:
     """Replace a layer's output gate with the backbone's parameterisation:
     full-rank ``g_proj`` (no bias) followed by RMSNorm(o) * SiLU(g)."""
     ref = layer.o_proj.weight
-    layer.g_proj = nn.Linear(hidden_size, value_dim, bias=False, device=ref.device, dtype=ref.dtype)
-    layer.o_norm = FusedRMSNormSwishGate(head_v_dim, eps=eps, device=ref.device, dtype=ref.dtype)
+    setattr(layer, gate_attr, nn.Linear(hidden_size, value_dim, bias=False, device=ref.device, dtype=ref.dtype))
+    setattr(layer, norm_attr, FusedRMSNormSwishGate(head_v_dim, eps=eps, device=ref.device, dtype=ref.dtype))
 
 
-def copy_output_gate(layer: nn.Module, src: dict) -> None:
-    g = layer.g_proj[0] if isinstance(layer.g_proj, nn.Sequential) else layer.g_proj
-    copy_(g.weight, src["z"], "g_proj")
-    copy_(layer.o_norm.weight, src["norm"], "o_norm")
+def copy_output_gate(layer: nn.Module, src: dict, gate_attr: str = "g_proj", norm_attr: str = "o_norm") -> None:
+    g = getattr(layer, gate_attr)
+    g = g[0] if isinstance(g, nn.Sequential) else g
+    copy_(g.weight, src["z"], gate_attr)
+    copy_(getattr(layer, norm_attr).weight, src["norm"], norm_attr)
     copy_(layer.o_proj.weight, src["out"], "o_proj")
+
+
+def copy_shared_from_gdn(layer: nn.Module, src: dict, gate_attr: str = "g_proj", norm_attr: str = "o_norm") -> None:
+    """Copy everything every delta-rule / linear-attention layer shares with the pretrained GDN
+    layer: q/k/v projections, the three short convolutions and the gated output path.  A kernel's
+    ``init_from_gdn`` then only has to handle its recurrence-specific parameters (decay, beta, …)."""
+    copy_qkv_and_conv(layer, src)
+    copy_output_gate(layer, src, gate_attr, norm_attr)
 
 
 def mark_hf_initialized(layer: nn.Module) -> None:

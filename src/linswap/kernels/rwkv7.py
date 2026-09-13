@@ -37,42 +37,18 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from fla.layers.utils import get_layer_cache, update_layer_cache
-from fla.modules import FusedRMSNormSwishGate, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule, fused_recurrent_dplr_delta_rule
 
 from ..registry import KernelSpec, register_kernel
-from .common import (
-    copy_,
-    copy_output_gate,
-    copy_qkv_and_conv,
-    get_gdn_source,
-    init_lowrank_tiled,
-    mark_hf_initialized,
-    tile_vec,
-)
+from .base import BackboneMixer, build_backbone_mixer
+from .common import copy_, copy_shared_from_gdn, get_gdn_source, init_lowrank_tiled, mark_hf_initialized, tile_vec
 
 
-class RWKV7DeltaLayer(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, conv_size=4, lora_rank=128, norm_eps=1e-6, layer_idx=None):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.head_k_dim = self.head_v_dim = head_dim
-        self.num_heads = self.num_v_heads = num_heads
-        self.key_dim = self.value_dim = num_heads * head_dim
-        self.layer_idx = layer_idx
-        self.use_short_conv = True
-
-        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=False, activation="silu")
-        self.k_conv1d = ShortConvolution(self.key_dim, conv_size, bias=False, activation="silu")
-        self.v_conv1d = ShortConvolution(self.value_dim, conv_size, bias=False, activation="silu")
-
-        # per-channel log decay:  g = -exp(A_log[h]) * softplus(f_proj(x) + dt_bias)
+class RWKV7DeltaLayer(BackboneMixer):
+    def __init__(self, hidden_size, head_dim, num_heads, conv_size=4, norm_eps=1e-6, layer_idx=None, lora_rank=128):
+        super().__init__(hidden_size, head_dim, num_heads, conv_size, norm_eps, layer_idx, qk_l2norm=True)
+        # per-channel log decay:  g = -exp(A_log[h]) * softplus(f_proj(x) + dt_bias)   (RWKV-7's w_lora)
         self.f_proj = nn.Sequential(nn.Linear(hidden_size, lora_rank, bias=False),
                                     nn.Linear(lora_rank, self.key_dim, bias=False))
         self.A_log = nn.Parameter(torch.log(torch.empty(num_heads, dtype=torch.float32).uniform_(1, 16)))
@@ -80,71 +56,34 @@ class RWKV7DeltaLayer(nn.Module):
         dt = torch.exp(torch.rand(self.key_dim) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
         self.dt_bias._no_weight_decay = True
-        # per-channel in-context learning rate (RWKV-7's `a`):  beta = sigmoid(b_proj(x))
+        # per-channel in-context learning rate (RWKV-7's a_lora):  beta = sigmoid(b_proj(x))
         self.b_proj = nn.Sequential(nn.Linear(hidden_size, lora_rank, bias=False),
                                     nn.Linear(lora_rank, self.key_dim, bias=False))
         # removal-key modulation (RWKV-7's k_k):  kappa = l2norm(k * k_k)
         self.k_k = nn.Parameter(torch.ones(self.key_dim))
         self.k_k._no_weight_decay = True
 
-        self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.o_norm = FusedRMSNormSwishGate(self.head_v_dim, eps=norm_eps)
-        self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
-
-    def forward(self, hidden_states, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
-        B, T, _ = hidden_states.shape
-        H, K = self.num_heads, self.head_k_dim
-        last_state = get_layer_cache(self, past_key_values)
-        conv_q = conv_k = conv_v = None
-        if last_state is not None:
-            conv_q, conv_k, conv_v = last_state["conv_state"]
-        q, conv_q = self.q_conv1d(x=self.q_proj(hidden_states), cache=conv_q, output_final_state=use_cache)
-        k, conv_k = self.k_conv1d(x=self.k_proj(hidden_states), cache=conv_k, output_final_state=use_cache)
-        v, conv_v = self.v_conv1d(x=self.v_proj(hidden_states), cache=conv_v, output_final_state=use_cache)
-        q, k, v = (rearrange(x, "b t (h d) -> b t h d", h=H) for x in (q, k, v))
-
+    def recurrence(self, hidden_states, q, k, v, state, use_cache):
+        B, T, H, K = k.shape
         g = -self.A_log.float().exp().view(1, 1, H, 1) * F.softplus(
             self.f_proj(hidden_states).float().view(B, T, H, K) + self.dt_bias.float().view(1, 1, H, K))
         beta = torch.sigmoid(self.b_proj(hidden_states).float()).view(B, T, H, K)
-        q = l2_norm(q)
-        k_hat = l2_norm(k)
         kappa = l2_norm(k * self.k_k.view(1, 1, H, K).to(k.dtype))
         dt = q.dtype
         a = (kappa.float() * g.exp()).to(dt)          # read-out of the decayed state
         b = (-beta * kappa.float()).to(dt)            # erase strength (per channel)
-        k_w = (beta * k_hat.float()).to(dt)           # write key
-        gk = g.to(dt)
-
-        recurrent_state = last_state["recurrent_state"] if last_state is not None else None
-        fn = fused_recurrent_dplr_delta_rule if (not torch.is_grad_enabled() and T <= 64) else chunk_dplr_delta_rule
-        o, recurrent_state = fn(q=q, k=k_w, v=v, a=a, b=b, gk=gk, initial_state=recurrent_state,
-                                output_final_state=use_cache)
-        update_layer_cache(self, past_key_values, recurrent_state=recurrent_state,
-                           conv_state=(conv_q, conv_k, conv_v), offset=T)
-
-        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "b t (h d) -> b t h d", h=H))
-        o = self.o_proj(rearrange(o, "b t h d -> b t (h d)"))
-        return o, None, past_key_values
+        k_w = (beta * k.float()).to(dt)               # write key
+        fn = fused_recurrent_dplr_delta_rule if (self.use_recurrent_kernel and T <= 64) else chunk_dplr_delta_rule
+        return fn(q=q, k=k_w, v=v, a=a, b=b, gk=g.to(dt), initial_state=state, output_final_state=use_cache)
 
 
 def build(cfg, layer_idx):
-    if cfg["linear_num_key_heads"] != cfg["linear_num_value_heads"]:
-        raise ValueError("rwkv7: the DPLR kernel shares one head count for k and v")
-    if cfg["linear_key_head_dim"] != cfg["linear_value_head_dim"]:
-        raise ValueError("rwkv7: key and value head dims must match")
-    return RWKV7DeltaLayer(
-        hidden_size=cfg["emb_dim"],
-        head_dim=cfg["linear_key_head_dim"],
-        num_heads=cfg["linear_num_key_heads"],
-        conv_size=cfg["linear_conv_kernel_dim"],
-        norm_eps=cfg.get("rms_norm_eps", 1e-6),
-        layer_idx=layer_idx,
-    )
+    return build_backbone_mixer(RWKV7DeltaLayer, cfg, layer_idx)
 
 
 def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
     src = get_gdn_source(gdn_state, layer_idx, model_prefix)
-    copy_qkv_and_conv(layer, src)
+    copy_shared_from_gdn(layer, src)
     K = layer.head_k_dim
     init_lowrank_tiled(layer.f_proj, src["a"], K, "f_proj")   # per-channel decay == scalar decay
     init_lowrank_tiled(layer.b_proj, src["b"], K, "b_proj")   # per-channel lr == scalar beta
@@ -152,7 +91,6 @@ def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
     copy_(layer.dt_bias, tile_vec(src["dt_bias"], K), "dt_bias")
     with torch.no_grad():
         layer.k_k.fill_(1.0)                                  # removal key == write key
-    copy_output_gate(layer, src)
     mark_hf_initialized(layer)
     return layer
 

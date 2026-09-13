@@ -13,7 +13,9 @@ src/linswap/
   hf.py                LinearSwapConfig / LinearSwapCache / LinearSwapForCausalLM (transformers PreTrainedModel,
                        registered with AutoConfig / AutoModelForCausalLM on import) + export()
   registry.py          KernelSpec + register_kernel / get_kernel / list_kernels
-  kernels/common.py    helpers shared by init recipes (pretrained tensor layout, split fused qkv/conv, tiling, Qwen output gate)
+  kernels/common.py    helpers shared by init recipes (pretrained tensor layout, split fused qkv/conv, tiling, output gate, copy_shared_from_gdn)
+  kernels/fla_layer.py build_fla_layer / register_fla_kernel: any fla.layers class + init recipe -> KernelSpec
+  kernels/base.py      BackboneMixer: projections + convs + cache + gated norm around an FLA op (custom recurrences)
   kernels/gdn.py       "gdn"          original GDN on FLA kernels (exact copy; control baseline)
   kernels/gdn2.py      "gdn2"         Gated DeltaNet-2 (scalar beta/decay tiled into b/w/f gates)
   kernels/kda.py       "kda"          Kimi Delta Attention, low-rank per-channel decay gate (default KDA)
@@ -21,6 +23,7 @@ src/linswap/
   kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap (exact_init=False)
+  kernels/gla.py       "gla"          Gated Linear Attention, stock FLA layer, no custom code — inexact swap
   model.py             LinearSwapBackbone (model.embed_tokens / layers / norm) + LinearSwapModel (adds lm_head)
                        — Qwen's module tree and state-dict keys; SwapCache
   components.py        RMSNorm / GQA / MLP / RoPE;  backbones.py  load_backbone_config() from the HF config

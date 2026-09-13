@@ -47,6 +47,7 @@ of a set of incomparable pretraining runs.  The kernels come from
 | `rwkv7` | RWKV-7-style DPLR generalised delta rule | decay/beta tiled, removal key = key | 14M | yes |
 | `mamba2` | Mamba-2-style SSD (scalar decay, no erase) | shared weights copied, erase dropped | 0.30M | no |
 | `deltanet` | DeltaNet (erase, no decay) | shared weights copied, decay dropped | 0.29M | no |
+| `gla` | Gated Linear Attention (per-channel decay, no erase) | shared weights copied, decay MLP at FLA init | 0.92M | no |
 
 "Exact" kernels reproduce the pretrained model at initialisation and go straight
 to SFT; the others are distilled first (`linswap.py distill`).  Parameter counts
@@ -142,21 +143,42 @@ y, _, cache = layer(x)                                                 # x: [B, 
 
 ### Adding a kernel
 
-One file, `src/linswap/kernels/<name>.py`, with
+LinearSwap is a consumer of flash-linear-attention, not a second layer zoo.
+A kernel is either a **stock FLA layer** plus an init recipe, or an **FLA op**
+(a recurrence) wrapped in the shared backbone-compatible block.
 
-* `build(cfg, layer_idx) -> nn.Module` — the token mixer, FLA layer interface
-  (`forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`).
-  Fix the module structure here so checkpoints load strictly.
-* `init_from_gdn(layer, hf_state_dict, layer_idx, model_prefix)` — copy or tile
-  the pretrained GDN tensors (`kernels/common.py` documents their layout and the
-  GDN recurrence and provides the splitting / tiling / low-rank-embedding helpers).
-* `register_kernel(KernelSpec(name, build, init_from_gdn, new_param_names, exact_init))`
-  and an import in `kernels/__init__.py`.
+*Stock FLA layer* — `register_fla_kernel` builds the layer from the backbone
+config with FLA's own constructor names, copies the weights every layer shares
+with GDN (q/k/v, convolutions, output gate) and calls your `init_extra` for the
+rest.  GLA is registered this way in its entirety:
 
-`kernels/kda.py` is the template for an exact swap, `kernels/deltanet.py` for an
-inexact one.  Then `python tests/test_kernels.py` and
-`python linswap.py verify --kernel <name> --baseline gdn`: an exact swap sits at
-the `gdn` control's noise level on every check.
+```python
+from fla.layers import GatedLinearAttention
+from linswap.kernels.fla_layer import register_fla_kernel
+
+register_fla_kernel(
+    "gla", GatedLinearAttention, description="Gated Linear Attention",
+    layer_kwargs=lambda cfg: dict(expand_k=2.0, expand_v=2.0, num_heads=16, use_short_conv=True,
+                                  use_output_gate=True, gate_fn="swish", fuse_norm=True),
+    output_gate="native", norm_attr="g_norm_swish_gate",   # GLA already has the backbone's gate
+    new_param_names=("gk_proj",), exact_init=False)
+```
+
+`gdn`, `gdn2`, `kda` and `deltanet` are registered the same way (with a
+`post_build` hook where a dense gate replaces FLA's low-rank one, and an
+`init_extra` that tiles the pretrained scalar gates).
+
+*FLA op* — subclass `linswap.kernels.base.BackboneMixer`, add your parameters
+and implement `recurrence(hidden_states, q, k, v, state, use_cache)`; the base
+provides projections, convolutions, q/k normalisation, the FLA cache protocol
+and the gated output norm.  `kernels/rwkv7.py` (DPLR delta rule) and
+`kernels/mamba2.py` (SSD) are the two examples, each under 40 lines of kernel code.
+
+Register with `exact_init=True` only if the init is function preserving, then
+run `python tests/test_kernels.py` and `linswap verify --kernel <name> --baseline gdn`:
+an exact swap sits at the `gdn` control's noise level on every check.
+`kernels/common.py` documents the pretrained tensor layout and provides the
+splitting / tiling / low-rank-embedding helpers.
 
 ## Training
 

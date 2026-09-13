@@ -29,91 +29,38 @@ full-rank *SiLU*-gated norm, which is not representable, so ``g_proj`` and
 ``o_norm`` are replaced by the backbone's parameterisation.
 """
 
-import torch
 import torch.nn as nn
-from fla.layers.kda import KimiDeltaAttention
+from fla.layers import KimiDeltaAttention
 
-from ..registry import KernelSpec, register_kernel
-from .common import (
-    copy_,
-    copy_output_gate,
-    copy_qkv_and_conv,
-    get_gdn_source,
-    init_lowrank_tiled,
-    mark_hf_initialized,
-    tile_rows,
-    tile_vec,
-    use_qwen_output_gate,
-)
+from .common import copy_, init_lowrank_tiled, tile_rows, tile_vec
+from .fla_layer import register_fla_kernel
 
 
-def _build(cfg, layer_idx, f_proj_mode="lowrank"):
-    layer = KimiDeltaAttention(
-        hidden_size=cfg["emb_dim"],
-        expand_v=1.0,
-        head_dim=cfg["linear_key_head_dim"],
-        num_heads=cfg["linear_num_key_heads"],
-        num_v_heads=cfg["linear_num_value_heads"],
-        mode="chunk",
-        use_short_conv=True,
-        conv_size=cfg["linear_conv_kernel_dim"],
-        conv_bias=False,
-        layer_idx=layer_idx,
-        norm_eps=cfg.get("rms_norm_eps", 1e-6),
-    )
-    if f_proj_mode == "full":
-        ref = layer.q_proj.weight
-        layer.f_proj = nn.Linear(layer.hidden_size, layer.gate_dim, bias=False, device=ref.device, dtype=ref.dtype)
-    elif f_proj_mode != "lowrank":
-        raise ValueError(f"Unknown f_proj_mode {f_proj_mode!r}")
-    use_qwen_output_gate(layer, layer.hidden_size, layer.value_dim, layer.head_v_dim, layer.o_norm.eps)
-    return layer
+def dense_f_proj(layer, cfg):
+    ref = layer.q_proj.weight
+    layer.f_proj = nn.Linear(layer.hidden_size, layer.gate_dim, bias=False, device=ref.device, dtype=ref.dtype)
 
 
-def build_lowrank(cfg, layer_idx):
-    return _build(cfg, layer_idx, "lowrank")
-
-
-def build_fullgate(cfg, layer_idx):
-    return _build(cfg, layer_idx, "full")
-
-
-def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
-    src = get_gdn_source(gdn_state, layer_idx, model_prefix)
-    copy_qkv_and_conv(layer, src)
-
-    H = layer.num_v_heads
+def init_extra(layer, src):
     K = layer.head_k_dim
-    a_w = src["a"]  # [H, hidden]
     if isinstance(layer.f_proj, nn.Linear):
-        copy_(layer.f_proj.weight, tile_rows(a_w, K), "f_proj")
+        copy_(layer.f_proj.weight, tile_rows(src["a"], K), "f_proj")
     else:
-        init_lowrank_tiled(layer.f_proj, a_w, K, "f_proj")
-
+        init_lowrank_tiled(layer.f_proj, src["a"], K, "f_proj")       # exact low-rank embedding of the tiled decay
     copy_(layer.A_log, src["A_log"], "A_log")
     copy_(layer.dt_bias, tile_vec(src["dt_bias"], K), "dt_bias")
     copy_(layer.b_proj.weight, src["b"], "b_proj")
-    copy_output_gate(layer, src)
-    mark_hf_initialized(layer)
-    return layer
 
 
 _NEW = ("f_proj", "b_proj", "A_log", "dt_bias")
 
-register_kernel(KernelSpec(
-    name="kda",
+register_fla_kernel(
+    "kda", KimiDeltaAttention,
     description="Kimi Delta Attention (FLA KimiDeltaAttention); scalar decay tiled into the low-rank per-channel gate.",
-    build=build_lowrank,
-    init_from_gdn=init_from_gdn,
-    new_param_names=_NEW,
-    exact_init=True,
-))
-
-register_kernel(KernelSpec(
-    name="kda_fullgate",
+    init_extra=init_extra, new_param_names=_NEW, exact_init=True,
+)
+register_fla_kernel(
+    "kda_fullgate", KimiDeltaAttention,
     description="KDA with a dense (full-rank) f_proj decay projection instead of the low-rank MLP.",
-    build=build_fullgate,
-    init_from_gdn=init_from_gdn,
-    new_param_names=_NEW,
-    exact_init=True,
-))
+    post_build=dense_f_proj, init_extra=init_extra, new_param_names=_NEW, exact_init=True,
+)
