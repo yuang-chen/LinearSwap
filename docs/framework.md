@@ -442,7 +442,7 @@ extraction), `qa_1` (SQuAD), `qa_2` (HotpotQA).
 | rwkv7-gate-100 | 100.0 | 100.0 | 100.0 | 75.6 | 3.0 | 98.0 | 42.0 | 44.0 | 70.3 |
 | mamba2-distill-sft-50 | 78.0 | 8.0 | 89.5 | 38.4 | 0.2 | 68.0 | 38.0 | 40.0 | 45.0 |
 
-##### 131K tokens
+##### 131K tokens (all models; val CE of the added rows: noah 1.443–1.445, mamba2 SFT-only 1.708, distill-only 1.729, mamba2_beta 1.470, mamba2_lc 1.504, deltanet 2.093, deltanet_lc 2.042, mamba1 2.068)
 
 | model | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
 |---|---|---|---|---|---|---|---|---|---|
@@ -453,7 +453,16 @@ extraction), `qa_1` (SQuAD), `qa_2` (HotpotQA).
 | rwkv7-full-50 | 98.0 | 100.0 | 100.0 | 80.0 | 9.0 | 98.0 | 42.0 | 44.0 | 71.4 |
 | kda-gate-100 | 100.0 | 100.0 | 99.5 | 83.6 | 1.4 | 98.0 | 36.0 | 40.0 | 69.8 |
 | rwkv7-gate-100 | 100.0 | 100.0 | 99.5 | 82.0 | 0.2 | 95.3 | 34.0 | 38.0 | 68.6 |
+| kda-noah-full-50 | 98.0 | 98.0 | 100.0 | 80.8 | 9.4 | 98.7 | 50.0 | 48.0 | 72.9 |
+| gdn-noah-full-50 | 98.0 | 98.0 | 100.0 | 80.8 | 9.4 | 98.7 | 48.0 | 50.0 | 72.9 |
+| mamba2-sft-500 | 12.0 | 0.0 | 2.0 | 1.6 | 1.2 | 30.0 | 24.0 | 20.0 | 11.3 |
+| mamba2-distill-500 | 42.0 | 8.0 | 64.5 | 22.0 | 0.4 | 59.3 | 16.0 | 32.0 | 30.5 |
 | mamba2-distill-sft-50 | 54.0 | 4.0 | 89.0 | 26.4 | 0.4 | 63.3 | 36.0 | 30.0 | 37.9 |
+| mamba2_beta-distill-sft-50 | 84.0 | 22.0 | 94.0 | 29.2 | 0.4 | 92.7 | 42.0 | 34.0 | 49.8 |
+| mamba2_lc-distill-sft-50 | 18.0 | 0.0 | 86.5 | 58.4 | 0.4 | 69.3 | 34.0 | 32.0 | 37.3 |
+| mamba1-distill-sft-50 | 0.0 | 0.0 | 21.0 | 0.0 | 0.2 | 15.3 | 4.0 | 12.0 | 6.6 |
+| deltanet-distill-sft-50 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| deltanet_lc-distill-sft-50 | 0.0 | 0.0 | 0.0 | 0.4 | 0.2 | 0.0 | 0.0 | 2.0 | 0.3 |
 
 ##### average over the 8 tasks vs length
 
@@ -492,6 +501,29 @@ Reading.
   context — `niah_multikey_3` 90 → 38 → 8 → 4 from 4K to 131K — and `cwe` is at zero from
   16K on; the average falls 66.5 → 37.9.  The exact kernels' averages fall only 86 → 71–75
   over the same range, almost all of it `cwe` and QA.
+
+* **The anti-haystack data is not what breaks `cwe`.**  Full SFT on LongAlign + LongAlpaca
+  only (`*-noah-full-50`, val CE 1.443–1.445 vs 1.388 with the full mixture) gives the same
+  `cwe` collapse (9.4) and the same `vt` (80.8), and slightly better QA (48–50 vs 40–44);
+  the two exact kernels again tie.  The `cwe` loss comes from the long-context SFT format
+  itself, not from the anti-haystack subset.
+* **Distillation vs SFT alone (Mamba-2).**  At matched validation loss (1.71 SFT-only for
+  500 steps vs 1.73 distill-only for 500 steps) the SFT-only model retrieves almost nothing at
+  131K (`niah_multikey_2` 12, `multiquery` 2, `vt` 1.6, avg 11) while the distilled one is
+  at 42 / 64.5 / 22 (avg 30.5); distillation followed by the standard 50-step SFT is best on
+  every task (avg 37.9).  The validation loss on SFT data does not measure what the swap
+  broke; matching the teacher's distributions transfers the retrieval behaviour that SFT
+  alone does not.
+* **Controls for the Mamba-2 gap.**  Keeping GDN's β-scaled writes and dropping only the erase
+  (`mamba2_beta`, val CE 1.470) recovers a large part of the gap — `niah_multikey_2` 84,
+  `multiquery` 94, `fwe` 92.7, avg 49.8 vs 37.9 — so roughly half of the Δ-scaled adapter's
+  loss was the write scale, not the missing erase; the distractor task (`multikey_3` 22) and
+  `cwe` (0.4) stay far below the exact kernels, which is the part attributable to the erase.
+  Distilling at longer context (`mamba2_lc`, packed KL at 8K then 64K, val CE 1.504) helps
+  `vt` (58.4 vs 26.4) but hurts the needle tasks (`multikey_2` 18 vs 54), avg 37.3 — no net
+  gain from long-context distillation under this budget.  For DeltaNet neither recipe
+  (`deltanet`, `deltanet_lc`) retrieves anything at 131K, and Mamba-1 reaches only
+  `multiquery` 21 / `fwe` 15.
 
 ### Raw-text NLL (`evaluate --nll pg19,wikitext`; token-weighted, 20 PG-19 books and the WikiText-103 test set, ≤131K tokens per document)
 

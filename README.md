@@ -295,7 +295,7 @@ opens the assistant turn as in RULER's chat templates)
 | rwkv7-gate-100 | 87.7 | 83.4 | 70.3 | 68.6 |
 | mamba2-distill-sft-50 | 66.5 | 52.8 | 45.0 | 37.9 |
 
-**Hard RULER at 131K, per task**
+**Hard RULER at 131K, per task** (`noah` = SFT without the anti-haystack data; `lc` = long-context distillation; `mamba2_beta` keeps β-scaled writes)
 
 | model | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
 |---|---|---|---|---|---|---|---|---|---|
@@ -306,7 +306,16 @@ opens the assistant turn as in RULER's chat templates)
 | rwkv7-full-50 | 98.0 | 100.0 | 100.0 | 80.0 | 9.0 | 98.0 | 42.0 | 44.0 | 71.4 |
 | kda-gate-100 | 100.0 | 100.0 | 99.5 | 83.6 | 1.4 | 98.0 | 36.0 | 40.0 | 69.8 |
 | rwkv7-gate-100 | 100.0 | 100.0 | 99.5 | 82.0 | 0.2 | 95.3 | 34.0 | 38.0 | 68.6 |
+| kda-noah-full-50 | 98.0 | 98.0 | 100.0 | 80.8 | 9.4 | 98.7 | 50.0 | 48.0 | 72.9 |
+| gdn-noah-full-50 | 98.0 | 98.0 | 100.0 | 80.8 | 9.4 | 98.7 | 48.0 | 50.0 | 72.9 |
+| mamba2-sft-500 | 12.0 | 0.0 | 2.0 | 1.6 | 1.2 | 30.0 | 24.0 | 20.0 | 11.3 |
+| mamba2-distill-500 | 42.0 | 8.0 | 64.5 | 22.0 | 0.4 | 59.3 | 16.0 | 32.0 | 30.5 |
 | mamba2-distill-sft-50 | 54.0 | 4.0 | 89.0 | 26.4 | 0.4 | 63.3 | 36.0 | 30.0 | 37.9 |
+| mamba2_beta-distill-sft-50 | 84.0 | 22.0 | 94.0 | 29.2 | 0.4 | 92.7 | 42.0 | 34.0 | 49.8 |
+| mamba2_lc-distill-sft-50 | 18.0 | 0.0 | 86.5 | 58.4 | 0.4 | 69.3 | 34.0 | 32.0 | 37.3 |
+| mamba1-distill-sft-50 | 0.0 | 0.0 | 21.0 | 0.0 | 0.2 | 15.3 | 4.0 | 12.0 | 6.6 |
+| deltanet-distill-sft-50 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| deltanet_lc-distill-sft-50 | 0.0 | 0.0 | 0.0 | 0.4 | 0.2 | 0.0 | 0.0 | 2.0 | 0.3 |
 
 **Second scale: Qwen3.8-27B** (16 key / 48 value linear heads, gate-only SFT
 at 32K, 100 steps; RULER `multikey_2` / `multiquery` / `vt` / `qa_1` at 16K and 64K,
@@ -336,11 +345,13 @@ What the numbers say:
   full SFT loses it, and give the best variable tracking at 131K.
 * Inexact swaps ablate the pretrained recurrence.  Mamba-2 (no erase) is brought
   back to the original loss by distillation but is the only kernel whose retrieval
-  degrades with length (distractor needles 90 → 4 from 4K to 131K); DeltaNet (no
-  decay) recovers loss and short-context retrieval but nothing at 131K.
-  Distillation beats SFT alone at equal steps (DeltaNet 2.46 vs 6.70 val CE after
-  500 steps), and for Mamba-2 it transfers retrieval behaviour that SFT does not
-  even at equal validation loss.
+  degrades with length (distractor needles 90 → 4 from 4K to 131K); keeping GDN's
+  β-scaled writes (`mamba2_beta`) recovers half the gap (avg 50 vs 38 at 131K), the
+  rest is the missing erase.  DeltaNet (no decay) recovers loss and short-context
+  retrieval but nothing at 131K.  Distillation beats SFT alone at equal steps
+  (DeltaNet 2.46 vs 6.70 val CE after 500 steps), and for Mamba-2 it transfers
+  retrieval behaviour that SFT does not even at equal validation loss (avg 30.5 vs
+  11.3 at 131K, val CE 1.73 vs 1.71).
 * The retrieval-flavoured SFT does not improve the hard tasks: it costs 1 point at
   4K and 4 at 131K, almost all of it common-word extraction (46 → 9 at 131K) — the
   fine-tuning data, not the swap.

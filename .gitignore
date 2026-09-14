@@ -31,3 +31,7 @@ RULER/scripts/data/synthetic/json/hotpotqa.json
 *.egg-info/
 build/
 dist/
+
+# Paper drafts and slides (kept locally only)
+/docs/paper/
+/docs/slides/
