@@ -74,10 +74,18 @@ Requirements: Python 3.11, PyTorch ≥ 2.7 with a matching Triton ≥ 3.3
 (FLA's requirement; tested with torch 2.9.1 / CUDA 12.8 / Triton 3.5.1),
 `flash-linear-attention` 0.6, `transformers` ≥ 5.16.
 
+`flash-linear-attention` has to come from the repository, not from PyPI: its
+published wheels ship only `fla/layers` and `fla/models` (no `fla/__init__.py`,
+no `fla.ops`, no `fla.modules`), and the last release, 0.5.2, predates the
+kernels used here anyway.  Git main calls itself 0.6.0, which is what the
+dependency pin refers to; the results below were produced with commit
+`8e84ed4`.
+
 ```bash
 git clone https://github.com/yuang-chen/LinearSwap && cd LinearSwap
 uv venv .venv --python 3.11 && source .venv/bin/activate
 uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+uv pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention@8e84ed4"
 uv pip install -e ".[eval]"                              # linswap + the `linswap` command; [eval] adds RULER's deps
 huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 python tests/test_kernels.py && python tests/test_hf.py  # kernels match the control; HF round-trip is exact
@@ -93,7 +101,7 @@ CUDA_HOME=/usr/local/cuda MAX_JOBS=32 uv pip install --no-deps --no-build-isolat
     --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
 ```
 
-On Hopper-class GPUs (compute capability 9.x, e.g. H100 / L20X) with Triton 3.4 to 3.7, FLA
+On Hopper-class GPUs (compute capability 9.x, e.g. H100) with Triton 3.4 to 3.7, FLA
 rejects the Triton backward of its gated chunk kernels as incorrect (issue #640) and needs
 `uv pip install -e ".[hopper]"` (TileLang) for training `gdn`, `gdn2`, `kda`; the
 simple-GLA path used by `mamba2` has no TileLang backend, so its *training* needs

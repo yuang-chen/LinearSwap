@@ -15,6 +15,9 @@ dependencies = [
     "torch>=2.7",
     "triton>=3.3",
     "transformers>=5.16",
+    # FLA's PyPI artifacts are incomplete (no `fla.ops` / `fla.modules`) and the last release,
+    # 0.5.2, predates the kernels used here; 0.6 is the version git main reports.  Install it from
+    # the repository *before* this package -- see README "Installation".
     "flash-linear-attention>=0.6,<0.7",
     "einops",
     "safetensors",
