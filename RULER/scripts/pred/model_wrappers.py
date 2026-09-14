@@ -180,6 +180,8 @@ class LinearSwapModelWrapper:
         if kernel is None:
             raise ValueError(f"{model_dir}/config.json has no 'linear_kernel' and LINSWAP_KERNEL is unset")
         base_model_dir = Path(cfg.get("base_model_dir", DEFAULT_BASE_MODEL_DIR))
+        if not base_model_dir.is_absolute():  # checkpoint configs record repo-relative paths; RULER runs from RULER/scripts
+            base_model_dir = Path(__file__).resolve().parents[3] / base_model_dir
         ckpt_dir = Path(cfg["ckpt_dir"]) if cfg.get("ckpt_dir") else model_dir
         if not (ckpt_dir / "model.pt").exists():
             ckpt_dir = None
@@ -199,15 +201,19 @@ class LinearSwapModelWrapper:
     def __call__(self, prompt: str, **kwargs) -> dict:
         return self.process_batch([prompt], **kwargs)[0]
 
-    def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
+    supports_answer_prefix = True  # call_api passes RULER's per-sample answer prefix separately
+
+    def process_batch(self, prompts: List[str], answer_prefixes=None, **kwargs) -> List[dict]:
         results = []
-        for prompt in prompts:
+        for prompt, answer_prefix in zip(prompts, answer_prefixes or [''] * len(prompts)):
             if self.tokenizer.chat_template is not None and self.use_chat_template:
                 templated = self.tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,  # thinking models (Qwen3.8) would spend the token budget on reasoning,
                 )
+                templated += (answer_prefix or '').lstrip(' ')  # answer prefix opens the assistant turn
             else:
-                templated = prompt
+                templated = prompt + (answer_prefix or '')
             input_ids = self.tokenizer(templated, return_tensors="pt", padding=False)["input_ids"].to(self.device)
             with torch.no_grad():
                 output_ids = self.model.generate(

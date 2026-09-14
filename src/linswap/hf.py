@@ -51,7 +51,7 @@ class LinearSwapConfig(PretrainedConfig):
                  rms_norm_eps=1e-6, rope_theta=10_000_000.0, partial_rotary_factor=0.25,
                  max_position_embeddings=262_144, linear_conv_kernel_dim=4, linear_key_head_dim=128,
                  linear_value_head_dim=128, linear_num_key_heads=16, linear_num_value_heads=16,
-                 layer_types=None, base_model=None, sft_mode=None, tie_word_embeddings=True, **kwargs):
+                 layer_types=None, base_model=None, sft_mode=None, tie_word_embeddings=True, use_cache=True, **kwargs):
         self.kernel = kernel
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -72,6 +72,7 @@ class LinearSwapConfig(PretrainedConfig):
         self.layer_types = layer_types or (["linear_attention"] * 3 + ["full_attention"]) * (num_hidden_layers // 4)
         self.base_model = base_model      # informational: the pretrained backbone the swap started from
         self.sft_mode = sft_mode          # informational: gate_only / full / distill / None
+        self.use_cache = use_cache
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def to_backbone_cfg(self, dtype=torch.bfloat16) -> dict:

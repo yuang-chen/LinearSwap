@@ -2,6 +2,7 @@
 
     linswap distill --kernel deltanet                 # layer alignment, then KL distillation
     linswap distill --kernel mamba2 --stages kl --kl_steps 500
+    linswap distill --kernel mamba2 --kl_schedule 8192:200,65536:100     # long-context curriculum (packed)
 
 Teacher: the original model (``gdn`` kernel, exact copy of the HF backbone).
 Student: the swapped model.  Two stages, both on the SFT corpus truncated to
@@ -37,7 +38,7 @@ from torch.utils.data import DataLoader
 from ..data import DEFAULT_DATA_DIR, ensure_sft_data
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model
 from ..registry import get_kernel
-from ..sft_utils import TruncatedDataset, collate_fn, evaluate
+from ..sft_utils import PackedDataset, TruncatedDataset, collate_fn, evaluate
 from .posttrain import checkpoint_config, log_jsonl
 
 
@@ -47,12 +48,16 @@ def add_args(ap):
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--teacher", default="gdn", help="kernel used as the teacher (exact copy of the original)")
     ap.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
+    ap.add_argument("--datasets", default="all", help="SFT mixture subset, e.g. longalign,longalpaca (ablation: no anti-haystack)")
     ap.add_argument("--data_max_length", type=int, default=262144)
     ap.add_argument("--max_length", type=int, default=8192, help="distillation sequence length")
     ap.add_argument("--stages", default="layer,kl")
     ap.add_argument("--layer_steps", type=int, default=200)
     ap.add_argument("--layer_lr", type=float, default=1e-4)
     ap.add_argument("--kl_steps", type=int, default=300)
+    ap.add_argument("--kl_schedule", default=None,
+                    help="length curriculum for the KL stage on PACKED sequences, e.g. 8192:200,65536:100 "
+                         "(overrides --kl_steps / --max_length for that stage)")
     ap.add_argument("--kl_lr", type=float, default=2e-5)
     ap.add_argument("--kl_train", choices=["all", "linear"], default="all")
     ap.add_argument("--kl_temperature", type=float, default=1.0)
@@ -110,9 +115,10 @@ def chunked_kl_with_backward(s_hidden, t_hidden, s_head, t_head, chunk_size=2048
 
 
 # --------------------------------------------------------------------- stages
-def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step0):
+def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step0, steps=None, tag=None):
     device = next(student.parameters()).device
-    steps = args.layer_steps if stage == "layer" else args.kl_steps
+    steps = steps if steps is not None else (args.layer_steps if stage == "layer" else args.kl_steps)
+    tag = tag or stage
     lr = args.layer_lr if stage == "layer" else args.kl_lr
     if stage == "layer" or args.kl_train == "linear":
         params = linear_params(student)
@@ -121,9 +127,9 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
     ids_ = {id(p) for p in params}
     for p in student.parameters():
         p.requires_grad_(id(p) in ids_)
-    student.gradient_checkpointing = stage == "kl"
+    student.gradient_checkpointing = stage == "kl" and student.kernel.supports_activation_checkpointing
     optimizer = AdamW([{"params": params, "lr": lr, "weight_decay": 0.0}])
-    print(f"[distill] stage={stage} steps={steps} lr={lr} trainable={sum(p.numel() for p in params)/1e6:.1f}M")
+    print(f"[distill] stage={tag} steps={steps} lr={lr} trainable={sum(p.numel() for p in params)/1e6:.1f}M")
 
     train_iter = iter(train_loader)
     start = time.time()
@@ -157,9 +163,9 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
-        rec = {"stage": stage, "step": step0 + step, "loss": acc / args.grad_accum_steps, "grad_norm": float(gn),
+        rec = {"stage": tag, "step": step0 + step, "loss": acc / args.grad_accum_steps, "grad_norm": float(gn),
                "elapsed_s": round(time.time() - start, 1)}
-        print(f"  {stage} step {step}/{steps}: loss={rec['loss']:.4f} grad_norm={rec['grad_norm']:.3f} "
+        print(f"  {tag} step {step}/{steps}: loss={rec['loss']:.4f} grad_norm={rec['grad_norm']:.3f} "
               f"elapsed={rec['elapsed_s']/60:.1f}min", flush=True)
         log_jsonl(log_path, rec)
         last = step == steps
@@ -167,8 +173,8 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
             student.eval()
             val = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
             student.train()
-            print(f"  {stage} step {step}: val_loss={val:.4f}", flush=True)
-            log_jsonl(log_path, {"stage": stage, "step": step0 + step, "val_loss": val})
+            print(f"  {tag} step {step}: val_loss={val:.4f}", flush=True)
+            log_jsonl(log_path, {"stage": tag, "step": step0 + step, "val_loss": val})
         if step % args.save_every == 0 or last:
             save(student, args, out_dir, step0 + step)
     return step0 + step
@@ -195,7 +201,7 @@ def main(args) -> Path:
     log_path = out_dir / "train_log.jsonl"
     print(f"[distill] kernel={spec.name} (exact_init={spec.exact_init}) teacher={args.teacher} -> {out_dir}")
 
-    data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir)
+    data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir, args.datasets)
     train_ds = TruncatedDataset(load_from_disk(data_dir / "train"), args.max_length)
     val_ds = TruncatedDataset(load_from_disk(data_dir / "validation"), args.max_length)
     g = torch.Generator().manual_seed(args.seed)
@@ -212,9 +218,18 @@ def main(args) -> Path:
     log_jsonl(log_path, {"stage": "init", "step": 0, "val_loss": val0})
 
     step = 0
+    raw_train = load_from_disk(data_dir / "train")
     for stage in [s for s in args.stages.split(",") if s]:
         if stage not in ("layer", "kl"):
             raise SystemExit(f"distill: unknown stage {stage!r}")
+        if stage == "kl" and args.kl_schedule:
+            for phase in [p for p in args.kl_schedule.split(",") if p]:
+                length, n = (int(v) for v in phase.split(":"))
+                packed = DataLoader(PackedDataset(raw_train, length, seed=args.seed + step), batch_size=1,
+                                    collate_fn=collate_fn)
+                step = run_stage("kl", args, teacher, student, packed, val_loader, out_dir, log_path, step,
+                                 steps=n, tag=f"kl@{length}")
+            continue
         step = run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step)
     ckpt = save(student, args, out_dir, step)
     print(f"[distill] done: {ckpt}")

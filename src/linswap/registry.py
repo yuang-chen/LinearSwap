@@ -36,6 +36,9 @@ class KernelSpec:
     # Whether ``init_from_gdn`` is function preserving (exact up to fp error).
     exact_init: bool = True
     notes: str = ""
+    # False for layers whose autograd Functions read ctx.saved_tensors more than once and therefore
+    # break under torch.utils.checkpoint (mamba_ssm's Mamba-3 kernels); training then runs without it.
+    supports_activation_checkpointing: bool = True
 
     def is_new_param(self, param_name: str) -> bool:
         parts = param_name.split(".")

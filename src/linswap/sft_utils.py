@@ -51,6 +51,31 @@ class TruncatedDataset(torch.utils.data.Dataset):
         return truncate_left(self.ds[i], self.max_length)
 
 
+class PackedDataset(torch.utils.data.IterableDataset):
+    """Concatenate shuffled examples into fixed-length sequences (no padding, no masks).
+
+    Used for long-context distillation: a 64K packed sequence contains several documents, so
+    the student is trained to reproduce the teacher across document boundaries — i.e. to forget
+    what the teacher forgets.  Labels are the input ids (all positions supervised)."""
+
+    def __init__(self, ds, length, seed=0):
+        self.ds, self.length, self.seed = ds, length, seed
+
+    def __iter__(self):
+        import random
+
+        rng = random.Random(self.seed)
+        order = list(range(len(self.ds)))
+        while True:
+            rng.shuffle(order)
+            buf = []
+            for i in order:
+                buf.extend(self.ds[i]["input_ids"])
+                while len(buf) >= self.length:
+                    seq, buf = buf[:self.length], buf[self.length:]
+                    yield {"input_ids": seq, "labels": list(seq)}
+
+
 def chunked_cross_entropy_with_backward(hidden_states, labels, lm_head, chunk_size=2048, ignore_index=-100,
                                         loss_scale=1.0):
     """Mean token cross-entropy with backward pass; returns the (unscaled) average loss.

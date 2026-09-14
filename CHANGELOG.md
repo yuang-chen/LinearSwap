@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+* **RULER protocol fix.**  The vendored `pred/call_api.py` never passed RULER's per-sample
+  `answer_prefix` to the model; `LinearSwapModelWrapper` now opens the assistant turn with it
+  (after the chat template, `enable_thinking=False` for thinking backbones).  Variable
+  tracking on the GDN base at 4K moves from 3.6 to 91.2.  All hard-task tables were regenerated.
+* `evaluate --nll pg19,wikitext` (token-weighted raw-text NLL with position bins),
+  `linswap lmeval` (lm-eval-harness on exported HF checkpoints) and `linswap mqar` (text
+  multi-query associative recall); `--datasets` subset selection for SFT / distill / evaluate;
+  `distill --kl_schedule` (packed long-context KL stage).
+* `KernelSpec.supports_activation_checkpointing` (False for `mamba3`, whose `mamba_ssm`
+  autograd functions do not compose with `torch.utils.checkpoint`).
+* `gdn2` refuses backbones with grouped value heads: FLA's `GatedDeltaNet2` shares its decay and
+  erase gates across a value-head group, so the tiled init has no exact image there.
+* `evaluate` resolves checkpoint and base-model paths to absolute before handing them to RULER
+  (RULER runs from its own directory); the RULER wrapper resolves repo-relative paths as well.
+* Second backbone scale: Qwen3.8-27B (exactness in fp32 at KL 2.6e-6; gate-only SFT and a RULER
+  subset for `kda` / `rwkv7`; see `docs/framework.md`).
+
 ## 0.1.0 — 2026-09-13
 
 First packaged release.

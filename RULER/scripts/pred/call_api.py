@@ -262,12 +262,18 @@ def main():
     # Load api
     llm = get_llm(config['tokens_to_generate'])
 
-    def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list):
+    def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list, answer_prefix_list=None):
         nonlocal llm
 
         while True:
             try:
-                pred_list = llm.process_batch(prompts=input_list)
+                # RULER stores the task's answer prefix separately from the input; it belongs at the start of the
+                # assistant turn (after the chat template), which wrappers that support it handle themselves.
+                if answer_prefix_list is not None and getattr(llm, 'supports_answer_prefix', False):
+                    pred_list = llm.process_batch(prompts=input_list, answer_prefixes=answer_prefix_list)
+                else:
+                    prompts = [i + (a or '') for i, a in zip(input_list, answer_prefix_list)] if answer_prefix_list else input_list
+                    pred_list = llm.process_batch(prompts=prompts)
                 break
             except Exception as e:
                 traceback.print_exc()
@@ -325,6 +331,7 @@ def main():
                     idx_list=idx_list,
                     index_list=[data_point['index'] for data_point in batch],
                     input_list=[data_point['input'] for data_point in batch],
+                    answer_prefix_list=[data_point.get('answer_prefix', '') for data_point in batch],
                     outputs_list=[data_point['outputs'] for data_point in batch],
                     others_list=[data_point.get('others', {}) for data_point in batch],
                     truncation_list=[data_point.get('truncation', -1) for data_point in batch],

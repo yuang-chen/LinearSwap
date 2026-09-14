@@ -28,8 +28,12 @@ DATASETS = {
 }
 
 
-def sft_data_dir(max_length: int, output_dir=DEFAULT_DATA_DIR) -> Path:
-    return Path(output_dir) / f"len{max_length}"
+def sft_data_dir(max_length: int, output_dir=DEFAULT_DATA_DIR, datasets=None) -> Path:
+    """``data/sft/len{L}`` for the full mixture, ``data/sft-{a}+{b}/len{L}`` for a subset."""
+    out = Path(output_dir)
+    if datasets is not None and set(datasets) != set(DATASETS):
+        out = out.with_name(out.name + "-" + "+".join(d for d in DATASETS if d in datasets))
+    return out / f"len{max_length}"
 
 
 def tokenize_messages(messages, tokenizer, max_length):
@@ -45,7 +49,7 @@ def tokenize_messages(messages, tokenizer, max_length):
 
 
 def prepare_sft_data(base_model_dir, max_length: int = 262144, output_dir=DEFAULT_DATA_DIR,
-                     val_ratio: float = 0.02, num_proc: int = 8) -> Path:
+                     val_ratio: float = 0.02, num_proc: int = 8, datasets=None) -> Path:
     """Download, tokenise and save the SFT data; returns the ``len{max_length}`` directory."""
     from datasets import concatenate_datasets, load_dataset
     from transformers import AutoTokenizer
@@ -53,6 +57,8 @@ def prepare_sft_data(base_model_dir, max_length: int = 262144, output_dir=DEFAUL
     tokenizer = AutoTokenizer.from_pretrained(base_model_dir, trust_remote_code=True)
     parts = []
     for name, (repo, formatter) in DATASETS.items():
+        if datasets is not None and name not in datasets:
+            continue
         ds = load_dataset(repo, cache_dir=str(HF_CACHE_DIR))["train"]
         ds = ds.map(lambda ex: tokenize_messages(formatter(ex), tokenizer, max_length),
                     remove_columns=ds.column_names, num_proc=num_proc, desc=f"tokenize {name}")
@@ -62,19 +68,32 @@ def prepare_sft_data(base_model_dir, max_length: int = 262144, output_dir=DEFAUL
     n_val = max(1, int(len(combined) * val_ratio))
     val, train = combined.select(range(n_val)), combined.select(range(n_val, len(combined)))
 
-    out = sft_data_dir(max_length, output_dir)
+    out = sft_data_dir(max_length, output_dir, datasets)
     out.mkdir(parents=True, exist_ok=True)
     train.save_to_disk(str(out / "train"))
     val.save_to_disk(str(out / "validation"))
     with open(out / "info.json", "w") as f:
-        json.dump({"max_length": max_length, "train": len(train), "validation": len(val)}, f)
+        json.dump({"max_length": max_length, "train": len(train), "validation": len(val),
+                   "datasets": list(datasets or DATASETS)}, f)
     print(f"Saved {out}: train={len(train)}, validation={len(val)}")
     return out
 
 
-def ensure_sft_data(base_model_dir, max_length: int = 262144, output_dir=DEFAULT_DATA_DIR) -> Path:
-    out = sft_data_dir(max_length, output_dir)
+def parse_datasets(spec):
+    """'longalign,longalpaca' -> list; None / 'all' -> None (the full mixture)."""
+    if spec is None or spec == "all":
+        return None
+    names = [s.strip() for s in spec.split(",") if s.strip()]
+    bad = [n for n in names if n not in DATASETS]
+    if bad:
+        raise ValueError(f"unknown datasets {bad}; known: {list(DATASETS)}")
+    return names
+
+
+def ensure_sft_data(base_model_dir, max_length: int = 262144, output_dir=DEFAULT_DATA_DIR, datasets=None) -> Path:
+    datasets = parse_datasets(datasets) if isinstance(datasets, str) else datasets
+    out = sft_data_dir(max_length, output_dir, datasets)
     if (out / "train").exists() and (out / "validation").exists():
         return out
-    print(f"SFT data not found at {out}; preparing it (max_length={max_length})...")
-    return prepare_sft_data(base_model_dir, max_length, output_dir)
+    print(f"SFT data not found at {out}; preparing it (max_length={max_length}, datasets={datasets or 'all'})...")
+    return prepare_sft_data(base_model_dir, max_length, output_dir, datasets=datasets)

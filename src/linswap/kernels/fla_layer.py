@@ -65,7 +65,7 @@ def register_fla_kernel(name: str, layer_cls, *, description: str, new_param_nam
                         layer_kwargs=None, output_gate: str = "qwen", gate_attr: str = "g_proj",
                         norm_attr: str = "o_norm", post_build: Callable[[nn.Module, dict], None] | None = None,
                         init_extra: Callable[[nn.Module, dict], None] | None = None, notes: str = "",
-                        copy_shared: bool = True) -> KernelSpec:
+                        copy_shared: bool = True, supports_activation_checkpointing: bool = True) -> KernelSpec:
     def build(cfg, layer_idx):
         layer = build_fla_layer(layer_cls, cfg, layer_idx, layer_kwargs, output_gate, gate_attr, norm_attr)
         if post_build is not None:
@@ -82,4 +82,5 @@ def register_fla_kernel(name: str, layer_cls, *, description: str, new_param_nam
         return layer
 
     return register_kernel(KernelSpec(name=name, description=description, build=build, init_from_gdn=init_from_gdn,
-                                      new_param_names=tuple(new_param_names), exact_init=exact_init, notes=notes))
+                                      new_param_names=tuple(new_param_names), exact_init=exact_init, notes=notes,
+                                      supports_activation_checkpointing=supports_activation_checkpointing))

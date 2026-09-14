@@ -189,7 +189,8 @@ def main(args):
         model = None
         if checks - {"layer"}:
             ckpt = args.ckpt if kernel == args.kernel else None
-            model = build_model(kernel, hf_weights=weights, device=device, ckpt_dir=ckpt).eval()
+            model = build_model(kernel, base_model_dir=args.base_model_dir, hf_weights=weights, device=device,
+                                ckpt_dir=ckpt).eval()
             n_new = sum(p.numel() for _, p in model.new_parameters())
             print(f"  params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M, "
                   f"kernel gate/new params: {n_new/1e6:.2f}M ({spec.new_param_names})")

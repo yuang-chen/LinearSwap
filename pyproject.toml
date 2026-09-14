@@ -24,11 +24,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-eval = ["nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm"]
+eval = ["accelerate", "lm_eval", "tenacity", "nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm"]
 # Mamba-1 / Mamba-3 kernels (mamba_ssm needs triton>=3.5, i.e. torch>=2.9).  Install these with
 #   pip install --no-deps --no-build-isolation --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
 # so that mamba-ssm cannot replace your torch build; see README "Installation".
 mamba = ["causal-conv1d>=1.5", "mamba-ssm>=2.3.2"]
+# Hopper-class GPUs (compute capability 9.x) with Triton 3.4–3.7: FLA refuses the Triton backward of gated
+# chunk kernels (incorrect results, fla-org/flash-linear-attention#640) and uses TileLang instead.
+hopper = ["tilelang>=0.1.8"]
 
 [project.scripts]
 linswap = "linswap.cli:main"

@@ -34,6 +34,7 @@ def add_args(ap):
     ap.add_argument("--layer_steps", type=int, default=200)
     ap.add_argument("--kl_steps", type=int, default=300)
     ap.add_argument("--distill_length", type=int, default=8192)
+    ap.add_argument("--distill_kl_schedule", default=None, help="e.g. 8192:200,65536:100 (packed long-context KL)")
     ap.add_argument("--skip_verify", action="store_true")
     ap.add_argument("--verify_checks", default="layer,logits,cache,generation")
     ap.add_argument("--verify_lengths", default="8,512,4096")
@@ -58,9 +59,10 @@ def main(args):
     if do_distill:
         d = _namespace(distill.add_args, ["--kernel", args.kernel, "--base_model_dir", args.base_model_dir,
                                           "--data_dir", args.data_dir, "--data_max_length", str(args.data_max_length),
-                                          "--stages", args.distill_stages, "--layer_steps", str(args.layer_steps),
+                                          "--datasets", args.datasets, "--stages", args.distill_stages, "--layer_steps", str(args.layer_steps),
                                           "--kl_steps", str(args.kl_steps), "--max_length", str(args.distill_length),
                                           "--seed", str(args.seed)]
+                       + (["--kl_schedule", args.distill_kl_schedule] if args.distill_kl_schedule else [])
                        + (["--output_dir", str(Path(args.output_dir) / "distill")] if args.output_dir else []))
         args.init_ckpt = str(distill.main(d))
         models.append(args.init_ckpt)
@@ -73,6 +75,6 @@ def main(args):
                                        "--base_model_dir", args.base_model_dir, "--tasks", args.tasks,
                                        "--lengths", args.lengths, "--samples", str(args.samples),
                                        "--val_batches", str(args.val_batches), "--data_dir", args.data_dir,
-                                       "--data_max_length", str(args.data_max_length)]
+                                       "--data_max_length", str(args.data_max_length), "--datasets", args.datasets]
                    + (["--no_cache"] if args.no_cache else []) + (["--skip_ruler"] if args.skip_ruler else []))
     return evaluate.main(e)

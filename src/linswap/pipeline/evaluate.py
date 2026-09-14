@@ -46,8 +46,12 @@ def add_args(ap):
     ap.add_argument("--val_batches", type=int, default=40, help="validation examples for the loss (0 = skip)")
     ap.add_argument("--val_max_length", type=int, default=131072)
     ap.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
+    ap.add_argument("--datasets", default="all", help="SFT mixture subset, e.g. longalign,longalpaca (ablation: no anti-haystack)")
     ap.add_argument("--data_max_length", type=int, default=262144)
     ap.add_argument("--skip_ruler", action="store_true")
+    ap.add_argument("--nll", default=None, help="raw-text NLL corpora, e.g. pg19,wikitext (token-weighted, position-binned)")
+    ap.add_argument("--nll_docs", type=int, default=20)
+    ap.add_argument("--nll_max_length", type=int, default=131072)
 
 
 # ----------------------------------------------------------------------------- models
@@ -62,7 +66,7 @@ def resolve_model(spec: str, base_model_dir):
 
 def _resolve_model(spec: str, base_model_dir):
     if spec in list_kernels():
-        return f"{spec}-base", spec, Path(base_model_dir), None
+        return f"{spec}-base", spec, Path(base_model_dir).resolve(), None  # RULER runs from its own cwd
     d = Path(spec).resolve()  # RULER runs from its own directory, so paths must be absolute
     if not (d / "model.pt").exists():
         raise SystemExit(f"evaluate: {spec!r} is neither a registered kernel nor a checkpoint dir with model.pt")
@@ -71,7 +75,7 @@ def _resolve_model(spec: str, base_model_dir):
     kernel = cfg.get("linear_kernel") or read_checkpoint_kernel(d)
     step = d.name.split("-")[-1] if d.name.startswith("checkpoint-") else d.name
     mode = cfg.get("sft_mode", "sft").replace("gate_only", "gate")
-    return f"{kernel}-{mode}-{step}", kernel, Path(cfg.get("base_model_dir", base_model_dir)), d
+    return f"{kernel}-{mode}-{step}", kernel, Path(cfg.get("base_model_dir", base_model_dir)).resolve(), d
 
 
 # ------------------------------------------------------------------------------ RULER
@@ -146,7 +150,7 @@ def main(args):
 
     val_loader = None
     if args.val_batches > 0:
-        data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir)
+        data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir, args.datasets)
         val_ds = TruncatedDataset(load_from_disk(data_dir / "validation"), args.val_max_length)
         val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
@@ -158,6 +162,21 @@ def main(args):
             ce = eval_loss(model, val_loader, max_batches=args.val_batches)
             row["val_ce"], row["ppl"] = round(ce, 4), round(math.exp(ce), 3)
             print(f"  {disp}: val CE {ce:.4f} (ppl {math.exp(ce):.2f})", flush=True)
+            del model
+            torch.cuda.empty_cache()
+        if args.nll:
+            from transformers import AutoTokenizer
+
+            from ..nll import raw_text_nll
+
+            tok = AutoTokenizer.from_pretrained(base)
+            model = build_model(kernel, base_model_dir=base, ckpt_dir=ckpt).eval()
+            for corpus in [c for c in args.nll.split(",") if c]:
+                r = raw_text_nll(model, tok, corpus, args.nll_docs, args.nll_max_length)
+                row[f"nll_{corpus}"] = round(r["nll"], 4)
+                for b, v in r["bins"].items():
+                    row[f"nll_{corpus}@{b}"] = round(v, 4)
+                print(f"  {disp}: {corpus} NLL {r['nll']:.4f} over {r['tokens']} tokens, bins {{{', '.join(f'{k}: {v:.3f}' for k, v in r['bins'].items())}}}", flush=True)
             del model
             torch.cuda.empty_cache()
         if not args.skip_ruler:

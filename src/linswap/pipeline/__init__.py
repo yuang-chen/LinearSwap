@@ -4,7 +4,7 @@ Every stage module exposes ``add_args(parser)`` and ``main(args)`` and is wired
 into the ``linswap`` command line (``linswap.cli``).
 """
 
-from . import distill, evaluate, export, posttrain, run, verify  # noqa: F401
+from . import distill, evaluate, export, lmeval, mqar, posttrain, run, verify  # noqa: F401
 
 STAGES = {
     "verify": verify,
@@ -13,4 +13,6 @@ STAGES = {
     "evaluate": evaluate,
     "run": run,
     "export": export,
+    "lmeval": lmeval,
+    "mqar": mqar,
 }

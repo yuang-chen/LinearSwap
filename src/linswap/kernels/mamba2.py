@@ -77,6 +77,46 @@ def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
     return layer
 
 
+class Mamba2BetaLayer(Mamba2SSDLayer):
+    """Control variant: SSD recurrence with GDN's beta-scaled write instead of Mamba-2's Δ-scaled one,
+    so the *only* difference from GDN is the missing delta-rule erase."""
+
+    def __init__(self, hidden_size, head_dim, num_heads, num_v_heads=None, conv_size=4, norm_eps=1e-6, layer_idx=None,
+                 qk_l2norm=True):
+        super().__init__(hidden_size, head_dim, num_heads, num_v_heads, conv_size, norm_eps, layer_idx, qk_l2norm)
+        self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
+
+    def recurrence(self, hidden_states, q, k, v, state, use_cache):
+        T, H = k.shape[1], k.shape[2]
+        delta = F.softplus(self.dt_proj(hidden_states).float() + self.dt_bias.float())
+        g = -self.A_log.float().exp() * delta
+        beta = torch.sigmoid(self.b_proj(hidden_states).float())
+        k_w = (k.float() * beta.unsqueeze(-1)).to(k.dtype)                                  # beta_t k̂_t (GDN's write)
+        fn = fused_recurrent_simple_gla if (self.use_recurrent_kernel and T <= 64) else chunk_simple_gla
+        o, state = fn(q=q, k=k_w, v=v, g=g, scale=self.head_k_dim ** -0.5, initial_state=state, output_final_state=use_cache)
+        return o + v * self.D.view(1, 1, H, 1).to(v.dtype), state
+
+
+def build_beta(cfg, layer_idx):
+    return build_backbone_mixer(Mamba2BetaLayer, cfg, layer_idx)
+
+
+def init_from_gdn_beta(layer, gdn_state, layer_idx, model_prefix="model"):
+    init_from_gdn(layer, gdn_state, layer_idx, model_prefix)
+    copy_(layer.b_proj.weight, get_gdn_source(gdn_state, layer_idx, model_prefix)["b"], "b_proj")
+    return layer
+
+
+register_kernel(KernelSpec(
+    name="mamba2_beta",
+    description="Mamba-2 SSD recurrence with GDN's beta-scaled write (control: only the delta-rule erase is missing).",
+    build=build_beta,
+    init_from_gdn=init_from_gdn_beta,
+    new_param_names=("dt_proj", "b_proj", "A_log", "dt_bias", "D"),
+    exact_init=False,
+    notes="Inexact swap (no delta rule): distil before SFT.",
+))
+
 register_kernel(KernelSpec(
     name="mamba2",
     description="Mamba-2 SSD recurrence (FLA simple-GLA kernel); GDN decay/projections copied, delta-rule erase "

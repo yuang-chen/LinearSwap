@@ -71,8 +71,35 @@ def init_extra(layer, src):
             layer.out_proj.bias.zero_()
 
 
+def init_extra_minimal(layer, src):
+    """Control: copy only the gate / value / key / query / decay-logit rows and the output path;
+    keep Mamba-3's own init for A, trapezoid, angles, B/C norms and biases, D."""
+    I, S, H = layer.intermediate_size, layer.ssm_state_size, layer.num_heads
+    key_dim, value_dim = S * layer.n_groups, I
+    W = layer.in_proj.weight
+    qw, kw, vw = torch.split(src["qkv"], [key_dim, key_dim, value_dim], dim=0)
+    with torch.no_grad():
+        W[0:I].copy_(src["z"].to(W.dtype))
+        W[I:2 * I].copy_(vw.to(W.dtype))
+        W[2 * I:2 * I + key_dim].copy_(kw.to(W.dtype))
+        W[2 * I + key_dim:2 * I + 2 * key_dim].copy_(qw.to(W.dtype))
+        W[2 * I + 2 * key_dim:2 * I + 2 * key_dim + H].copy_(src["a"].to(W.dtype))
+        copy_(layer.dt_bias, src["dt_bias"], "dt_bias")
+        layer.norm.weight.copy_(src["norm"].repeat(H).to(layer.norm.weight.dtype))
+        copy_(layer.out_proj.weight, src["out"], "out_proj")
+
+
 if _mamba3_available:
     from .fla_layer import register_fla_kernel
+
+    register_fla_kernel(
+        "mamba3_min", Mamba3,
+        description="Mamba-3 with a minimal init (projection rows + output path copied, SSM parameters at Mamba-3's "
+                    "own init) — control for the GDN-matched mamba3 init.",
+        layer_kwargs=lambda cfg: dict(layer_kwargs(cfg), use_bias=False), output_gate="native", copy_shared=False,
+        init_extra=init_extra_minimal, new_param_names=("dt_bias", "D", "B_bias", "C_bias", "B_norm", "C_norm"),
+        exact_init=False, notes="Inexact swap (control init).", supports_activation_checkpointing=False,
+    )
 
     register_fla_kernel(
         "mamba3", Mamba3,
@@ -81,4 +108,5 @@ if _mamba3_available:
         layer_kwargs=layer_kwargs, output_gate="native", copy_shared=False, init_extra=init_extra,
         new_param_names=("dt_bias", "D", "B_bias", "C_bias", "B_norm", "C_norm"), exact_init=False,
         notes="Inexact swap (no erase, Δ-scaled writes, no short conv): distil before SFT.",
+        supports_activation_checkpointing=False,   # mamba_ssm kernels re-read ctx.saved_tensors
     )

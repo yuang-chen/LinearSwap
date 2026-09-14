@@ -41,7 +41,7 @@ of a set of incomparable pretraining runs.  The kernels come from
 | name | recurrence (FLA kernel) | init from the pretrained GDN layer | new params | exact |
 |---|---|---|---|---|
 | `gdn` | Gated DeltaNet | weight copy (control) | 0.59M | yes |
-| `gdn2` | Gated DeltaNet-2 | scalar beta/decay tiled into b/w/f gates | 113M | yes |
+| `gdn2` | Gated DeltaNet-2 | scalar beta/decay tiled into b/w/f gates | 113M | yes ‡ |
 | `kda` | Kimi Delta Attention | scalar decay tiled into the low-rank per-channel gate | 7.4M | yes |
 | `kda_fullgate` | Kimi Delta Attention | … with a dense decay projection | 38M | yes |
 | `rwkv7` | RWKV-7-style DPLR generalised delta rule | decay/beta tiled, removal key = key | 14M | yes |
@@ -53,7 +53,10 @@ of a set of incomparable pretraining runs.  The kernels come from
 
 "Exact" kernels reproduce the pretrained model at initialisation and go straight
 to SFT; the others are distilled first (`linswap distill`).  Parameter counts
-are for the 0.8B backbone.  † `mamba1` / `mamba3` use `mamba_ssm`'s kernels through
+are for the 0.8B backbone.  ‡ `gdn2` requires as many value heads as key heads: FLA's
+`GatedDeltaNet2` shares its decay and erase gates across a group of value heads, so a
+backbone with grouped value heads (Qwen3.8-27B: 16 key / 48 value heads) has no exact
+GDN2 image and the kernel refuses to build there.  † `mamba1` / `mamba3` use `mamba_ssm`'s kernels through
 FLA's `Mamba` / `Mamba3` layers and are registered only when those import (see
 Installation).  Mamba-3's single-token decode step additionally needs `mamba_ssm`'s
 CuTe-DSL kernel (`nvidia-cutlass-dsl` + `quack-kernels`), which did not run with the
@@ -89,6 +92,12 @@ dependency resolution or it will replace your torch):
 CUDA_HOME=/usr/local/cuda MAX_JOBS=32 uv pip install --no-deps --no-build-isolation \
     --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
 ```
+
+On Hopper-class GPUs (compute capability 9.x, e.g. H100 / L20X) with Triton 3.4 to 3.7, FLA
+rejects the Triton backward of its gated chunk kernels as incorrect (issue #640) and needs
+`uv pip install -e ".[hopper]"` (TileLang) for training `gdn`, `gdn2`, `kda`; the
+simple-GLA path used by `mamba2` has no TileLang backend, so its *training* needs
+Triton < 3.4 or ≥ 3.7.1 (inference is unaffected).
 
 RULER's word list and QA datasets are fetched by
 `RULER/scripts/data/synthetic/json/download_*.{py,sh}`.
@@ -231,7 +240,13 @@ linswap evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn \
 ```
 
 `--models` takes kernel names (the base swap) and/or checkpoint directories
-(`label=path` to name a row).  The stage computes validation loss and drives
+(`label=path` to name a row).  Beyond RULER, `evaluate --nll pg19,wikitext`
+adds token-weighted raw-text NLL (binned by position) on held-out corpora,
+`linswap lmeval` runs lm-eval-harness (HellaSwag, PIQA, ARC, WinoGrande,
+LAMBADA) through the HF model class, and `linswap mqar` probes in-context
+multi-query associative recall versus the number of key-value pairs.
+`linswap distill --kl_schedule 8192:200,65536:100` distils on packed
+long-context sequences.  The stage computes validation loss and drives
 RULER's own scripts (vendored under `RULER/`, with a wrapper for swapped
 models) for any tasks / lengths / sample counts, then writes one summary table.
 
@@ -259,45 +274,76 @@ hard set 50 (≈ ±7 points).  Full tables and discussion in
 | mamba2 SFT only, 500 steps | all | 1.709 | 95 | 66 | 55 |
 | mamba2 distill only (500) | all | 1.729 | 100 | 72 | 53.25 |
 | mamba2 distill → full 50 | all | 1.491 | 100 | 77 | 73.5 |
+| mamba1 distill → full 50 | all | 2.068 | 66 | 20 | 15 |
+| mamba3 distill → full 50 (32K) | all | 3.679 | – | – | – |
 | deltanet base (inexact) | – | 12.845 | 0 | 0 | 0 |
 | deltanet SFT only, 500 steps | all | 6.145 | 0 | 0 | 0 |
 | deltanet distill → full 50 | all | 2.092 | 0 | 0 | 0 |
 
-**Hard RULER** (`multikey_2` / `multikey_3` / `multiquery` / `vt` / `cwe` / `fwe` / `qa_1` / `qa_2`, average)
+**Hard RULER, average over 8 tasks vs context length** (`multikey_2` / `multikey_3` /
+`multiquery` / `vt` / `cwe` / `fwe` / `qa_1` / `qa_2`; 50 samples per task, answer prefix
+opens the assistant turn as in RULER's chat templates)
+
+| model | 4K | 16K | 64K | 131K |
+|---|---|---|---|---|
+| gdn-base | 86.5 | 85.7 | 78.6 | 75.0 |
+| gdn-full-50 | 85.5 | 81.9 | 74.8 | 70.8 |
+| gdn2-full-50 | 85.4 | 82.4 | 74.8 | 71.7 |
+| kda-full-50 | 85.3 | 81.2 | 74.9 | 71.2 |
+| rwkv7-full-50 | 85.4 | 81.9 | 74.7 | 71.4 |
+| kda-gate-100 | 86.3 | 85.8 | 71.8 | 69.8 |
+| rwkv7-gate-100 | 87.7 | 83.4 | 70.3 | 68.6 |
+| mamba2-distill-sft-50 | 66.5 | 52.8 | 45.0 | 37.9 |
+
+**Hard RULER at 131K, per task**
 
 | model | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
 |---|---|---|---|---|---|---|---|---|---|
-| gdn base | 100 | 98 | 100 | 0 | 36.4 | 87.3 | 36 | 36 | 61.7 |
-| gdn full 50 | 96 | 94 | 100 | 19.2 | 2.2 | 97.3 | 42 | 46 | 62.1 |
-| gdn2 full 50 | 96 | 94 | 100 | 19.2 | 3.0 | 97.3 | 40 | 44 | 61.7 |
-| kda full 50 | 96 | 94 | 100 | 19.2 | 3.2 | 98.0 | 44 | 46 | 62.5 |
-| rwkv7 full 50 | 96 | 94 | 100 | 19.2 | 2.2 | 96.7 | 42 | 42 | 61.5 |
-| kda gate-only 100 | 100 | 96 | 100 | 5.6 | 3.0 | 92.7 | 40 | 34 | 58.9 |
-| rwkv7 gate-only 100 | 100 | 92 | 100 | 4.4 | 0.4 | 90.7 | 32 | 34 | 56.7 |
-| mamba2 SFT only, 50 steps | 0 | 0 | 0 | 0 | 0 | 7.3 | 2 | 0 | 1.2 |
-| mamba2 SFT only, 500 steps | 12 | 2 | 6.5 | 0 | 1.0 | 30.7 | 10 | 0 | 7.8 |
-| mamba2 distill only (500) | 52 | 16 | 49 | 0.4 | 0.4 | 6.0 | 10 | 24 | 19.7 |
-| mamba2 distill → full 50 | 62 | 6 | 83.5 | 20.4 | 0.4 | 59.3 | 26 | 32 | 36.2 |
-| deltanet (any variant) | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0–4 | ~0 |
+| gdn-base | 100.0 | 100.0 | 100.0 | 77.2 | 46.0 | 98.7 | 40.0 | 38.0 | 75.0 |
+| gdn-full-50 | 98.0 | 100.0 | 100.0 | 79.6 | 9.0 | 98.0 | 42.0 | 40.0 | 70.8 |
+| gdn2-full-50 | 98.0 | 100.0 | 100.0 | 80.0 | 9.6 | 98.0 | 44.0 | 44.0 | 71.7 |
+| kda-full-50 | 98.0 | 100.0 | 100.0 | 80.4 | 9.6 | 98.0 | 44.0 | 40.0 | 71.2 |
+| rwkv7-full-50 | 98.0 | 100.0 | 100.0 | 80.0 | 9.0 | 98.0 | 42.0 | 44.0 | 71.4 |
+| kda-gate-100 | 100.0 | 100.0 | 99.5 | 83.6 | 1.4 | 98.0 | 36.0 | 40.0 | 69.8 |
+| rwkv7-gate-100 | 100.0 | 100.0 | 99.5 | 82.0 | 0.2 | 95.3 | 34.0 | 38.0 | 68.6 |
+| mamba2-distill-sft-50 | 54.0 | 4.0 | 89.0 | 26.4 | 0.4 | 63.3 | 36.0 | 30.0 | 37.9 |
+
+**Second scale: Qwen3.8-27B** (16 key / 48 value linear heads, gate-only SFT
+at 32K, 100 steps; RULER `multikey_2` / `multiquery` / `vt` / `qa_1` at 16K and 64K,
+25 samples; `gdn2` cannot be built on grouped value heads, see ‡)
+
+| model | trainable | val CE | mk2 16K/64K | mq 16K/64K | vt 16K/64K | qa1 16K/64K |
+|---|---|---|---|---|---|---|
+| gdn base (exact copy) | – | 4.77 | 100 / 100 | 100 / 100 | 100 / 100 | 80 / 84 |
+| kda gate-only 100 | 81M | 0.94 | 100 / 100 | 100 / 100 | 100 / 100 | 84 / 80 |
+| rwkv7 gate-only 100 | 139M | 0.93 | 100 / 100 | 100 / 100 | 100 / 100 | 80 / 76 |
+
+In fp32 the swapped 27B reproduces the Hugging Face model to KL 2.6e-6 (top-1
+identical); the base model's high validation loss is the thinking-tuned backbone
+in non-thinking mode on this SFT data (the HF model itself scores 4.79), not the
+swap.
 
 What the numbers say:
 
 * The exact swaps lose nothing at init, and after the identical short full-SFT
-  recipe all four exact kernels tie on every task, easy and hard.  At this budget
-  the backbone dominates; the recurrence is invisible.
-* Gate-only SFT is where kernels differ: a per-channel decay gate (KDA, RWKV-7)
-  is a cheap handle for multi-value retrieval, GDN2's three dense gates are not,
-  despite the lowest validation loss.
+  recipe all four exact kernels tie on every task at every context length (4K to
+  131K, within 0.6 average points).  At this budget the backbone dominates; the
+  recurrence is invisible.
+* Gate-only SFT is where kernels differ on the easy set (a per-channel decay gate
+  — KDA, RWKV-7 — is a cheap handle for multi-value retrieval, GDN2's three dense
+  gates are not, despite the lowest validation loss); on the hard set KDA and RWKV-7
+  gate-only checkpoints tie, keep common-word extraction at short context where
+  full SFT loses it, and give the best variable tracking at 131K.
 * Inexact swaps ablate the pretrained recurrence.  Mamba-2 (no erase) is brought
-  back to the original loss by distillation but plateaus on distractor-heavy
-  multi-key retrieval; DeltaNet (no decay) recovers loss and short-context
-  retrieval but nothing at 131K.  Distillation beats SFT alone at equal steps
-  (DeltaNet 2.46 vs 6.70 val CE after 500 steps), and for Mamba-2 it transfers
-  retrieval behaviour that SFT does not even at equal validation loss (multikey_2
-  52 vs 12 at val CE 1.73 vs 1.71).
-* The retrieval-flavoured SFT lifts variable tracking (0 → 19) but destroys
-  common-word extraction (36 → ~3) for every kernel — the fine-tuning data, not
-  the swap.
+  back to the original loss by distillation but is the only kernel whose retrieval
+  degrades with length (distractor needles 90 → 4 from 4K to 131K); DeltaNet (no
+  decay) recovers loss and short-context retrieval but nothing at 131K.
+  Distillation beats SFT alone at equal steps (DeltaNet 2.46 vs 6.70 val CE after
+  500 steps), and for Mamba-2 it transfers retrieval behaviour that SFT does not
+  even at equal validation loss.
+* The retrieval-flavoured SFT does not improve the hard tasks: it costs 1 point at
+  4K and 4 at 131K, almost all of it common-word extraction (46 → 9 at 131K) — the
+  fine-tuning data, not the swap.
 
 ## Citation
 

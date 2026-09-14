@@ -11,7 +11,11 @@ so tiling the pretrained scalar projections across channels is exact
 (docs/gdn2_swap_notes.md).  As for KDA, GDN2's default low-rank gate MLPs and
 sigmoid-gated output norm are replaced by the backbone's parameterisation (dense
 ``f_proj``/``g_proj``, SiLU-gated RMSNorm) so the init is representable.
-New parameters: ~113M (three dense 2048×1024 gates per layer)."""
+New parameters: ~113M (three dense 2048×1024 gates per layer).
+
+Limitation: FLA's layer shares ``f``/``b`` across the value heads of a query-head group,
+so backbones with grouped value heads (e.g. Qwen3.8-27B, 16 key / 48 value heads) are
+rejected at build time — the exact tiled init does not exist there."""
 
 import torch.nn as nn
 from fla.layers import GatedDeltaNet2
@@ -22,6 +26,12 @@ from .fla_layer import register_fla_kernel
 
 def dense_f_proj(layer, cfg):
     """GDN2's default low-rank decay MLP cannot hold the tiled scalar decay exactly; use a dense projection."""
+    if layer.num_v_heads != layer.num_heads:
+        raise NotImplementedError(
+            "gdn2: FLA's GatedDeltaNet2 keeps the decay (f) and erase (b) gates per *key* head and repeats them "
+            f"over each group of {layer.num_v_heads // layer.num_heads} value heads, so a GDN backbone with grouped "
+            f"value heads ({layer.num_heads} key / {layer.num_v_heads} value heads) has no exact GDN2 image: the "
+            "value heads of a group carry different pretrained decays.  Use kda or rwkv7 for GVA backbones.")
     ref = layer.q_proj.weight
     layer.f_proj = nn.Linear(layer.hidden_size, layer.key_dim, bias=False, device=ref.device, dtype=ref.dtype)
 

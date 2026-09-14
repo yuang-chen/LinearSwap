@@ -38,6 +38,7 @@ def add_args(ap):
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--init_ckpt", default=None, help="start from this checkpoint (e.g. a distill checkpoint)")
     ap.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
+    ap.add_argument("--datasets", default="all", help="SFT mixture subset, e.g. longalign,longalpaca (ablation: no anti-haystack)")
     ap.add_argument("--data_max_length", type=int, default=262144, help="length the SFT data is prepared at")
     ap.add_argument("--max_length", type=int, default=131072, help="left-truncate examples to this many tokens")
     ap.add_argument("--gate_steps", type=int, default=100)
@@ -103,7 +104,9 @@ def train_one(args, mode, data_dir, out_dir) -> Path:
     if args.init_ckpt:
         print(f"  initialised from {args.init_ckpt}")
     model.train()
-    model.gradient_checkpointing = True
+    model.gradient_checkpointing = spec.supports_activation_checkpointing
+    if not spec.supports_activation_checkpointing:
+        print("  activation checkpointing disabled for this kernel (use a shorter --max_length if memory is tight)")
 
     gate_params = [p for _, p in model.new_parameters()]
     gate_ids = {id(p) for p in gate_params}
@@ -211,7 +214,7 @@ def main(args) -> list[Path]:
     for m in modes:
         if m not in ("gate_only", "full"):
             raise SystemExit(f"posttrain: unknown mode {m!r}")
-    data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir)
+    data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir, args.datasets)
     out_root = (Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUTS / args.kernel).resolve()
     ckpts = [train_one(args, mode, data_dir, out_root / f"sft_{mode}") for mode in modes]
     print("[posttrain] checkpoints: " + ", ".join(str(c) for c in ckpts))
