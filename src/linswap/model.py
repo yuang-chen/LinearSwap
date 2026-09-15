@@ -6,13 +6,17 @@ linear-attention layers are built by the kernel registry.
 
 from __future__ import annotations
 
+import re
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .components import FeedForward, GroupedQueryAttention, RMSNorm, compute_rope_params
 
-from .registry import KernelSpec, get_kernel
+from .registry import KernelSpec, get_kernel, kernel_map_name, parse_kernel_map
+
+ROPE_MARGIN = 4096  # positions beyond the backbone's max_position_embeddings that the RoPE tables cover
 
 
 class TransformerBlock(nn.Module):
@@ -60,15 +64,21 @@ class TransformerBlock(nn.Module):
 class LinearSwapBackbone(nn.Module):
     """embed_tokens -> layers -> norm (the ``model`` sub-module of a Qwen-style causal LM)."""
 
-    def __init__(self, cfg, kernel: KernelSpec):
+    def __init__(self, cfg, kernel: str | KernelSpec):
         super().__init__()
         self.cfg = cfg
-        self.kernel = kernel
+        # ``kernel`` may be a registry name / KernelSpec or a kernel-map string ("gdn;mamba2@3,6,9"):
+        # the default kernel builds every linear-attention layer unless the map overrides that layer.
+        self.kernel, self.kernel_map = parse_kernel_map(kernel)
         self.embed_tokens = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
         layer_types = cfg.get("layer_types", ["full_attention"] * cfg["n_layers"])
         if len(layer_types) != cfg["n_layers"]:
             raise ValueError("len(layer_types) must equal n_layers")
-        self.layers = nn.ModuleList([TransformerBlock(cfg, lt, idx, kernel) for idx, lt in enumerate(layer_types)])
+        for i in self.kernel_map:
+            if i >= len(layer_types) or layer_types[i] != "linear_attention":
+                raise ValueError(f"kernel map names layer {i}, which is not a linear-attention layer")
+        self.layers = nn.ModuleList([TransformerBlock(cfg, lt, idx, self.layer_kernel(idx))
+                                     for idx, lt in enumerate(layer_types)])
         self.norm = RMSNorm(cfg["emb_dim"], eps=cfg.get("rms_norm_eps", 1e-6))
         # RoPE tables are computed lazily per (device, dtype) rather than registered as buffers:
         # non-persistent buffers are not restored by HF `from_pretrained` (meta-device init).
@@ -76,13 +86,23 @@ class LinearSwapBackbone(nn.Module):
         self.current_pos = 0
         self.gradient_checkpointing = False
 
+    def layer_kernel(self, idx: int) -> KernelSpec:
+        return self.kernel_map.get(idx, self.kernel)
+
+    @property
+    def kernel_name(self) -> str:
+        """Registry name, or the canonical kernel-map string for mixed-kernel models."""
+        return kernel_map_name(self.kernel, self.kernel_map)
+
     def rope_tables(self, device, dtype):
         key = (str(device), dtype)
         if key not in self._rope_tables:
             cfg = self.cfg
             head_dim = cfg["emb_dim"] // cfg["n_heads"] if cfg["head_dim"] is None else cfg["head_dim"]
             cos, sin = compute_rope_params(
-                head_dim=head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"],
+                # A margin beyond max_position_embeddings lets generation continue past a prompt that fills the
+                # native window (RULER at 256K); HF computes RoPE per position and extrapolates the same way.
+                head_dim=head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"] + ROPE_MARGIN,
                 partial_rotary_factor=cfg.get("partial_rotary_factor", 1.0), dtype=torch.float32,
             )
             self._rope_tables = {key: (cos.to(device=device, dtype=dtype), sin.to(device=device, dtype=dtype))}
@@ -120,8 +140,8 @@ class LinearSwapModel(nn.Module):
     def __init__(self, cfg, kernel: str | KernelSpec = "gdn"):
         super().__init__()
         self.cfg = cfg
-        self.kernel = get_kernel(kernel)
-        self.model = LinearSwapBackbone(cfg, self.kernel)
+        self.model = LinearSwapBackbone(cfg, kernel)
+        self.kernel = self.model.kernel            # default kernel (see ``kernel_map`` / ``kernel_name``)
         self.lm_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
     # ---- convenience accessors
@@ -157,9 +177,37 @@ class LinearSwapModel(nn.Module):
     def linear_layers(self):
         return [b.linear_attn for b in self.model.layers if b.layer_type == "linear_attention"]
 
+    @property
+    def kernel_map(self):
+        return self.model.kernel_map
+
+    @property
+    def kernel_name(self) -> str:
+        return self.model.kernel_name
+
+    def layer_kernel(self, idx: int) -> KernelSpec:
+        return self.model.layer_kernel(idx)
+
+    @property
+    def supports_activation_checkpointing(self) -> bool:
+        return all(k.supports_activation_checkpointing for k in [self.kernel, *self.kernel_map.values()])
+
+    @property
+    def new_param_names(self) -> tuple:
+        names = []
+        for k in [self.kernel, *self.kernel_map.values()]:
+            names.extend(n for n in k.new_param_names if n not in names)
+        return tuple(names)
+
     def new_parameters(self):
-        """Named parameters the kernel spec considers new / gate parameters."""
-        return [(n, p) for n, p in self.named_parameters() if self.kernel.is_new_param(n)]
+        """Named parameters the (per-layer) kernel spec considers new / gate parameters."""
+        out = []
+        for n, p in self.named_parameters():
+            m = re.match(r"model\.layers\.(\d+)\.", n)
+            spec = self.layer_kernel(int(m.group(1))) if m else self.kernel
+            if spec.is_new_param(n):
+                out.append((n, p))
+        return out
 
     # ---- forward
     def forward(self, in_idx, cache=None, use_cache=False, return_hidden=False,

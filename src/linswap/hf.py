@@ -147,7 +147,7 @@ class LinearSwapForCausalLM(LinearSwapPreTrainedModel, GenerationMixin):
         # Cast everything (including the fp32 A_log / dt_bias the FLA layers create) to one dtype,
         # exactly like linswap.build_model does; mixed dtypes make the Triton kernels misbehave.
         cfg = config.to_backbone_cfg(dtype)
-        self.model = LinearSwapBackbone(cfg, get_kernel(config.kernel)).to(dtype)
+        self.model = LinearSwapBackbone(cfg, config.kernel).to(dtype)
         self.lm_head = torch.nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=dtype)
         self.post_init()
 
@@ -207,7 +207,7 @@ class LinearSwapForCausalLM(LinearSwapPreTrainedModel, GenerationMixin):
         if ckpt_dir is not None and (Path(ckpt_dir) / "config.json").exists():
             import json
             sft_mode = json.load(open(Path(ckpt_dir) / "config.json")).get("sft_mode")
-        config = LinearSwapConfig.from_backbone_cfg(swapped.cfg, swapped.kernel.name,
+        config = LinearSwapConfig.from_backbone_cfg(swapped.cfg, swapped.kernel_name,
                                                     base_model=str(Path(base_model_dir).name), sft_mode=sft_mode)
         config.dtype = dtype
         model = cls(config)

@@ -13,13 +13,14 @@ Two checkpoint formats are understood:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import torch
 
 from .backbones import load_backbone_config
 from .model import LinearSwapModel
-from .registry import get_kernel
+from .registry import parse_kernel_map, get_kernel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASE_MODEL_DIR = REPO_ROOT / "models" / "Qwen3.5-0.8B"
@@ -66,7 +67,6 @@ def load_weights_from_gdn(model: LinearSwapModel, params: dict) -> None:
 
     _assign(model.embed_tokens.weight, get("embed_tokens.weight"), "embed_tokens")
     layer_types = model.cfg.get("layer_types", ["full_attention"] * model.cfg["n_layers"])
-    kernel = model.kernel
 
     for l, block in enumerate(model.layers):
         if layer_types[l] == "full_attention":
@@ -80,7 +80,7 @@ def load_weights_from_gdn(model: LinearSwapModel, params: dict) -> None:
             if att.k_norm is not None:
                 _assign(att.k_norm.weight, get(f"layers.{l}.self_attn.k_norm.weight"), f"{l}.k_norm")
         elif layer_types[l] == "linear_attention":
-            kernel.init_from_gdn(block.linear_attn, params, l, model_prefix)
+            model.layer_kernel(l).init_from_gdn(block.linear_attn, params, l, model_prefix)
         else:
             raise ValueError(f"Unsupported layer type: {layer_types[l]}")
 
@@ -140,12 +140,37 @@ def convert_legacy_state_dict(state: dict, layer_types) -> dict:
     return out
 
 
-def load_native_checkpoint(model: LinearSwapModel, ckpt_dir, strict=True) -> None:
+def load_native_checkpoint(model: LinearSwapModel, ckpt_dir, strict=None) -> None:
+    """Load ``ckpt_dir/model.pt``.  ``strict=None`` (default) is strict unless the checkpoint was written by a
+    different kernel (map) than the model's — e.g. a full ``mamba2`` checkpoint loaded into a mixed
+    ``gdn;mamba2@3,6`` model — in which case only the tensors whose names and shapes match are loaded
+    (the swapped layers and the shared backbone) and the rest keep their pretrained init."""
     state = torch.load(Path(ckpt_dir) / "model.pt", map_location="cpu", weights_only=True)
     state = convert_legacy_state_dict(state, model.cfg.get("layer_types", ["full_attention"] * model.cfg["n_layers"]))
-    missing, unexpected = model.load_state_dict(state, strict=strict)
-    if missing or unexpected:
-        print(f"[linswap] load_native_checkpoint: missing={missing[:5]} unexpected={unexpected[:5]}")
+    if strict is None:
+        ck = read_checkpoint_kernel(ckpt_dir)
+        strict = ck is None or ck == model.kernel_name
+    if strict:
+        model.load_state_dict(state, strict=True)
+        return
+    own = model.state_dict()
+    # Kernel-specific tensors are only taken for layers whose kernel in the checkpoint equals the model's
+    # kernel for that layer: different kernels share parameter names (q_proj, conv1d, A_log, ...) and a
+    # checkpoint trained with one kernel must not overwrite another kernel's pretrained copy of them.
+    ck_default, ck_map = parse_kernel_map(read_checkpoint_kernel(ckpt_dir))
+    lin = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.")
+
+    def wanted(k):
+        m = lin.match(k)
+        if m is None:
+            return True
+        i = int(m.group(1))
+        return ck_map.get(i, ck_default).name == model.layer_kernel(i).name
+
+    keep = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape and wanted(k)}
+    missing, unexpected = model.load_state_dict(keep, strict=False)
+    print(f"[linswap] load_native_checkpoint (partial, checkpoint kernel {read_checkpoint_kernel(ckpt_dir)!r} -> model "
+          f"{model.kernel_name!r}): loaded {len(keep)} tensors, kept init for {len(missing)}, ignored {len(state) - len(keep)}")
 
 
 def read_checkpoint_kernel(ckpt_dir) -> str | None:

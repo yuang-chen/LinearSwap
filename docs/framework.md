@@ -39,7 +39,8 @@ src/linswap/
   pipeline/evaluate.py   stage 3: validation loss + RULER (calls RULER's scripts directly) -> summary table
   pipeline/run.py        the stages chained for one kernel
   pipeline/export.py     write a swapped model / checkpoint as an HF checkpoint (safetensors + tokenizer + card)
-tests/                 test_kernels.py (all kernels vs control), test_hf.py (HF round-trip), test_batch.py (padded batches), test_gva.py (grouped value heads)
+tests/                 test_kernels.py (all kernels vs control), test_hf.py (HF round-trip), test_batch.py (padded batches), test_gva.py (grouped value heads),
+                       test_losses.py (chunked CE / KL vs dense autograd; CPU, no model)
 examples/quickstart.ipynb
 RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linswap[_nocache]
 ```
@@ -120,7 +121,7 @@ implementation):
 | cached decode vs no-cache decode (5 / 120 / 4096-token prompts) | 100 % token agreement | 100 % |
 | greedy generation vs HF (20 tokens) | identical | identical |
 | gradients of shared params, KDA vs GDN layer (T=256 / 4096) | rel diff ≤ 1.3 % | – |
-| validation CE at step 0 (10 batches ≤131K) | 1.6914 | 1.6920 (gdn2: 1.6914) |
+| validation CE at step 0 (10 batches ≤128K) | 1.6914 | 1.6920 (gdn2: 1.6914) |
 
 ## RWKV-7 swap (exact)
 
@@ -237,8 +238,8 @@ Recipe (identical for every kernel, `linswap posttrain`): data
 `data/sft/len262144` left-truncated to 131072, bf16, gradient checkpointing,
 micro-batch 1 × 2 accumulation, AdamW, clip 1.0, seed 42.
 `gate_only`: 100 steps, lr 2e-4 on `new_param_names`, backbone frozen.
-`full`: 50 steps, lr 1e-5 on everything.  Hardware here: 2× NVIDIA L20X (143 GiB);
-a 131K micro-step takes ~10 s, a 262K micro-step ~36 s / 54 GiB, so every run
+`full`: 50 steps, lr 1e-5 on everything.  Hardware here: 2× NVIDIA H200 (143 GiB);
+a 128K micro-step takes ~10 s, a 262K micro-step ~36 s / 54 GiB, so every run
 finishes in well under 10 minutes because most examples are short (median 9K tokens).
 
 Environment: Python 3.11 in the `uv` venv.  The 0.8B results in this document
@@ -246,7 +247,7 @@ were produced with torch 2.6 / Triton 3.2 (FLA's short convolution on its
 PyTorch fallback until `causal-conv1d` was built); the environment was later
 moved to torch 2.9.1 / CUDA 12.8 / Triton 3.5.1 with `causal-conv1d` and
 `mamba_ssm` built from source, where every exact kernel re-verifies at the
-same noise floor.  The L20X reports compute capability 9.0 (Hopper class), and
+same noise floor.  The H200 reports compute capability 9.0 (Hopper class), and
 FLA refuses the Triton backward of gated chunk kernels under Triton 3.4–3.7
 there (issue #640); `tilelang` supplies the backward for `gdn` / `gdn2` / `kda`,
 while the `mamba2` / `mamba2_beta` kernels (simple-GLA op, no TileLang backend)
@@ -260,7 +261,7 @@ come from the torch 2.9 environment.
 > ~1000).  It is fixed in this revision; all runs below use the fixed loss.
 > The GDN2 numbers in docs/gdn2_experiment_log.md were produced with the old loss.
 
-### Validation cross-entropy (first 40 validation examples ≤131K)
+### Validation cross-entropy (first 40 validation examples ≤128K)
 
 | model | trainable params | val CE | ppl |
 |---|---|---|---|
@@ -301,7 +302,7 @@ per-channel KDA decay gate (7.4M params) recovers about half of the gap
 between GDN's scalar gates and GDN2's three full-rank gates, and the dense
 `kda_fullgate` variant a little more.
 
-### RULER at 131072 tokens (100 samples per task, cached decode)
+### RULER at 128K (131,072) tokens (100 samples per task, cached decode)
 
 `niah_multivalue` is value-level accuracy.  (These runs predate the `evaluate` stage; today
 `linswap evaluate` writes the same numbers to `outputs/eval/<name>/summary.csv`.)  Every model was evaluated with the
@@ -375,12 +376,12 @@ decay and keeps the erase, and is the harsher counter-example: at init the model
 unusable (validation CE 12.8, all NIAH scores 0), and 200 full-SFT steps at
 lr 1e-4 only bring the loss to 6.2.  Distillation (`linswap distill`,
 layer alignment 200 steps + KL 300 steps at 8K tokens, ~20 min) is far more
-effective — 2.46, and 2.09 after the standard 50-step SFT — yet 131K-token
+effective — 2.46, and 2.09 after the standard 50-step SFT — yet 128K-token
 retrieval stays at 0: a state without decay never forgets, so at 16× the distillation length it is
 full of stale associations.
 At short context the distilled model does retrieve — `niah_single_1` / `niah_multikey_1` reach 56 / 36 at 4K tokens (25 samples) and 0 / 24 at 16K — so the failure is specifically the loss of long-range forgetting, not of the mechanism itself.
 
-### Hard RULER tasks, 4K–131K (50 samples per task)
+### Hard RULER tasks, 4K–128K (50 samples per task)
 
 > **Protocol correction (13 September 2026, evening).**  RULER stores every sample's
 > `answer_prefix` (e.g. *"Answer: According to the chain(s) of variable assignment in the
@@ -442,7 +443,7 @@ extraction), `qa_1` (SQuAD), `qa_2` (HotpotQA).
 | rwkv7-gate-100 | 100.0 | 100.0 | 100.0 | 75.6 | 3.0 | 98.0 | 42.0 | 44.0 | 70.3 |
 | mamba2-distill-sft-50 | 78.0 | 8.0 | 89.5 | 38.4 | 0.2 | 68.0 | 38.0 | 40.0 | 45.0 |
 
-##### 131K tokens (all models; val CE of the added rows: noah 1.443–1.445, mamba2 SFT-only 1.708, distill-only 1.729, mamba2_beta 1.470, mamba2_lc 1.504, deltanet 2.093, deltanet_lc 2.042, mamba1 2.068)
+##### 128K tokens (all models; val CE of the added rows: noah 1.443–1.445, mamba2 SFT-only 1.708, distill-only 1.729, mamba2_beta 1.470, mamba2_lc 1.504, deltanet 2.093, deltanet_lc 2.042, mamba1 2.068)
 
 | model | mk2 | mk3 | mq | vt | cwe | fwe | qa1 | qa2 | avg |
 |---|---|---|---|---|---|---|---|---|---|
@@ -466,7 +467,7 @@ extraction), `qa_1` (SQuAD), `qa_2` (HotpotQA).
 
 ##### average over the 8 tasks vs length
 
-| model | 4K | 16K | 64K | 131K |
+| model | 4K | 16K | 64K | 128K |
 |---|---|---|---|---|
 | gdn-base | 86.5 | 85.7 | 78.6 | 75.0 |
 | gdn-full-50 | 85.5 | 81.9 | 74.8 | 70.8 |
@@ -481,24 +482,24 @@ Reading.
 
 * **Exact kernels are indistinguishable at every length.**  After the identical 50-step
   full SFT, `gdn`, `gdn2`, `kda` and `rwkv7` sit within 0.6 average points of each other at
-  4K, 16K, 64K and 131K, and within noise on every individual task.  The swap is invisible;
+  4K, 16K, 64K and 128K, and within noise on every individual task.  The swap is invisible;
   the backbone and the recipe decide the numbers.
 * **What SFT does, by length.**  The retrieval-flavoured SFT does not improve the hard
-  tasks on average — it costs 1 point at 4K and 4 points at 64K–131K relative to the base.
-  The cost is concentrated in common-word extraction (`cwe`: 77 → 65 at 4K, 46 → 9 at 131K;
+  tasks on average — it costs 1 point at 4K and 4 points at 64K–128K relative to the base.
+  The cost is concentrated in common-word extraction (`cwe`: 77 → 65 at 4K, 46 → 9 at 128K;
   the fine-tuned models answer the counting task with confident, fabricated lists) and in
   variable tracking at 64K (80 → 62); needles, `fwe` and QA are unchanged.  Under the old
   protocol (no answer prefix) the same runs looked like SFT *lifting* `vt` from 0 to 19 —
   that was a formatting artefact.
 * **Gate-only SFT behaves differently from full SFT, in both directions.**  Training only
   the ≤14M gate parameters keeps `cwe` at short context (82 / 79 at 4K, 85 / 77 at 16K, vs
-  64–67 after full SFT) and gives the best `vt` at 131K (84 / 82), but collapses `cwe` at
-  64K+ even harder than full SFT (10 / 3 at 64K, 1 / 0 at 131K) and loses 6–8 QA points at
+  64–67 after full SFT) and gives the best `vt` at 128K (84 / 82), but collapses `cwe` at
+  64K+ even harder than full SFT (10 / 3 at 64K, 1 / 0 at 128K) and loses 6–8 QA points at
   64K+.  KDA and RWKV-7 gate-only checkpoints are within noise of each other.
 * **Mamba-2 (no erase) is the only kernel whose retrieval degrades with length.**  After
   distillation and SFT it is close to the exact kernels on single-needle recall at 4K
   (`niah_multikey_2` 100, `multiquery` 99.5) but the distractor task collapses with
-  context — `niah_multikey_3` 90 → 38 → 8 → 4 from 4K to 131K — and `cwe` is at zero from
+  context — `niah_multikey_3` 90 → 38 → 8 → 4 from 4K to 128K — and `cwe` is at zero from
   16K on; the average falls 66.5 → 37.9.  The exact kernels' averages fall only 86 → 71–75
   over the same range, almost all of it `cwe` and QA.
 
@@ -509,7 +510,7 @@ Reading.
   itself, not from the anti-haystack subset.
 * **Distillation vs SFT alone (Mamba-2).**  At matched validation loss (1.71 SFT-only for
   500 steps vs 1.73 distill-only for 500 steps) the SFT-only model retrieves almost nothing at
-  131K (`niah_multikey_2` 12, `multiquery` 2, `vt` 1.6, avg 11) while the distilled one is
+  128K (`niah_multikey_2` 12, `multiquery` 2, `vt` 1.6, avg 11) while the distilled one is
   at 42 / 64.5 / 22 (avg 30.5); distillation followed by the standard 50-step SFT is best on
   every task (avg 37.9).  The validation loss on SFT data does not measure what the swap
   broke; matching the teacher's distributions transfers the retrieval behaviour that SFT
@@ -522,10 +523,12 @@ Reading.
   Distilling at longer context (`mamba2_lc`, packed KL at 8K then 64K, val CE 1.504) helps
   `vt` (58.4 vs 26.4) but hurts the needle tasks (`multikey_2` 18 vs 54), avg 37.3 — no net
   gain from long-context distillation under this budget.  For DeltaNet neither recipe
-  (`deltanet`, `deltanet_lc`) retrieves anything at 131K, and Mamba-1 reaches only
+  (`deltanet`, `deltanet_lc`) retrieves anything at 128K, and Mamba-1 reaches only
   `multiquery` 21 / `fwe` 15.
 
-### Raw-text NLL (`evaluate --nll pg19,wikitext`; token-weighted, 20 PG-19 books and the WikiText-103 test set, ≤131K tokens per document)
+### Perplexity: WikiText-103 and PG-19 length extrapolation (`evaluate --nll pg19,wikitext`; token-weighted NLL, 20 PG-19 books and the WikiText-103 test set, ≤128K tokens per document)
+
+WikiText perplexity is the Gated DeltaNet paper's headline language-modelling metric; the PG-19 numbers binned by position are its Figure-2-style length-extrapolation curve.  The SFT-data validation loss reported elsewhere in this document is a training diagnostic only.
 
 | model | PG-19 NLL | 0-4k | 4k-16k | 16k-64k | 64k-128k | WikiText NLL |
 |---|---|---|---|---|---|---|
@@ -600,7 +603,7 @@ Qwen3.8-27B (dense, Apache-2.0; 64 layers = 48 linear + 16 full-attention,
 hidden 5120, 16 query / 48 value linear heads with head dim 128 — i.e. grouped
 value heads, untied `lm_head`, 27B parameters) is the second scale.  Its
 tokenizer is identical to Qwen3.5-0.8B's (same vocabulary and ids), so the SFT
-mixture in `data/sft/len262144` is reused unchanged.  On one L20X a 64K-token
+mixture in `data/sft/len262144` is reused unchanged.  On one H200 a 64K-token
 forward takes 20 s / 72 GiB in bf16, and gate-only SFT at 32K takes ≈ 22 s per
 optimizer step (micro-batch 1 × 2 accumulation, gradient checkpointing).  Full
 SFT of 27B parameters does not fit the 143 GiB budget with AdamW, so the 27B
@@ -610,7 +613,7 @@ here — FLA's `GatedDeltaNet2` keeps `f`/`b` per key head and repeats them over
 three value heads of a group, so the per-value-head pretrained decay has no exact
 image and the kernel now refuses grouped-value-head backbones), and a
 reduced RULER subset (`niah_multikey_2`, `niah_multiquery`, `vt`, `qa_1` at 16K and
-64K, 25 samples per task) plus the 64K validation loss.  No 131K runs, no
+64K, 25 samples per task) plus the 64K validation loss.  No 128K runs, no
 inexact kernels and no distillation were attempted at this scale.
 
 **Exactness at 27B.** All three tiled inits and the exact `gdn` copy build
@@ -690,7 +693,129 @@ the tiled KDA and RWKV-7 swaps keep every one of those scores after gate-only
 SFT while their validation loss drops from 4.77 to 0.93 — the function-
 preserving init holds at 27B and 100 gate-only steps on 81–139M parameters
 neither break long-context retrieval nor change QA beyond noise.  Where the
-0.8B base already loses on `vt` with length (93 → 77 from 4K to 131K) the 27B
+0.8B base already loses on `vt` with length (93 → 77 from 4K to 128K) the 27B
 is saturated, so the second scale confirms containment rather than separating
 the kernels; separating them at this scale would need full SFT (does not fit
 here) or harder tasks.
+
+## Which layers can be swapped? Per-layer sensitivity and greedy mixed-kernel models
+
+Transformer→hybrid conversions choose *which* attention layers to keep by scoring each layer's
+marginal effect (KL-guided layer selection, arXiv 2512.20569) or by greedy validation-guided
+replacement after a blockwise local distillation of every layer (Distill-then-Replace,
+arXiv 2601.11667).  `linswap sensitivity` is the kernel-swap analogue: each of the 18
+linear-attention layers of the 0.8B backbone is replaced by the target kernel *alone*
+(forward only) and scored by KL(teacher ‖ student) on 16 packed 2K FineWeb-Edu sequences
+and by text MQAR; then layers are added greedily in order of least KL, re-scoring the
+remaining candidates each round.  Candidate layers come either from the tiled init or from
+the checkpoint after the `layer` stage of the literature recipe (blockwise local distillation
+on 50M tokens; `outputs/sensitivity/*`).
+
+| layer | mamba2, tiled init | mamba2, after blockwise distillation | deltanet, after blockwise distillation |
+|---|---|---|---|
+| 0 | 1.798 | 0.0100 | 0.0338 |
+| 1 | 0.161 | 0.0074 | 0.0395 |
+| 2 | 0.080 | 0.0048 | 0.0211 |
+| 4 | 0.503 | 0.0039 | 0.0094 |
+| 5 | 0.041 | 0.0038 | 0.0107 |
+| 6 | 0.050 | 0.0037 | 0.0098 |
+| 8 | 0.022 | 0.0026 | 0.0074 |
+| 9 | 0.026 | 0.0026 | 0.0053 |
+| 10 | 0.144 | 0.0038 | 0.0079 |
+| 12 | 0.016 | 0.0027 | 0.0039 |
+| 13 | 0.053 | 0.0031 | 0.0084 |
+| 14 | 0.052 | 0.0034 | 0.0079 |
+| 16 | 0.054 | 0.0044 | 0.0089 |
+| 17 | 0.031 | 0.0033 | 0.0037 |
+| 18 | 0.029 | 0.0028 | 0.0022 |
+| 20 | 0.020 | 0.0028 | 0.0046 |
+| 21 | 0.023 | 0.0049 | 0.0031 |
+| 22 | 0.089 | 0.0054 | 0.0043 |
+| *all 18* | 5.825 | 0.084 | 0.572 |
+
+Greedy replacement (k = number of GDN layers turned into the target; KL, MQAR accuracy at
+256 and 1024 pairs ≈ 4.7K / 19K tokens):
+
+| k | mamba2, tiled init | mamba2, after BLD | deltanet, after BLD |
+|---|---|---|---|
+| 3 | 0.060 / 1.00 / 1.00 | 0.007 / 1.00 / 1.00 | 0.008 / 1.00 / 1.00 |
+| 6 | 0.165 / 1.00 / 1.00 | 0.014 / 1.00 / 1.00 | 0.020 / 1.00 / 1.00 |
+| 9 | 0.346 / 1.00 / 0.99 | 0.024 / 1.00 / 1.00 | 0.047 / 1.00 / 0.77 |
+| 12 | 0.645 / 0.23 / 0.09 | 0.038 / 1.00 / 1.00 | 0.091 / 0.98 / 0.15 |
+| 15 | 1.437 / 0.17 / 0.02 | 0.055 / 1.00 / 1.00 | 0.183 / 0.92 / 0.00 |
+| 18 | 5.825 / 0.00 / 0.00 | 0.084 / 1.00 / 0.99 | 0.572 / 0.01 / 0.00 |
+
+Greedy order (first = cheapest): mamba2 after BLD 8, 9, 20, 12, 18, 17, 14, 5, 13, 6, 4, 22,
+10, 16, 2, 21, 1, 0; deltanet after BLD 18, 21, 12, 17, 22, 20, 9, 8, 14, 4, 10, 16, 13, 5, 6,
+0, 2, 1.
+
+Reading.
+
+* **Sensitivity is front-loaded.**  Before any training the first linear layer costs 1.8 nats
+  of KL on its own when swapped to Mamba-2, layer 4 0.5, layer 1 0.16; the middle and late
+  layers cost 0.02–0.05.  The same ordering survives distillation: layers 0, 1, 2 are the last
+  ones the greedy procedure swaps for both kernels.
+* **Blockwise local distillation is what makes swapping cheap, and single-layer scores are
+  nearly additive for Mamba-2.**  After 50M tokens of per-layer MSE the sum of the 18
+  single-layer KLs (0.067) is close to the all-swapped KL (0.084), and MQAR stays ≥ 0.99 at
+  every k — the missing erase is not visible at 19K tokens on this probe.
+* **DeltaNet (no decay) has a budget of about nine layers.**  MQAR at 1024 pairs is intact
+  up to k = 6, drops to 0.77 at k = 9 and to 0.15 at k = 12; the early layers (5, 6, 0, 2, 1)
+  cannot be swapped without losing recall.  This is the layer-level version of the
+  "state saturation" of additive/undecayed recurrences reported by "What matters in
+  linearizing LMs" (arXiv 2504.14366): a few undecayed layers are tolerable, a majority is not.
+* Mixed checkpoints (`outputs/mixed/*`, spec strings such as
+  `gdn;deltanet@8,9,12,14,17,18,20,21,22`) are evaluated on the hard RULER tasks below.
+
+## Literature recipe for inexact swaps: generic-text, four-stage distillation
+
+The chat-data recipe above (~8M tokens of layer-MSE + KL on the SFT mixture) follows the
+GDN2 tech blog.  Transformer→hybrid conversions instead distil on generic web text with a
+staged recipe and 10–100× the tokens: token-mixer alignment → hidden-state alignment →
+end-to-end KL → long-context fine-tuning (RADLADS arXiv 2505.03005, HALO 2601.22156,
+"What matters in linearizing LMs" 2504.14366, Retrieval-Aware Distillation 2602.11374).
+`linswap distill --text_data fineweb-edu --stages layer,hidden,kl,ce` implements that
+recipe: FineWeb-Edu sample-10BT (one shard, 756M tokens, tokenised once), packed 2K
+sequences, 16 × 2 accumulation (66K tokens per step); budgets 50M (layer, lr 1e-4, linear
+params) / 50M (hidden, lr 1e-4, linear params) / 300M (KL, lr 2e-5, all params) / 100M at
+16K (CE, lr 1e-5, all params); ≈ 4.5 h per kernel on one L20X.  The teacher's packed-text
+validation CE is 2.645; the students reach 2.73 → 2.69 → 2.66 after the first three stages and
+2.55 after the CE stage, which trains on the same distribution and therefore drops *below* the
+teacher on this split (it is not a sign of surpassing the teacher).  The standard 50-step SFT
+follows, then the corrected-protocol hard tasks (50 samples) and perplexity.
+
+| model | recipe | 4K | 16K | 64K | 128K | PG-19 NLL | WikiText NLL |
+|---|---|---|---|---|---|---|---|
+| gdn base | – | 86.5 | 85.7 | 78.6 | 75.0 | 2.972 | 2.529 |
+| mamba2 distill-only | chat, 500 steps | – | – | – | 30.5 | – | – |
+| mamba2 distill → SFT | chat, 500 + 50 | 66.5 | 52.8 | 45.0 | 37.9 | 3.149 | 2.694 |
+| mamba2 distill-only | **literature, 500M tokens** | 59.4 | 33.9 | 22.2 | 19.2 | **2.961** | **2.470** |
+| mamba2 distill → SFT | **literature + 50 SFT** | **78.0** | **67.3** | **52.5** | **49.1** | 2.982 | 2.511 |
+| deltanet distill → SFT | chat, 500 + 50 | – | – | – | 0.0 | 4.460 | 4.455 |
+| deltanet distill-only | **literature, 500M tokens** | 46.2 | 18.7 | 0.3 | 0.2 | *pending* | *pending* |
+| deltanet distill → SFT | **literature + 50 SFT** | 60.3 | *pending* | *pending* | *pending* | *pending* | *pending* |
+
+Per task, Mamba-2 with the literature recipe + SFT at 16K: `niah_multikey_2` 100,
+`multikey_3` 92, `multiquery` 92.5, `vt` 73.6, `fwe` 76, QA 56 / 48 (chat recipe: 96 / 38 / 94 /
+37.6 / 66.7 / 48 / 42); at 128K: 58 / 2 / 88.5 / 86.4 / 92 / 36 / 30 (chat: 54 / 4 / 89 / 26.4 /
+63.3 / 36 / 30).
+
+Reading.
+
+* **The recipe, not the kernel, was the bottleneck for Mamba-2 at short and medium context.**
+  Generic-text distillation with the four stages lifts the hard-task average by 11–15 points at
+  every length (66.5 → 78.0 at 4K, 52.8 → 67.3 at 16K, 45.0 → 52.5 at 64K, 37.9 → 49.1 at
+  128K) and closes the perplexity gap entirely: the distilled student's PG-19 / WikiText NLL
+  (2.961 / 2.470) is at or below the GDN base (2.972 / 2.529), because the last stage trains on
+  web text; after SFT it is 2.982 / 2.511.
+* **What remains is the erase.**  The distractor-needle task at 128K (`multikey_3` 2, vs 100 for
+  the exact kernels) and `cwe` (0.2) do not move with more distillation tokens, the same tasks
+  the β-write control left open; the remaining Mamba-2 gap is architectural, consistent with
+  "state resolution, not budget" in arXiv 2504.14366.
+* **Distill-only is not the right checkpoint to judge.**  Before SFT the literature-recipe
+  student scores *lower* than the chat-distilled one on the hard tasks (19.2 vs 30.5 at 128K)
+  because it has never seen the instruction format; after the identical 50-step SFT it is 11
+  points better.  Loss and retrieval move independently in both directions.
+* **DeltaNet (no decay) gains at short context only.**  At 4K the literature recipe + SFT
+  reaches 60.3 (chat recipe ≈ 55 on the needle tasks, 0 elsewhere), but every task is still
+  zero from 64K on, before and after SFT: undecayed state saturation is not a budget problem.

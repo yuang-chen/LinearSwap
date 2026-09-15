@@ -62,10 +62,10 @@ def add_args(ap):
 def checkpoint_config(model, args, mode):
     cfg = {k: (str(v) if k == "dtype" else v) for k, v in model.cfg.items()}
     cfg.update({
-        "linear_kernel": model.kernel.name,
+        "linear_kernel": model.kernel_name,
         "base_model_dir": str(args.base_model_dir),
         "sft_mode": mode,
-        "new_param_names": list(model.kernel.new_param_names),
+        "new_param_names": list(model.new_param_names),
     })
     return cfg
 
@@ -97,15 +97,15 @@ def train_one(args, mode, data_dir, out_dir) -> Path:
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
-    spec = get_kernel(args.kernel)
-    print(f"[posttrain] kernel={spec.name} mode={mode} steps={num_steps} -> {out_dir}")
+    get_kernel(args.kernel)  # validate
     model = build_model(args.kernel, base_model_dir=args.base_model_dir, device=device,
                         ckpt_dir=args.init_ckpt)
+    print(f"[posttrain] kernel={model.kernel_name} mode={mode} steps={num_steps} -> {out_dir}")
     if args.init_ckpt:
         print(f"  initialised from {args.init_ckpt}")
     model.train()
-    model.gradient_checkpointing = spec.supports_activation_checkpointing
-    if not spec.supports_activation_checkpointing:
+    model.gradient_checkpointing = model.supports_activation_checkpointing
+    if not model.supports_activation_checkpointing:
         print("  activation checkpointing disabled for this kernel (use a shorter --max_length if memory is tight)")
 
     gate_params = [p for _, p in model.new_parameters()]
@@ -122,7 +122,7 @@ def train_one(args, mode, data_dir, out_dir) -> Path:
         ]
     n_train = sum(p.numel() for g in param_groups for p in g["params"])
     print(f"  trainable params {n_train/1e6:.2f}M (gate/new {sum(p.numel() for p in gate_params)/1e6:.2f}M, "
-          f"new_param_names={spec.new_param_names})")
+          f"new_param_names={model.new_param_names})")
     optimizer = AdamW(param_groups)
 
     global_step = 0

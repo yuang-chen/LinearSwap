@@ -17,7 +17,7 @@ from pathlib import Path
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT
 from .evaluate import resolve_model
 
-DEFAULT_TASKS = "hellaswag,piqa,arc_easy,arc_challenge,winogrande,lambada_openai"
+DEFAULT_TASKS = "piqa,hellaswag,winogrande,arc_easy,arc_challenge,boolq,social_iqa,lambada_openai"  # Gated DeltaNet paper, Table 3
 
 
 def add_args(ap):
@@ -49,16 +49,24 @@ def main(args):
         res = lm_eval.simple_evaluate(model="hf", model_args=f"pretrained={hf_dir},dtype=bfloat16,trust_remote_code=False",
                                       tasks=tasks, num_fewshot=args.num_fewshot, limit=args.limit,
                                       batch_size=args.batch_size, log_samples=False)
+        (out_dir / "raw").mkdir(exist_ok=True)
+        with open(out_dir / "raw" / f"{disp}.json", "w") as f:      # full lm-eval result dicts, for re-parsing
+            json.dump({t: res["results"].get(t, {}) for t in tasks}, f, indent=1)
         row = {"model": disp, "kernel": kernel}
         for task in tasks:
             r = res["results"].get(task, {})
-            metric = next((k for k in ("acc_norm,none", "acc,none", "perplexity,none") if k in r), None)
+            # accuracy-like metrics first (acc_norm / acc / contains for SWDE, FDA, SQuAD-completion / exact match / F1),
+            # perplexity last; LAMBADA additionally reports its perplexity in a second column.
+            metric = next((k for k in ("acc_norm,none", "acc,none", "contains,none", "exact_match,none", "em,none",
+                                       "f1,none", "perplexity,none") if k in r), None)
             row[task] = round(float(r[metric]), 4) if metric else None
+            if "perplexity,none" in r and metric != "perplexity,none":
+                row[f"{task}_ppl"] = round(float(r["perplexity,none"]), 3)
         rows.append(row)
         print(f"  {disp}: " + ", ".join(f"{k}={v}" for k, v in row.items() if k not in ("model", "kernel")) + f"  ({time.time()-t:.0f}s)", flush=True)
         with open(out_dir / "lmeval.json", "w") as f:
             json.dump(rows, f, indent=1)
-    cols = ["model", "kernel"] + tasks
+    cols = ["model", "kernel"] + [c for c in rows[0] if c not in ("model", "kernel")] if rows else ["model", "kernel"]
     with open(out_dir / "lmeval.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows)
     md = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)] + ["| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows]

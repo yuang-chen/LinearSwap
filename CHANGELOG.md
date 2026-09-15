@@ -10,6 +10,11 @@
   `linswap lmeval` (lm-eval-harness on exported HF checkpoints) and `linswap mqar` (text
   multi-query associative recall); `--datasets` subset selection for SFT / distill / evaluate;
   `distill --kl_schedule` (packed long-context KL stage).
+* `tests/test_losses.py`: the chunked cross-entropy and distillation KL — which run their own
+  backward, so no framework checks them — against dense autograd, on a stand-in with the LM head
+  tied to the embedding (the configuration the old loss-scaling bug depended on).  Loss,
+  tied-matrix gradient and hidden-path gradient, over uneven chunk sizes, masked prompts, right
+  padding, `loss_scale`, KL temperature and an all-masked microbatch.  CPU, no checkpoint needed.
 * `KernelSpec.supports_activation_checkpointing` (False for `mamba3`, whose `mamba_ssm`
   autograd functions do not compose with `torch.utils.checkpoint`).
 * `gdn2` refuses backbones with grouped value heads: FLA's `GatedDeltaNet2` shares its decay and
