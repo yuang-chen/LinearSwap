@@ -68,6 +68,9 @@ def add_args(ap):
     ap.add_argument("--text_data", default=None, help="generic-text corpus instead of the SFT mixture, e.g. fineweb-edu")
     ap.add_argument("--text_shards", type=int, default=1, help="number of corpus shards to tokenise (~700M tokens each)")
     ap.add_argument("--text_dir", default=str(DEFAULT_TEXT_DIR))
+    ap.add_argument("--text_mix", type=float, default=0.0,
+                    help="fraction of documents drawn from the SFT mixture (chat format, all tokens supervised) when packing "
+                         "generic text, so long generic-text training does not erase the instruction format (replay)")
     ap.add_argument("--max_length", type=int, default=8192, help="sequence length for layer / hidden / kl")
     ap.add_argument("--batch_size", type=int, default=1, help="sequences per micro-batch")
     ap.add_argument("--stages", default="layer,kl", help="comma list of layer / hidden / kl / ce")
@@ -276,6 +279,25 @@ def save(student, args, out_dir, step):
     return ckpt
 
 
+class MixedDocs:
+    """Document source for ``PackedDataset``: each index maps to a document of ``primary`` or, for a fixed
+    fraction of indices, of ``replay`` (round-robin), so packing interleaves the two corpora at the given ratio."""
+
+    def __init__(self, primary, replay, fraction):
+        self.primary, self.replay = primary, replay
+        self.every = max(2, int(round(1.0 / fraction)))     # every k-th document comes from the replay set
+        self.n = len(primary) + len(primary) // (self.every - 1)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        if i % self.every == self.every - 1:
+            return {"input_ids": self.replay[(i // self.every) % len(self.replay)]["input_ids"]}
+        j = i - i // self.every
+        return {"input_ids": self.primary[j % len(self.primary)]["input_ids"]}
+
+
 def packed_loader(raw, length, batch_size, seed):
     return DataLoader(PackedDataset(raw, length, seed=seed), batch_size=batch_size, collate_fn=collate_fn)
 
@@ -306,6 +328,10 @@ def main(args) -> Path:
         text_dir = ensure_text_data(args.base_model_dir, args.text_data, args.text_shards, args.text_dir)
         raw_train = load_from_disk(str(text_dir / "train"))
         raw_val = load_from_disk(str(text_dir / "validation"))
+        if args.text_mix > 0:
+            sft_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir, args.datasets)
+            raw_train = MixedDocs(raw_train, load_from_disk(sft_dir / "train"), args.text_mix)
+            print(f"[distill] replay: {args.text_mix:.0%} of packed documents come from the SFT mixture ({sft_dir})")
         val_loader = fixed_packed_val(raw_val, args.max_length, args.eval_batches)
         print(f"[distill] text corpus {text_dir} ({len(raw_train)} docs); val = {args.eval_batches} packed "
               f"sequences of {args.max_length}")

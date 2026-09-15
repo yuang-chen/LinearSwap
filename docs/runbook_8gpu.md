@@ -62,7 +62,7 @@ Two shards of FineWeb-Edu (`--text_shards 2`) give ~1.5B tokens.
 ```bash
 for i in 0 1 2 3; do k=$(echo gdn gdn2 kda rwkv7 | cut -d' ' -f$((i+1)));
 nohup bash -c "export CUDA_VISIBLE_DEVICES=$i; \
- $P -m linswap distill --kernel $k --text_data fineweb-edu --text_shards 2 --stages ce \
+ $P -m linswap distill --kernel $k --text_data fineweb-edu --text_shards 2 --text_mix 0.1 --stages ce \
     --max_length 2048 --batch_size 16 --grad_accum_steps 2 --ce_schedule 8192:1.2e9,16384:3e8 --ce_lr 1e-5 \
     --eval_batches 10 --eval_every 200 --save_every 2000 --output_dir outputs/cpt1p5b/$k/cpt > outputs/cpt1p5b_${k}_cpt.log 2>&1 \
  && C=\$(ls -d outputs/cpt1p5b/$k/cpt/checkpoint-* | sort -t- -k2 -n | tail -1) \
@@ -98,7 +98,7 @@ recipe used for `mamba2` / `deltanet`; both train in `.venv` on any GPU.
 ```bash
 for pair in "6 gla" "7 mamba1"; do set -- $pair; gpu=$1; k=$2;
 nohup bash -c "export CUDA_VISIBLE_DEVICES=$gpu; \
- $P -m linswap distill --kernel $k --text_data fineweb-edu --stages layer,hidden,kl,ce --max_length 2048 --batch_size 16 \
+ $P -m linswap distill --kernel $k --text_data fineweb-edu --text_mix 0.1 --stages layer,hidden,kl,ce --max_length 2048 --batch_size 16 \
     --grad_accum_steps 2 --layer_tokens 50e6 --hidden_tokens 50e6 --kl_tokens 300e6 --ce_length 16384 --ce_tokens 100e6 \
     --eval_batches 10 --eval_every 100 --save_every 500 --output_dir outputs/lit/$k/distill > outputs/lit/${k}_distill.log 2>&1 \
  && C=\$(ls -d outputs/lit/$k/distill/checkpoint-* | sort -t- -k2 -n | tail -1) \

@@ -35,3 +35,6 @@ dist/
 # Paper drafts and slides (kept locally only)
 /docs/paper/
 /docs/slides/
+
+# in-development kernel, kept locally only
+/gated_breg_delta_rule/

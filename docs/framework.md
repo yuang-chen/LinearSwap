@@ -764,8 +764,29 @@ Reading.
   cannot be swapped without losing recall.  This is the layer-level version of the
   "state saturation" of additive/undecayed recurrences reported by "What matters in
   linearizing LMs" (arXiv 2504.14366): a few undecayed layers are tolerable, a majority is not.
-* Mixed checkpoints (`outputs/mixed/*`, spec strings such as
-  `gdn;deltanet@8,9,12,14,17,18,20,21,22`) are evaluated on the hard RULER tasks below.
+* **Mixed models on the hard tasks confirm the budget and sharpen it.**  The greedy sets were
+  materialised as checkpoints (`outputs/mixed/*`, spec strings such as
+  `gdn;deltanet@8,9,12,14,17,18,20,21,22`; only the swapped layers carry the blockwise-distilled
+  weights, no further training) and run on the eight hard tasks (25 samples):
+
+  | model (k of 18 linear layers swapped) | 4K | 16K | 64K |
+  |---|---|---|---|
+  | gdn base (0) | 86.5 | 85.7 | 78.6 |
+  | deltanet k = 6 | 82.4 | 79.0 | 57.2 |
+  | deltanet k = 9 | 65.9 | 23.7 | 5.0 |
+  | deltanet k = 12 | 40.6 | 7.8 | 0.5 |
+  | mamba2 k = 9 | 72.3 | 61.6 | 49.2 |
+  | mamba2 k = 18 (layer stage only) | 60.6 | 42.8 | 26.0 |
+  | mamba2 k = 18, full literature recipe + SFT | 78.0 | 67.3 | 52.5 |
+
+  Six blockwise-distilled DeltaNet layers cost 4–7 points at 4K–16K and keep the needle tasks
+  (96 / 96 / 99 at 16K); the ninth layer is the cliff (multi-key needles 0 at 16K), exactly where
+  the MQAR probe predicted it.  For Mamba-2 nine layers cost 14–29 points, with the distractor task
+  (`multikey_3` 80 at 16K, 64 at 64K) and `vt` bearing the loss, and swapping all 18 without the
+  later stages costs far more than the full recipe recovers — the KL/hidden/CE stages are worth
+  ~20 points at every length.  KL on 2K text ranks layers correctly but understates task damage
+  by an order of magnitude (k = 6 DeltaNet: KL 0.02, hard-task loss 4–21 points), so the
+  greedy selection should be run on a task metric when the target is retrieval.
 
 ## Literature recipe for inexact swaps: generic-text, four-stage distillation
 
