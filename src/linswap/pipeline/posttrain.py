@@ -1,6 +1,6 @@
 """Stage 2 — posttrain: SFT of a swapped model (data preparation included).
 
-    linswap posttrain --kernel kda                       # gate_only then full, standard recipe
+    linswap posttrain --kernel kda                       # full SFT, standard recipe
     linswap posttrain --kernel kda --modes full --full_steps 200 --full_lr 1e-4
 
 Recipe (identical for every kernel): bf16, gradient checkpointing, chunked
@@ -33,7 +33,7 @@ DEFAULT_OUTPUTS = REPO_ROOT / "outputs"
 
 def add_args(ap):
     ap.add_argument("--kernel", required=True)
-    ap.add_argument("--modes", default="gate_only,full", help="comma list of gate_only / full")
+    ap.add_argument("--modes", default="full", help="comma list of gate_only / full (gate_only is kept only for backbones where full SFT does not fit)")
     ap.add_argument("--output_dir", default=None, help="default outputs/<kernel>")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--init_ckpt", default=None, help="start from this checkpoint (e.g. a distill checkpoint)")

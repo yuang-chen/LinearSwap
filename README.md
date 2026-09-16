@@ -40,7 +40,7 @@ of a set of incomparable pretraining runs.  The kernels come from
 
 
 | name           | recurrence (FLA kernel)                                   | init from the pretrained GDN layer                                                    | new params | exact |
-| -------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------- | ---------- | ----- |
+|---|---|---|---|---|---|
 | `gdn`          | Gated DeltaNet                                            | weight copy (control)                                                                 | 0.59M      | yes   |
 | `gdn2`         | Gated DeltaNet-2                                          | scalar beta/decay tiled into b/w/f gates                                              | 113M       | yes ‡ |
 | `kda`          | Kimi Delta Attention                                      | scalar decay tiled into the low-rank per-channel gate                                 | 7.4M       | yes   |
@@ -51,6 +51,7 @@ of a set of incomparable pretraining runs.  The kernels come from
 | `gla`          | Gated Linear Attention (per-channel decay, no erase)      | shared weights copied, decay MLP at FLA init                                          | 0.92M      | no    |
 | `mamba3` †     | Mamba-3 (data-dependent decay, trapezoidal, rotary state) | GDN decay / projections mapped into the fused `in_proj`, rotary and trapezoid neutral | 0.05M      | no    |
 | `mamba1` †     | Mamba-1 selective SSM (per-channel, no q/k)               | values, gate, conv and `out_proj` copied; SSM params at Mamba init                    | 19M        | no    |
+| `gdn_breg` §   | Gated DeltaNet + Bregman soft-threshold on the state       | weight copy (GDN's parameter set); `lam` from `LINSWAP_BREG_LAM`, 0 = GDN            | 0.59M      | at lam = 0 |
 
 
 "Exact" kernels reproduce the pretrained model at initialisation and go straight
@@ -58,7 +59,9 @@ to SFT; the others are distilled first (`linswap distill`).  Parameter counts
 are for the 0.8B backbone.  ‡ `gdn2` requires as many value heads as key heads: FLA's
 `GatedDeltaNet2` shares its decay and erase gates across a group of value heads, so a
 backbone with grouped value heads (Qwen3.8-27B: 16 key / 48 value heads) has no exact
-GDN2 image and the kernel refuses to build there.  † `mamba1` / `mamba3` use `mamba_ssm`'s kernels through
+GDN2 image and the kernel refuses to build there.  § `gdn_breg` wraps the external
+`gated_breg_delta_rule` package (in development, not shipped) and is registered only when it
+imports; at `lam = 0` it verifies at the GDN noise floor.  † `mamba1` / `mamba3` use `mamba_ssm`'s kernels through
 FLA's `Mamba` / `Mamba3` layers and are registered only when those import (see
 Installation).  Mamba-3's single-token decode step additionally needs `mamba_ssm`'s
 CuTe-DSL kernel (`nvidia-cutlass-dsl` + `quack-kernels`), which did not run with the
@@ -229,7 +232,7 @@ init is not exact.
 ```bash
 linswap verify    --kernel kda --baseline gdn        # layer / logits / layer-wise / cache / generation vs HF
 linswap distill   --kernel mamba2                    # inexact kernels: layer alignment (200) + KL (300) @8K
-linswap posttrain --kernel kda                       # gate-only (100 steps, 2e-4) and full SFT (50 steps, 1e-5)
+linswap posttrain --kernel kda                       # full SFT (50 steps, 1e-5); --modes gate_only exists but is not used
 linswap posttrain --kernel mamba2 --modes full --init_ckpt outputs/mamba2/distill/checkpoint-500
 linswap run       --kernel rwkv7                     # everything, results in outputs/eval/rwkv7/
 linswap export    --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA-sft
@@ -279,11 +282,6 @@ hard set 50 (≈ ±7 points).  Full tables and discussion in
 | ------------------------------------ | --------- | ------ | -------- | ----------- |
 | gdn base (exact copy) | – | 100 | 100 | 96.5 |
 | gdn2 / kda / rwkv7 base (tiled init) | – | 100 | 100 | 95.75–96.75 |
-| gdn gate-only 100 | 0.59M | 100 | 100 | 96.25 |
-| kda gate-only 100 | 7.4M | 100 | 100 | 97.5 |
-| rwkv7 gate-only 100 | 14M | 100 | 99 | 99.5 |
-| kda_fullgate gate-only 100 | 38M | 100 | 98 | 99.0 |
-| gdn2 gate-only 100 | 113M | 100 | 99 | 96.5 |
 | gdn / gdn2 / kda / rwkv7 full 50 | all | 100 | 100 | 99.0–99.5 |
 | mamba2 base (inexact) | – | 0 | 0 | 0 |
 | mamba2 SFT only, 500 steps | all | 95 | 66 | 55 |
@@ -297,20 +295,18 @@ hard set 50 (≈ ±7 points).  Full tables and discussion in
 
 
 **Hard RULER, average over 8 tasks vs context length** (`multikey_2` / `multikey_3` /
-`multiquery` / `vt` / `cwe` / `fwe` / `qa_1` / `qa_2`; 50 samples per task, answer prefix
-opens the assistant turn as in RULER's chat templates)
+`multiquery` / `vt` / `cwe` / `fwe` / `qa_1` / `qa_2`; 50 samples per task, 25 at 256K, answer
+prefix opens the assistant turn as in RULER's chat templates)
 
 
-| model                 | 4K   | 16K  | 64K  | 128K |
-| --------------------- | ---- | ---- | ---- | ---- |
-| gdn-base              | 86.5 | 85.7 | 78.6 | 75.0 |
-| gdn-full-50           | 85.5 | 81.9 | 74.8 | 70.8 |
-| gdn2-full-50          | 85.4 | 82.4 | 74.8 | 71.7 |
-| kda-full-50           | 85.3 | 81.2 | 74.9 | 71.2 |
-| rwkv7-full-50         | 85.4 | 81.9 | 74.7 | 71.4 |
-| kda-gate-100          | 86.3 | 85.8 | 71.8 | 69.8 |
-| rwkv7-gate-100        | 87.7 | 83.4 | 70.3 | 68.6 |
-| mamba2-distill-sft-50 | 66.5 | 52.8 | 45.0 | 37.9 |
+| model | 4K | 16K | 64K | 128K | 256K |
+| --------------------- | ---- | ---- | ---- | ---- | ---- |
+| gdn-base              | 86.5 | 85.7 | 78.6 | 75.0 | 67.0 |
+| gdn-full-50           | 85.5 | 81.9 | 74.8 | 70.8 | 63.5 |
+| gdn2-full-50          | 85.4 | 82.4 | 74.8 | 71.7 | 64.6 |
+| kda-full-50           | 85.3 | 81.2 | 74.9 | 71.2 | 64.7 |
+| rwkv7-full-50         | 85.4 | 81.9 | 74.7 | 71.4 | 64.0 |
+| mamba2-distill-sft-50 | 66.5 | 52.8 | 45.0 | 37.9 | 29.3 |
 
 
 **Hard RULER at 128K, per task** (`noah` = SFT without the anti-haystack data; `lc` = long-context distillation; `mamba2_beta` keeps β-scaled writes)
@@ -323,8 +319,6 @@ opens the assistant turn as in RULER's chat templates)
 | gdn2-full-50               | 98.0  | 100.0 | 100.0 | 80.0 | 9.6  | 98.0 | 44.0 | 44.0 | 71.7 |
 | kda-full-50                | 98.0  | 100.0 | 100.0 | 80.4 | 9.6  | 98.0 | 44.0 | 40.0 | 71.2 |
 | rwkv7-full-50              | 98.0  | 100.0 | 100.0 | 80.0 | 9.0  | 98.0 | 42.0 | 44.0 | 71.4 |
-| kda-gate-100               | 100.0 | 100.0 | 99.5  | 83.6 | 1.4  | 98.0 | 36.0 | 40.0 | 69.8 |
-| rwkv7-gate-100             | 100.0 | 100.0 | 99.5  | 82.0 | 0.2  | 95.3 | 34.0 | 38.0 | 68.6 |
 | kda-noah-full-50           | 98.0  | 98.0  | 100.0 | 80.8 | 9.4  | 98.7 | 50.0 | 48.0 | 72.9 |
 | gdn-noah-full-50           | 98.0  | 98.0  | 100.0 | 80.8 | 9.4  | 98.7 | 48.0 | 50.0 | 72.9 |
 | mamba2-sft-500             | 12.0  | 0.0   | 2.0   | 1.6  | 1.2  | 30.0 | 24.0 | 20.0 | 11.3 |
@@ -337,7 +331,8 @@ opens the assistant turn as in RULER's chat templates)
 | deltanet_lc-distill-sft-50 | 0.0   | 0.0   | 0.0   | 0.4  | 0.2  | 0.0  | 0.0  | 2.0  | 0.3  |
 
 
-**Second scale: Qwen3.8-27B** (16 key / 48 value linear heads, gate-only SFT
+**Second scale: Qwen3.8-27B** (16 key / 48 value linear heads; gate-only SFT is the only
+post-training that fits 143 GiB at 27B and is kept here for that reason only; it is not used at 0.8B,
 at 32K, 100 steps; RULER `multikey_2` / `multiquery` / `vt` / `qa_1` at 16K and 64K,
 25 samples; `gdn2` cannot be built on grouped value heads, see ‡)
 
@@ -345,8 +340,6 @@ at 32K, 100 steps; RULER `multikey_2` / `multiquery` / `vt` / `qa_1` at 16K and 
 | model | trainable | mk2 16K/64K | mq 16K/64K | vt 16K/64K | qa1 16K/64K |
 | --------------------- | --------- | ----------- | ---------- | ---------- | ----------- |
 | gdn base (exact copy) | – | 100 / 100 | 100 / 100 | 100 / 100 | 80 / 84 |
-| kda gate-only 100 | 81M | 100 / 100 | 100 / 100 | 100 / 100 | 84 / 80 |
-| rwkv7 gate-only 100 | 139M | 100 / 100 | 100 / 100 | 100 / 100 | 80 / 76 |
 
 
 In fp32 the swapped 27B reproduces the Hugging Face model to KL 2.6e-6 (top-1
@@ -360,11 +353,10 @@ What the numbers say:
 recipe all four exact kernels tie on every task at every context length (4K to
 128K, within 0.6 average points).  At this budget the backbone dominates; the
 recurrence is invisible.
-- Gate-only SFT is where kernels differ on the easy set (a per-channel decay gate
-— KDA, RWKV-7 — is a cheap handle for multi-value retrieval, GDN2's three dense
-gates are not, despite the lowest validation loss); on the hard set KDA and RWKV-7
-gate-only checkpoints tie, keep common-word extraction at short context where
-full SFT loses it, and give the best variable tracking at 128K.
+- Equal-budget continued training (400M tokens of FineWeb-Edu at 8K–16K, then the
+same SFT) does not separate them either: gdn, gdn2 and kda end with identical
+perplexities (PG-19 2.858, WikiText 2.392) and hard-task averages within 0.9
+points at every length.  A richer gate does not beat GDN at this scale and budget.
 - Inexact swaps ablate the pretrained recurrence.  Mamba-2 (no erase) is brought
 back to the original loss by distillation but is the only kernel whose retrieval
 degrades with length (distractor needles 90 → 4 from 4K to 128K); keeping GDN's
