@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+* **The pipeline is now verify → distill → evaluate.**  Distillation is three steps on generic web text
+  (DCLM by default): layer-output alignment (100M tokens, length 512, lr 1e-3 cosine, swapped layers only),
+  logit KL (500M tokens, length 512, lr 1e-5, all parameters) and context extension by plain
+  cross-entropy (100M tokens, length 16384).  The defaults are the recipe; `linswap run --kernel rwkv7`
+  needs no flags.
+* **Evaluation defaults**: RULER `niah_single_1/2/3` + `niah_multikey_1` at 4K–128K with RULER's base
+  prompt template (`--chat_template` opts back in), and `linswap lmeval` with LAMBADA / ARC-c / ARC-e /
+  PIQA / WinoGrande / HellaSwag 0-shot + MMLU 5-shot and relative scores against a reference row.
+* **Removed**: the supervised fine-tuning stage (`linswap posttrain`, both gate-only and full) and its
+  chat corpora (`linswap.data`); raw-text NLL (`evaluate --nll`) and the MQAR probe (`linswap mqar`);
+  the per-layer sensitivity search (`linswap sensitivity`) — the kernel-map machinery it used stays;
+  the `hidden` distillation step, the long-context KL curriculum and instruction replay; the
+  `mamba2_beta` and `mamba3_min` control kernels; the pre-September checkpoint-key converter.
+* `linswap.sft_utils` is now `linswap.train_utils`.
+
+
 * **RULER protocol fix.**  The vendored `pred/call_api.py` never passed RULER's per-sample
   `answer_prefix` to the model; `LinearSwapModelWrapper` now opens the assistant turn with it
   (after the chat template, `enable_thinking=False` for thinking backbones).  Variable

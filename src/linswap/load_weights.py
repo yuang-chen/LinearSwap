@@ -6,7 +6,7 @@ Two checkpoint formats are understood:
   pretrained backbone checkpoint.  Non-linear layers are copied verbatim; each
   linear layer is initialised through ``kernel.init_from_gdn``.
 * **Native format** (``model.layers.{i}.linear_attn.*`` — the same keys as the HF checkpoint):
-  ``state_dict()`` of a swapped model, as written by ``linswap posttrain`` (``model.pt``).  Checkpoints
+  ``state_dict()`` of a swapped model, as written by ``linswap distill`` (``model.pt``).  Checkpoints
   written before September 2026 (``trf_blocks.*`` keys) are converted on load.
 """
 
@@ -99,54 +99,12 @@ def load_weights_from_gdn(model: LinearSwapModel, params: dict) -> None:
         model.lm_head.weight = model.embed_tokens.weight
 
 
-_LEGACY_ATTN = {"W_query": "q_proj", "W_key": "k_proj", "W_value": "v_proj", "out_proj": "o_proj", "q_norm": "q_norm", "k_norm": "k_norm"}
-_LEGACY_MLP = {"fc1": "gate_proj", "fc2": "up_proj", "fc3": "down_proj"}
-
-
-def convert_legacy_state_dict(state: dict, layer_types) -> dict:
-    """Map the pre-September-2026 native key layout (``tok_emb`` / ``trf_blocks.{i}.token_mixer`` / ``ff.fc*`` /
-    ``final_norm`` / ``out_head``) onto the Qwen-style layout used now."""
-    if "tok_emb.weight" not in state:
-        return state
-    out = {}
-    for k, v in state.items():
-        if k == "tok_emb.weight":
-            nk = "model.embed_tokens.weight"
-        elif k == "out_head.weight":
-            nk = "lm_head.weight"
-        elif k == "final_norm.weight":
-            nk = "model.norm.weight"
-        elif k.startswith("trf_blocks."):
-            _, i, rest = k.split(".", 2)
-            i = int(i)
-            if rest.startswith("norm1."):
-                rest = "input_layernorm." + rest[len("norm1."):]
-            elif rest.startswith("norm2."):
-                rest = "post_attention_layernorm." + rest[len("norm2."):]
-            elif rest.startswith("ff."):
-                sub, tail = rest[len("ff."):].split(".", 1)
-                rest = f"mlp.{_LEGACY_MLP[sub]}.{tail}"
-            elif rest.startswith("token_mixer."):
-                tail = rest[len("token_mixer."):]
-                if layer_types[i] == "full_attention":
-                    sub, tail2 = tail.split(".", 1)
-                    rest = f"self_attn.{_LEGACY_ATTN[sub]}.{tail2}"
-                else:
-                    rest = f"linear_attn.{tail}"
-            nk = f"model.layers.{i}.{rest}"
-        else:
-            nk = k
-        out[nk] = v
-    return out
-
-
 def load_native_checkpoint(model: LinearSwapModel, ckpt_dir, strict=None) -> None:
     """Load ``ckpt_dir/model.pt``.  ``strict=None`` (default) is strict unless the checkpoint was written by a
     different kernel (map) than the model's — e.g. a full ``mamba2`` checkpoint loaded into a mixed
     ``gdn;mamba2@3,6`` model — in which case only the tensors whose names and shapes match are loaded
     (the swapped layers and the shared backbone) and the rest keep their pretrained init."""
     state = torch.load(Path(ckpt_dir) / "model.pt", map_location="cpu", weights_only=True)
-    state = convert_legacy_state_dict(state, model.cfg.get("layer_types", ["full_attention"] * model.cfg["n_layers"]))
     if strict is None:
         ck = read_checkpoint_kernel(ckpt_dir)
         strict = ck is None or ck == model.kernel_name

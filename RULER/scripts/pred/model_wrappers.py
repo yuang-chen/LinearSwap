@@ -195,7 +195,8 @@ class LinearSwapModelWrapper:
         self.generation_kwargs = generation_kwargs
         self.stop = self.generation_kwargs.pop("stop")
         self.max_new_tokens = self.generation_kwargs.pop("max_new_tokens")
-        self.use_chat_template = self.generation_kwargs.pop("use_chat_template", True)
+        self.use_chat_template = self.generation_kwargs.pop("use_chat_template", True) and \
+            not os.environ.get("LINSWAP_NO_CHAT_TEMPLATE")   # base-prompt mode (RADLADS / KL-guided protocol)
         self.use_cache = self.generation_kwargs.pop("use_cache", True)
 
     def __call__(self, prompt: str, **kwargs) -> dict:

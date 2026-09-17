@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 from linswap.pipeline.distill import chunked_kl_with_backward  # noqa: E402
-from linswap.sft_utils import chunked_cross_entropy_eval, chunked_cross_entropy_with_backward  # noqa: E402
+from linswap.train_utils import chunked_cross_entropy_eval, chunked_cross_entropy_with_backward  # noqa: E402
 
 B, T, D, V = 2, 9, 5, 13
 CHUNK = 4          # does not divide B * (T - 1) = 16
@@ -111,9 +111,9 @@ def check_cross_entropy(results):
 
 
 def check_kl(results):
-    print("distillation KL vs dense autograd (temperature 2.0, CE term on)")
-    ids, labels = fixture()
-    temperature, ce_weight = 2.0, 0.5
+    print("distillation KL vs dense autograd (temperature 2.0)")
+    ids, _ = fixture()
+    temperature = 2.0
     t_emb, t_proj, t_head = make_model(seed=7)          # teacher: frozen
     for p in list(t_emb.parameters()) + list(t_proj.parameters()):
         p.requires_grad_(False)
@@ -123,22 +123,17 @@ def check_kl(results):
 
     emb, proj, head = make_model()
     s_hidden = proj(emb(ids))
-    s_logits = head(s_hidden).float()
-    s_logp = F.log_softmax(s_logits / temperature, dim=-1)
+    s_logp = F.log_softmax(head(s_hidden).float() / temperature, dim=-1)
     kl = (t_logp.exp() * (t_logp - s_logp)).sum(-1).reshape(-1)
     ref_kl = kl.mean()
-    flat_labels = labels.reshape(-1)
-    n_lab = int((flat_labels != -100).sum())
-    ref_ce = F.cross_entropy(s_logits.reshape(-1, V), flat_labels, ignore_index=-100, reduction="sum") / n_lab
-    (ref_kl * temperature ** 2 + ce_weight * ref_ce).backward()
+    (ref_kl * temperature ** 2).backward()
     ref_tied, ref_proj = emb.weight.grad.clone(), proj.weight.grad.clone()
 
     emb, proj, head = make_model()
-    got_kl, got_ce = chunked_kl_with_backward(proj(emb(ids)), t_hidden, head, t_head, chunk_size=CHUNK,
-                                              temperature=temperature, labels=labels, ce_weight=ce_weight)
-    ok = abs(got_kl - ref_kl.item()) < RTOL and abs(got_ce - ref_ce.item()) < RTOL
-    print(f"  {'ok  ' if ok else 'FAIL'} loss: dense KL {ref_kl.item():.9f} / CE {ref_ce.item():.9f}, "
-          f"chunked KL {got_kl:.9f} / CE {got_ce:.9f}")
+    got_kl = chunked_kl_with_backward(proj(emb(ids)), t_hidden, head, t_head, chunk_size=CHUNK,
+                                      temperature=temperature)
+    ok = abs(got_kl - ref_kl.item()) < RTOL
+    print(f"  {'ok  ' if ok else 'FAIL'} loss: dense KL {ref_kl.item():.9f}, chunked KL {got_kl:.9f}")
     results.append(ok)
     close(emb.weight.grad, ref_tied, "tied embedding / LM head gradient", results)
     close(proj.weight.grad, ref_proj, "hidden-path gradient", results)

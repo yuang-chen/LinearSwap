@@ -1,37 +1,31 @@
-"""Stage 3 — evaluate: validation loss + RULER for any set of swapped models.
+"""Stage 3 — evaluate: long-context retrieval (RULER) for any set of swapped models.
 
-    linswap evaluate --models kda outputs/kda/sft_full/checkpoint-50 gdn --name kda-vs-gdn
-    linswap evaluate --models kda --tasks niah_single_1 --lengths 4096,32768 --samples 20
+    linswap evaluate --models rwkv7 outputs/rwkv7/distill/checkpoint-16338 --name rwkv7
+    linswap evaluate --models gdn --tasks niah_single_1 --lengths 4096,32768 --samples 20
 
-``--models`` entries are kernel names (the base, function-preserving swap) or
-checkpoint directories written by ``posttrain``.  Results go to
-``outputs/eval/<name>/``: ``val_loss.json``, ``ruler/<model>/<length>/{data,pred}``
-and a combined ``summary.csv`` / ``summary.md``.  RULER's own scripts are
-invoked directly (no editing of its shell configs).
+``--models`` entries are kernel names (the base, function-preserving swap) or checkpoint directories
+written by ``distill``.  Prompts are built with RULER's own base template (context, question, answer
+prefix); pass ``--chat_template`` to wrap them in the backbone's chat format instead — whichever is
+used, apply it to the teacher and the students alike.  Results go to ``outputs/eval/<name>/``:
+``ruler/<model>/<length>/{data,pred}`` and a combined ``summary.csv`` / ``summary.md``.  RULER's own
+scripts are invoked directly (no editing of its shell configs).
 """
 
 from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-import torch
-from datasets import load_from_disk
-from torch.utils.data import DataLoader
-
-from ..data import DEFAULT_DATA_DIR, ensure_sft_data
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model, read_checkpoint_kernel
 from ..registry import get_kernel, list_kernels
-from ..sft_utils import TruncatedDataset, collate_fn, evaluate as eval_loss
 
 RULER_DIR = REPO_ROOT / "RULER" / "scripts"
-DEFAULT_TASKS = "niah_single_1,niah_multikey_1,niah_multivalue"
+DEFAULT_TASKS = "niah_single_1,niah_single_2,niah_single_3,niah_multikey_1"
 
 
 def add_args(ap):
@@ -40,21 +34,15 @@ def add_args(ap):
     ap.add_argument("--name", default=None, help="run name -> outputs/eval/<name> (default: timestamp)")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--tasks", default=DEFAULT_TASKS, help="RULER synthetic tasks, comma separated")
-    ap.add_argument("--lengths", default="131072", help="RULER sequence lengths, comma separated")
-    ap.add_argument("--samples", type=int, default=100, help="RULER samples per task")
+    ap.add_argument("--lengths", default="4096,16384,65536,131072", help="RULER sequence lengths, comma separated")
+    ap.add_argument("--samples", type=int, default=50, help="RULER samples per task")
     ap.add_argument("--no_cache", action="store_true", help="decode without KV / recurrent-state cache")
-    ap.add_argument("--val_batches", type=int, default=40, help="validation examples for the loss (0 = skip)")
-    ap.add_argument("--val_max_length", type=int, default=131072)
-    ap.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
-    ap.add_argument("--datasets", default="all", help="SFT mixture subset, e.g. longalign,longalpaca (ablation: no anti-haystack)")
-    ap.add_argument("--data_max_length", type=int, default=262144)
+    ap.add_argument("--chat_template", action="store_true",
+                    help="wrap RULER prompts in the backbone's chat template; the default is RULER's base "
+                         "template (context + question + answer prefix).  Use the same setting for every model.")
     ap.add_argument("--skip_ruler", action="store_true")
-    ap.add_argument("--nll", default=None, help="raw-text NLL corpora, e.g. pg19,wikitext (token-weighted, position-binned)")
-    ap.add_argument("--nll_docs", type=int, default=20)
-    ap.add_argument("--nll_max_length", type=int, default=131072)
 
 
-# ----------------------------------------------------------------------------- models
 def resolve_model(spec: str, base_model_dir):
     """kernel name | checkpoint dir | label=spec  ->  (display name, kernel, base_model_dir, ckpt_dir | None)."""
     label = None
@@ -145,40 +133,15 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     tasks = [t for t in args.tasks.split(",") if t]
     lengths = [int(x) for x in args.lengths.split(",") if x]
+    if not args.chat_template:
+        os.environ["LINSWAP_NO_CHAT_TEMPLATE"] = "1"   # inherited by the RULER subprocesses
+    print(f"[evaluate] RULER prompts: {'chat template' if args.chat_template else 'base template'}")
     models = [resolve_model(m, args.base_model_dir) for m in args.models]
     print(f"[evaluate] {len(models)} models -> {out_dir}")
-
-    val_loader = None
-    if args.val_batches > 0:
-        data_dir = ensure_sft_data(args.base_model_dir, args.data_max_length, args.data_dir, args.datasets)
-        val_ds = TruncatedDataset(load_from_disk(data_dir / "validation"), args.val_max_length)
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
     rows = []
     for disp, kernel, base, ckpt in models:
         row = {"model": disp, "kernel": kernel, "exact_init": get_kernel(kernel).exact_init}
-        if val_loader is not None:
-            model = build_model(kernel, base_model_dir=base, ckpt_dir=ckpt).eval()
-            ce = eval_loss(model, val_loader, max_batches=args.val_batches)
-            row["val_ce"], row["ppl"] = round(ce, 4), round(math.exp(ce), 3)
-            print(f"  {disp}: val CE {ce:.4f} (ppl {math.exp(ce):.2f})", flush=True)
-            del model
-            torch.cuda.empty_cache()
-        if args.nll:
-            from transformers import AutoTokenizer
-
-            from ..nll import raw_text_nll
-
-            tok = AutoTokenizer.from_pretrained(base)
-            model = build_model(kernel, base_model_dir=base, ckpt_dir=ckpt).eval()
-            for corpus in [c for c in args.nll.split(",") if c]:
-                r = raw_text_nll(model, tok, corpus, args.nll_docs, args.nll_max_length)
-                row[f"nll_{corpus}"] = round(r["nll"], 4)
-                for b, v in r["bins"].items():
-                    row[f"nll_{corpus}@{b}"] = round(v, 4)
-                print(f"  {disp}: {corpus} NLL {r['nll']:.4f} over {r['tokens']} tokens, bins {{{', '.join(f'{k}: {v:.3f}' for k, v in r['bins'].items())}}}", flush=True)
-            del model
-            torch.cuda.empty_cache()
         if not args.skip_ruler:
             if ckpt is not None:
                 model_dir = ckpt
@@ -195,8 +158,7 @@ def main(args):
         with open(out_dir / "summary.json", "w") as f:
             json.dump(rows, f, indent=1)
 
-    cols = ["model", "kernel", "exact_init"] + sorted({k for r in rows for k in r} - {"model", "kernel", "exact_init"},
-                                                     key=lambda c: (c not in ("val_ce", "ppl"), c))
+    cols = ["model", "kernel", "exact_init"] + sorted({k for r in rows for k in r} - {"model", "kernel", "exact_init"})
     with open(out_dir / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

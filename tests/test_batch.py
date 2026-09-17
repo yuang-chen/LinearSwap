@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO / "src"))
 import linswap  # noqa: E402,F401
 from linswap import DEFAULT_BASE_MODEL_DIR, build_model  # noqa: E402
 from linswap.hf import LinearSwapForCausalLM  # noqa: E402
-from linswap.sft_utils import chunked_cross_entropy_eval, chunked_cross_entropy_with_backward, collate_fn  # noqa: E402
+from linswap.train_utils import chunked_cross_entropy_eval, chunked_cross_entropy_with_backward, collate_fn  # noqa: E402
 
 
 def main():

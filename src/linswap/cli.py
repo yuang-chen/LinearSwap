@@ -1,13 +1,12 @@
-"""``linswap`` command line: verify → (distill) → posttrain → evaluate, ``run`` for the whole chain,
-``export`` to a Hugging Face checkpoint, ``kernels`` to list what is registered.
+"""``linswap`` command line: verify → distill → evaluate, ``run`` for the whole pipeline.
 
-    linswap verify    --kernel kda --baseline gdn
-    linswap distill   --kernel mamba2
-    linswap posttrain --kernel kda
-    linswap evaluate  --models kda outputs/kda/sft_full/checkpoint-50
-    linswap run       --kernel kda
-    linswap export    --kernel kda --ckpt outputs/kda/sft_full/checkpoint-50 --out hf/Qwen3.5-0.8B-KDA
-    linswap kernels
+    linswap kernels                                      # list the registered kernels
+    linswap verify   --kernel rwkv7 --baseline gdn       # is the swap a faithful replacement?
+    linswap distill  --kernel rwkv7                      # three training steps on generic text
+    linswap evaluate --models gdn rwkv7-distilled=outputs/rwkv7/distill/checkpoint-16338
+    linswap lmeval   --models gdn rwkv7-distilled=outputs/rwkv7/distill/checkpoint-16338
+    linswap run      --kernel rwkv7                      # all of the above
+    linswap export   --ckpt outputs/rwkv7/distill/checkpoint-16338 --out hf/Qwen3.5-0.8B-RWKV7
 """
 
 import argparse

@@ -1,10 +1,8 @@
-"""Training utilities shared by the posttrain and evaluate stages.
+"""Batching, packing and chunked losses for the distillation stages.
 
-Memory-efficient chunked cross-entropy: the LM head is applied to 2048-token
-chunks of the final hidden states, each chunk's loss is back-propagated
-immediately, and the accumulated hidden-state gradient is propagated through
-the model once — so the full ``[T, vocab]`` logits are never materialised.
-"""
+``collate_fn`` right-pads, ``PackedDataset`` concatenates documents into fixed-length sequences, and the
+chunked cross-entropy / evaluation helpers compute the loss in vocabulary chunks so the full logits are
+never materialised."""
 
 from __future__ import annotations
 
@@ -30,25 +28,6 @@ def collate_fn(batch, pad_id: int = 0):
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
-
-
-def truncate_left(example, max_length):
-    if max_length is None or len(example["input_ids"]) <= max_length:
-        return example
-    return {"input_ids": example["input_ids"][-max_length:], "labels": example["labels"][-max_length:]}
-
-
-class TruncatedDataset(torch.utils.data.Dataset):
-    """Left-truncates every example to ``max_length`` tokens (keeps the assistant tail)."""
-
-    def __init__(self, ds, max_length):
-        self.ds, self.max_length = ds, max_length
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, i):
-        return truncate_left(self.ds[i], self.max_length)
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -161,8 +140,3 @@ def evaluate(model, dataloader, max_batches=10, chunk_size=2048, token_weighted=
     if was_training:
         model.train()
     return total / max(count, 1)
-
-
-def find_latest_checkpoint(output_dir):
-    ckpts = list(Path(output_dir).glob("checkpoint-*"))
-    return max(ckpts, key=lambda p: int(p.name.split("-")[1])) if ckpts else None

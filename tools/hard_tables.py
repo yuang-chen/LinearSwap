@@ -1,13 +1,13 @@
 #!/usr/bin/env python
-"""Markdown tables for the corrected-protocol hard-task runs, parsed from evaluate logs (works on partial runs)."""
+"""Markdown tables from `linswap evaluate` logs: one table per length plus the average (works on partial runs).
+
+    python tools/hard_tables.py outputs/eval/rwkv7.log outputs/eval/mamba2.log
+"""
 import ast, re, sys, json, pathlib
-TASKS = ["niah_multikey_2", "niah_multikey_3", "niah_multiquery", "vt", "cwe", "fwe", "qa_1", "qa_2"]
+TASKS = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
+         "niah_multikey_3", "niah_multiquery", "vt", "cwe", "fwe", "qa_1", "qa_2"]
+SHORT = ["s1", "s2", "s3", "mk1", "mk2", "mk3", "mq", "vt", "cwe", "fwe", "qa1", "qa2"]
 LAB = lambda L: {4096: "4K", 16384: "16K", 65536: "64K", 131072: "128K", 262144: "256K"}.get(L, f"{L//1024}K")
-SHORT = ["mk2", "mk3", "mq", "vt", "cwe", "fwe", "qa1", "qa2"]
-ORDER = ["gdn-base", "gdn-full-50", "gdn2-full-50", "kda-full-50", "rwkv7-full-50", "kda-gate-100", "rwkv7-gate-100",
-         "kda-noah-full-50", "gdn-noah-full-50", "mamba2-sft-500", "mamba2-distill-500", "mamba2-distill-sft-50",
-         "mamba2_beta-distill-sft-50", "mamba2_lc-distill-sft-50", "mamba1-distill-sft-50",
-         "deltanet-distill-sft-50", "deltanet_lc-distill-sft-50"]
 res, val = {}, {}
 for log in [l for l in sys.argv[1:] if pathlib.Path(l).exists()]:
     for line in open(log):
@@ -17,16 +17,17 @@ for log in [l for l in sys.argv[1:] if pathlib.Path(l).exists()]:
         m = re.match(r"^  ([\w.-]+): val CE ([\d.]+)", line)
         if m:
             val[m.group(1)] = float(m.group(2))
-models = [m for m in ORDER if any(k[0] == m for k in res)] + sorted({k[0] for k in res} - set(ORDER))
+models = sorted({k[0] for k in res})
 lengths = sorted({k[1] for k in res})
 def row(m, L):
     r = res.get((m, L))
     if r is None: return None
-    cells = [f"{r[t]:.1f}" if t in r else "–" for t in TASKS]
+    cells = [f"{r[t]:.1f}" if t in r else "–" for t in TASKS if any(t in x for x in res.values())]
     have = [r[t] for t in TASKS if t in r]
     return f"| {m} | " + " | ".join(cells) + f" | {sum(have)/len(have):.1f} |"
 for L in lengths:
-    print(f"\n#### {LAB(L)} tokens\n\n| model | " + " | ".join(SHORT) + " | avg |\n|---|" + "---|" * (len(SHORT) + 1))
+    cols = [c for t, c in zip(TASKS, SHORT) if any(t in r for r in res.values())]
+    print(f"\n#### {LAB(L)} tokens\n\n| model | " + " | ".join(cols) + " | avg |\n|---|" + "---|" * (len(cols) + 1))
     for m in models:
         r = row(m, L)
         if r: print(r)
