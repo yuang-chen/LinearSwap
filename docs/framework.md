@@ -258,7 +258,20 @@ students' gains over the teacher cannot be attributed to the kernel.
 | teacher (unmodified backbone) | 94 / 68 / 98 / 82 | 98 / 76 / 96 / 86 | 94 / 100 / 94 / 90 | 98 / 86 / 100 / 94 |
 | control (`gdn`, same three steps) | 100 / 100 / 94 / 100 | 100 / 100 / 100 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 90 |
 | `rwkv7` (exact init) | 100 / 100 / 98 / 96 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 94 | 100 / 100 / 92 / 92 |
+| `kda` (exact init) | 100 / 100 / 94 / 96 | 100 / 100 / 98 / 94 | 100 / 100 / 100 / 94 | 100 / 100 / 92 / 88 |
+| `kda_fullgate` (exact init) | 100 / 100 / 98 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 90 | 100 / 100 / 96 / 88 |
 | `mamba2` (no erase) | 100 / 100 / 98 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 98 / 92 | 100 / 98 / 92 / 72 |
+| `mamba3` (no erase, `--no_cache`) | 100 / 100 / 94 / 94 | 100 / 100 / 92 / 74 | – | – |
+| `gla` (per-channel decay, no erase) | 58 / 100 / 96 / 94 | 0 / 100 / 90 / 72 | 0 / 82 / 40 / 42 | 0 / 2 / 0 / 4 |
+| `deltanet` (erase, no decay) | 100 / 100 / 90 / 98 | 96 / 100 / 76 / 82 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+The second batch (`kda`, `kda_fullgate`, `mamba3`, `gla`, `deltanet`) was run months later on freshly
+tokenised DCLM and carried its own control and teacher: the control came back at 110.0 -> 110.1 on the
+short-context suite, and its teacher needle row (94 / 72 / 98 / 82 at 4K, 100 / 92 / 100 / 92 at 128K)
+sits inside the ±7-point noise of the row above, which is what licenses reading the two batches in one
+table.  `mamba3` cannot decode a single token here (no CuTe-DSL kernel), so it is scored with
+`--no_cache` at the two shorter lengths only.  `gdn2` and `mamba1` have not been measured under this
+recipe yet.
 
 **Short context**, accuracy and relative score against the teacher in %:
 
@@ -266,8 +279,13 @@ students' gains over the teacher cannot be attributed to the kernel.
 |---|---|---|---|---|---|---|---|---|
 | teacher | 0.437 (ppl 14.7) | 0.374 | 0.611 | 0.693 | 0.583 | 0.496 | 0.504 | 100.0 |
 | control (`gdn`) | 0.478 (13.2) | 0.399 | 0.653 | 0.706 | 0.588 | 0.524 | 0.515 | **110.0** |
+| `kda_fullgate` | 0.481 (13.0) | 0.397 | 0.646 | 0.706 | 0.591 | 0.521 | 0.517 | 110.0 |
+| `kda` | 0.476 (13.5) | 0.393 | 0.641 | 0.701 | 0.596 | 0.522 | 0.514 | 109.4 |
 | `rwkv7` | 0.479 (13.3) | 0.391 | 0.642 | 0.705 | 0.590 | 0.521 | 0.517 | 108.7 |
 | `mamba2` | 0.462 (14.2) | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
+| `gla` | 0.454 (15.0) | 0.354 | 0.593 | 0.691 | 0.568 | 0.509 | 0.482 | 94.3 |
+| `mamba3` | 0.436 (16.7) | 0.340 | 0.574 | 0.691 | 0.573 | 0.492 | 0.429 | 88.2 |
+| `deltanet` | 0.382 (21.3) | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
 **Throughput** (one L20X, bf16, batch 1, cached greedy decode, 256 new tokens):
 
@@ -282,12 +300,31 @@ Reading.
 * **The recipe, not the kernel, is what lifts the scores above the teacher.**  The control gains as
   much as the students on both suites (relative average 110.0, needles at 100 almost everywhere), so
   the right question is what the *swap* costs on top of it.
-* **With an exact init the swap is nearly free.**  `rwkv7` sits 1.3 relative points under the control
-  on the short-context suite and within sample noise of it on every needle length; its 92 / 92 at 128K
-  against the control's 100 / 90 is the ±7-point noise of 50 samples.
+* **With an exact init the swap is nearly free — for all four of them.**  `kda_fullgate` matches the
+  control (110.0), `kda` is 0.6 under it and `rwkv7` 1.3, and none of the three leaves the ±7-point
+  band at any needle length.  Four recurrences as different as the gated delta rule, a per-key-channel
+  gated delta rule and a DPLR generalised delta rule all land on the control, which says the swap is
+  paid for by the *initialisation*, not by the target architecture.
+* **KDA's low-rank forget gate is not a constraint.**  `kda` and `kda_fullgate` are the same kernel and
+  the same init, differing only in whether `f_proj` factors through the 128-dim bottleneck FLA ships or
+  a dense 2048x1024 matrix.  They finish 0.6 relative points apart and swap places across needle
+  lengths, so the rank limit costs nothing at this scale and budget; the dense variant buys 31M extra
+  parameters for noise.  (Compare the equal-budget `gdn` / `gdn2` / `kda` result below: a richer gate
+  does not beat GDN either.)
 * **The missing erase still costs.**  `mamba2` trails the control by 8.6 relative points and loses the
-  distractor needle at 128K (72 vs 90) — the same failure mode as under every earlier recipe, now the
-  only substantial gap left.
+  distractor needle at 128K (72 vs 90) — the same failure mode as under every earlier recipe.
+  `mamba3`, which also lacks the erase and additionally drops the short convolution, is worse still at
+  88.2 and already loses the distractor needle at 16K (74).
+* **Inexact swaps fail with length, and the short-context suite cannot see it.**  `deltanet` matches
+  the control at 4K (97.0 task average against 99.5) and then scores exactly 0 on all four needles from
+  64K on; `gla` decays through 87 / 65.5 / 41 / 1.5.  Both remain respectable on LAMBADA, PIQA and
+  HellaSwag — `gla` is at 94.3 relative — so a swap validated only on short-context benchmarks can be
+  entirely broken at 64K.  This is the strongest argument in these results for scoring retrieval at
+  several lengths rather than reporting a single accuracy.
+* `deltanet`'s collapse is the predicted one: with `exp(g_t) = 1` the state never contracts, so stale
+  associations survive until they are explicitly overwritten and the needle becomes unrecoverable once
+  the context is long enough.  Distillation on 700M tokens moves the length at which that happens; it
+  does not remove it.
 * Decode time is length-independent for all three (constant state).  RWKV-7's DPLR kernel is the
   slowest and needs the most memory (two rank-1 terms per step, more chunk intermediates); Mamba-2's
   SSD recurrence runs through FLA's generic simple-GLA kernels rather than Mamba-2's own fused CUDA

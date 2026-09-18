@@ -26,6 +26,7 @@ score; no supervised fine-tuning follows.
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import time
@@ -84,6 +85,11 @@ def add_args(ap):
     ap.add_argument("--val_length", type=int, default=8192, help="length of the held-out packed sequences")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--ce_chunk_size", type=int, default=2048)
+    ap.add_argument("--init_from", default=None,
+                    help="resume from this checkpoint dir: finished steps are skipped and a partial one continues "
+                         "on the same data (optimizer state restarts)")
+    ap.add_argument("--init_step", type=int, default=None,
+                    help="global step of --init_from (default: parsed from its checkpoint-N name)")
     return ap
 
 
@@ -170,7 +176,7 @@ def stage_steps(args, stage, length, micro, accum):
 
 # --------------------------------------------------------------------- steps
 def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step0, steps,
-              seq_length, micro, accum, schedule):
+              seq_length, micro, accum, schedule, done=0):
     device = next(student.parameters()).device
     lr = getattr(args, f"{stage}_lr")
     params = linear_params(student) if stage == "layer" else list(student.parameters())
@@ -184,10 +190,10 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
     tok_per_step = micro * accum * seq_length
     print(f"[distill] step={tag} steps={steps} lr={lr} ({schedule}) betas={betas} micro={micro} accum={accum} "
           f"trainable={sum(p.numel() for p in params)/1e6:.1f}M tokens/step={tok_per_step/1e3:.0f}K "
-          f"total={steps*tok_per_step/1e6:.0f}M", flush=True)
+          f"total={steps*tok_per_step/1e6:.0f}M" + (f" (resuming after {done})" if done else ""), flush=True)
 
     train_iter = iter(train_loader)
-    start, step = time.time(), 0
+    start, step = time.time(), done
     while step < steps:
         acc = 0.0
         for _ in range(accum):
@@ -252,8 +258,18 @@ def save(student, args, out_dir, step):
     return ckpt
 
 
-def packed_loader(raw, length, batch_size, seed):
-    return DataLoader(PackedDataset(raw, length, seed=seed), batch_size=batch_size, collate_fn=collate_fn)
+class _Skip(torch.utils.data.IterableDataset):
+    def __init__(self, ds, n):
+        self.ds, self.n = ds, n
+
+    def __iter__(self):
+        return itertools.islice(iter(self.ds), self.n, None)
+
+
+def packed_loader(raw, length, batch_size, seed, skip=0):
+    """``skip`` sequences are dropped from the front, so a resumed step sees the same data as the original run."""
+    ds = PackedDataset(raw, length, seed=seed)
+    return DataLoader(_Skip(ds, skip) if skip else ds, batch_size=batch_size, collate_fn=collate_fn)
 
 
 def fixed_packed_val(raw, length, n):
@@ -268,7 +284,10 @@ def main(args) -> Path:
     device = torch.device("cuda")
     out_dir = (Path(args.output_dir) if args.output_dir else REPO_ROOT / "outputs" / args.kernel / "distill").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "args.json", "w") as f:
+    step = 0
+    if args.init_from:
+        step = args.init_step if args.init_step is not None else int(Path(args.init_from).name.split("-")[-1])
+    with open(out_dir / ("args.json" if not args.init_from else f"args_resume{step}.json"), "w") as f:
         json.dump(vars(args), f, indent=1)
     log_path = out_dir / "train_log.jsonl"
     print(f"[distill] kernel={spec.name} (exact_init={spec.exact_init}) teacher={args.teacher} -> {out_dir}")
@@ -287,20 +306,29 @@ def main(args) -> Path:
     teacher = build_model(args.teacher, base_model_dir=args.base_model_dir, device=device).eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
-    student = build_model(args.kernel, base_model_dir=args.base_model_dir, device=device).train()
+    student = build_model(args.kernel, base_model_dir=args.base_model_dir, ckpt_dir=args.init_from,
+                          device=device).train()
 
     val_t = evaluate(teacher, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
     val0 = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
-    print(f"  step 0: val_loss={val0:.4f} (teacher {val_t:.4f})")
-    log_jsonl(log_path, {"stage": "init", "step": 0, "val_loss": val0, "teacher_val_loss": val_t})
+    print(f"  step {step}: val_loss={val0:.4f} (teacher {val_t:.4f})" + (f" [from {args.init_from}]" if args.init_from else ""))
+    log_jsonl(log_path, {"stage": "init" if not args.init_from else "resume", "step": step, "val_loss": val0,
+                         "teacher_val_loss": val_t})
 
-    step = 0
+    resume, step = step, 0
     for stage in stages:
         length, micro, accum, schedule = stage_plan(args, stage)
-        loader = packed_loader(raw_train, length, micro, args.seed + step)
         steps = stage_steps(args, stage, length, micro, accum)
+        done = min(max(resume - step, 0), steps)
+        if done == steps:
+            print(f"[distill] step={stage}: already done in {args.init_from}")
+            step += steps
+            continue
+        if done:
+            print(f"[distill] step={stage}: fast-forwarding the data past {done} steps", flush=True)
+        loader = packed_loader(raw_train, length, micro, args.seed + step, skip=done * micro * accum)
         step = run_stage(stage, args, teacher, student, loader, val_loader, out_dir, log_path, step, steps,
-                         length, micro, accum, schedule)
+                         length, micro, accum, schedule, done)
     ckpt = save(student, args, out_dir, step)
     print(f"[distill] done: {ckpt}")
     del teacher, student

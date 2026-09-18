@@ -70,6 +70,8 @@ def _resolve_model(spec: str, base_model_dir):
 def _ruler_env():
     env = dict(os.environ)
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    # repo-local kernel packages (e.g. gated_breg_delta_rule) are not installed; RULER runs from its own cwd
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO_ROOT), env.get("PYTHONPATH")) if p)
     return env
 
 
