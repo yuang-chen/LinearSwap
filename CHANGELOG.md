@@ -16,6 +16,19 @@
   the `hidden` distillation step, the long-context KL curriculum and instruction replay; the
   `mamba2_beta` and `mamba3_min` control kernels; the pre-September checkpoint-key converter.
 * `linswap.sft_utils` is now `linswap.train_utils`.
+* `distill --init_from <checkpoint-N>` (and `run`) resumes a run: steps already finished are skipped, a
+  partial one continues for its remaining optimizer steps on the same data (the loader is fast-forwarded
+  past the consumed sequences); optimizer state restarts.  `--init_step` overrides the step parsed from
+  the directory name.
+* `evaluate` puts the repo root on `PYTHONPATH` for the RULER subprocesses, so repo-local kernel
+  packages (`gated_breg_delta_rule`) register there too; before, `gdn_breg` checkpoints produced no
+  predictions.
+* Results for five more kernels in the README and `docs/framework.md`: `gdn2` (109.9 relative, on the
+  control), `swa` (101.0), `mamba1` (79.6) and `gdn_breg` at λ = 0.01 / 0.003, each with every GDN
+  layer thresholded and with layer 0 left as a plain GDN layer (`--kernel 'gdn_breg;gdn@0'`).
+* `evaluate` / `lmeval` sanitise model labels before using them as directory names (`path_slug`):
+  RULER builds shell command strings, so a kernel-map label such as `gdn_breg;gdn@0-distilled`
+  truncated them at the `;` and no prediction files were written.
 
 
 * **RULER protocol fix.**  The vendored `pred/call_api.py` never passed RULER's per-sample

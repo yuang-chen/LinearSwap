@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT
-from .evaluate import resolve_model
+from .evaluate import path_slug, resolve_model
 
 DEFAULT_TASKS = "lambada_openai,arc_challenge,arc_easy,piqa,winogrande,hellaswag,mmlu"
 
@@ -49,7 +49,7 @@ def main(args):
     rows = []
     for spec in args.models:
         disp, kernel, base, ckpt = resolve_model(spec, args.base_model_dir)
-        hf_dir = out_dir / "hf" / disp
+        hf_dir = out_dir / "hf" / path_slug(disp)
         if not (hf_dir / "config.json").exists():
             export(kernel, hf_dir, base_model_dir=base, ckpt_dir=ckpt)
         t = time.time()
@@ -63,7 +63,7 @@ def main(args):
                                          batch_size=args.batch_size, log_samples=False)
             res["results"].update(r2["results"])
         (out_dir / "raw").mkdir(exist_ok=True)
-        with open(out_dir / "raw" / f"{disp}.json", "w") as f:      # full lm-eval result dicts, for re-parsing
+        with open(out_dir / "raw" / f"{path_slug(disp)}.json", "w") as f:      # full lm-eval result dicts, for re-parsing
             json.dump({t: res["results"].get(t, {}) for t in tasks}, f, indent=1)
         row = {"model": disp, "kernel": kernel}
         for task in tasks:

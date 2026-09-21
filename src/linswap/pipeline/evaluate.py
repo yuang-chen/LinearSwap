@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -94,13 +95,19 @@ def _read_summary(pred_dir: Path) -> dict:
     return {t: float(s) for t, s in zip(tasks, scores)}
 
 
+def path_slug(name):
+    """Directory-safe form of a model label: RULER builds shell command strings, and a kernel map
+    ("gdn_breg;gdn@0") would truncate them at the ';'."""
+    return re.sub(r"[^A-Za-z0-9._=-]", "_", name)
+
+
 def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, use_cache, out_dir: Path) -> dict:
     """Returns {length: {task: score}}."""
     results = {}
-    log_file = out_dir / "ruler" / f"{name}.log"
+    log_file = out_dir / "ruler" / f"{path_slug(name)}.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     for L in lengths:
-        res_dir = out_dir / "ruler" / name / str(L)
+        res_dir = out_dir / "ruler" / path_slug(name) / str(L)
         data_dir, pred_dir = res_dir / "data", res_dir / "pred"
         data_dir.mkdir(parents=True, exist_ok=True)
         pred_dir.mkdir(parents=True, exist_ok=True)
@@ -148,7 +155,7 @@ def main(args):
             if ckpt is not None:
                 model_dir = ckpt
             else:  # base swap: a config dir the RULER wrapper can read
-                model_dir = out_dir / "models" / disp
+                model_dir = out_dir / "models" / path_slug(disp)
                 model_dir.mkdir(parents=True, exist_ok=True)
                 with open(model_dir / "config.json", "w") as f:
                     json.dump({"linear_kernel": kernel, "base_model_dir": str(base)}, f)
