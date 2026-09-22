@@ -23,9 +23,18 @@
 * `evaluate` puts the repo root on `PYTHONPATH` for the RULER subprocesses, so repo-local kernel
   packages (`gated_breg_delta_rule`) register there too; before, `gdn_breg` checkpoints produced no
   predictions.
-* Results for five more kernels in the README and `docs/framework.md`: `gdn2` (109.9 relative, on the
-  control), `swa` (101.0), `mamba1` (79.6) and `gdn_breg` at λ = 0.01 / 0.003, each with every GDN
-  layer thresholded and with layer 0 left as a plain GDN layer (`--kernel 'gdn_breg;gdn@0'`).
+* **RULER results are now at 500 samples per task** (the standard count) instead of 50, for the
+  teacher, the `gdn` control, `gdn2`, `kda`, `kda_fullgate`, `rwkv7`, `mamba2` and `swa`; `gla` and
+  `deltanet` are still the older 50-sample rows pending their re-run.  At 50 samples the binomial
+  95% interval is about ±7 points and the exact-init kernels were an undifferentiated block of
+  100s; at 500 it is about ±3 and every exact init is measurably below the control on the 128K
+  distractor needle.
+* `mamba1` and `mamba3` results are removed from both tables — neither is being carried forward.
+  The kernels stay registered and documented.
+* Results for three more kernels in the README and `docs/framework.md`: `gdn2` (109.9 relative, on the
+  control), `swa` (101.0) and `mamba1` (79.6).  `gdn_breg` (λ = 0.01 / 0.003, with and without layer 0
+  thresholded) was measured too but is held out of the docs pending a re-run at RULER's standard
+  sample count; the runs are under `outputs/breg*` and `outputs/eval/breg*`.
 * `evaluate` / `lmeval` sanitise model labels before using them as directory names (`path_slug`):
   RULER builds shell command strings, so a kernel-map label such as `gdn_breg;gdn@0-distilled`
   truncated them at the `;` and no prediction files were written.

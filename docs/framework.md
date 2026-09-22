@@ -234,7 +234,7 @@ Two suites, both applied to the students *and* to the unmodified backbone so the
 like-for-like:
 
 * **Long-context retrieval** (`linswap evaluate`): RULER's needle tasks `niah_single_1/2/3` and
-  `niah_multikey_1` at 4K / 16K / 64K / 128K, 50 samples each, cached greedy decoding.  Prompts use
+  `niah_multikey_1` at 4K / 16K / 64K / 128K, 500 samples each, cached greedy decoding.  Prompts use
   RULER's own base template (context, question, answer prefix); `--chat_template` switches to the
   backbone's chat format.  Since the students never see an instruction format during distillation,
   base prompting is the setting in which teacher and student are scored the same way.
@@ -251,35 +251,26 @@ Everything below is the recipe above: 700M tokens of DCLM, no SFT, base-prompt e
 **control** is the *unswapped* backbone put through the identical three steps — without it the
 students' gains over the teacher cannot be attributed to the kernel.
 
-**RULER / passkey** (50 samples; `niah_single_1` / `_2` / `_3` / `niah_multikey_1`):
+**RULER / passkey** (500 samples; `niah_single_1` / `_2` / `_3` / `niah_multikey_1`):
 
 | model | 4K | 16K | 64K | 128K |
 |---|---|---|---|---|
-| teacher (unmodified backbone) | 94 / 68 / 98 / 82 | 98 / 76 / 96 / 86 | 94 / 100 / 94 / 90 | 98 / 86 / 100 / 94 |
-| control (`gdn`, same recipe) | 100 / 100 / 94 / 100 | 100 / 100 / 100 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 90 |
-| `gdn2` (exact init) | 100 / 100 / 94 / 100 | 100 / 100 / 100 / 94 | 100 / 100 / 98 / 90 | 100 / 100 / 96 / 82 |
-| `rwkv7` (exact init) | 100 / 100 / 98 / 96 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 94 | 100 / 100 / 92 / 92 |
-| `kda` (exact init) | 100 / 100 / 94 / 96 | 100 / 100 / 98 / 94 | 100 / 100 / 100 / 94 | 100 / 100 / 92 / 88 |
-| `kda_fullgate` (exact init) | 100 / 100 / 98 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 100 / 90 | 100 / 100 / 96 / 88 |
-| `gdn_breg` λ=0.01 (all layers) | 100 / 100 / 100 / 94 | 100 / 100 / 100 / 96 | 96 / 98 / 98 / 80 | 94 / 98 / 96 / 84 |
-| `gdn_breg` λ=0.01 (layer 0 plain) | 100 / 100 / 100 / 94 | 100 / 100 / 100 / 94 | 90 / 98 / 100 / 86 | 74 / 98 / 96 / 92 |
-| `gdn_breg` λ=0.003 (all layers) | 100 / 100 / 100 / 98 | 100 / 100 / 100 / 98 | 100 / 88 / 98 / 46 | 100 / 52 / 76 / 24 |
-| `gdn_breg` λ=0.003 (layer 0 plain) | 100 / 100 / 100 / 98 | 100 / 100 / 100 / 98 | 100 / 96 / 98 / 58 | 100 / 86 / 88 / 40 |
-| `swa` (window 64 + 4 sinks) | 100 / 100 / 100 / 96 | 100 / 100 / 98 / 84 | 100 / 100 / 92 / 72 | 100 / 82 / 82 / 62 |
-| `mamba2` (no erase) | 100 / 100 / 98 / 98 | 100 / 100 / 100 / 96 | 100 / 100 / 98 / 92 | 100 / 98 / 92 / 72 |
-| `mamba3` (no erase, `--no_cache`) | 100 / 100 / 94 / 94 | 100 / 100 / 92 / 74 | – | – |
-| `mamba1` (SSM init, no erase) | 100 / 100 / 94 / 66 | 100 / 100 / 100 / 60 | 32 / 92 / 82 / 58 | 30 / 12 / 8 / 16 |
-| `gla` (per-channel decay, no erase) | 58 / 100 / 96 / 94 | 0 / 100 / 90 / 72 | 0 / 82 / 40 / 42 | 0 / 2 / 0 / 4 |
-| `deltanet` (erase, no decay) | 100 / 100 / 90 / 98 | 96 / 100 / 76 / 82 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| teacher (unmodified backbone) | 96.4 / 65.0 / 97.8 / 79.4 | 98.4 / 76.2 / 90.6 / 81.6 | 96.4 / 98.4 / 94.6 / 91.8 | 99.2 / 91.6 / 96.6 / 91.0 |
+| control (`gdn`, same recipe) | 100 / 100 / 97.0 / 99.8 | 100 / 100 / 100 / 98.4 | 100 / 100 / 99.8 / 97.2 | 100 / 100 / 99.8 / 96.2 |
+| `kda_fullgate` (exact init) | 100 / 100 / 95.0 / 99.6 | 100 / 100 / 100 / 97.6 | 100 / 100 / 100 / 95.4 | 100 / 100 / 99.4 / 92.4 |
+| `gdn2` (exact init) | 100 / 100 / 93.6 / 100 | 100 / 100 / 99.0 / 97.0 | 100 / 100 / 98.8 / 92.8 | 100 / 99.2 / 96.6 / 86.8 |
+| `rwkv7` (exact init) | 100 / 100 / 91.6 / 99.6 | 100 / 100 / 100 / 96.4 | 100 / 100 / 100 / 94.8 | 100 / 100 / 98.6 / 86.6 |
+| `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
+| `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
+| `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
+| `gla` (per-channel decay, no erase) † | 58 / 100 / 96 / 94 | 0 / 100 / 90 / 72 | 0 / 82 / 40 / 42 | 0 / 2 / 0 / 4 |
+| `deltanet` (erase, no decay) † | 100 / 100 / 90 / 98 | 96 / 100 / 76 / 82 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
 
-The second batch (`kda`, `kda_fullgate`, `mamba3`, `gla`, `deltanet`) was run months later on freshly
-tokenised DCLM and carried its own control and teacher: the control came back at 110.0 -> 110.1 on the
-short-context suite, and its teacher needle row (94 / 72 / 98 / 82 at 4K, 100 / 92 / 100 / 92 at 128K)
-sits inside the ±7-point noise of the row above, which is what licenses reading the two batches in one
-table.  `mamba3` cannot decode a single token here (no CuTe-DSL kernel), so it is scored with
-`--no_cache` at the two shorter lengths only.  The `gdn_breg` rows (a third batch) threshold every GDN layer, λ set by `LINSWAP_BREG_LAM`; their lm-eval teacher row reproduced
-the one below exactly.  The `gdn2` / `mamba1` / `swa` / `gdn_breg` rows are a
-third batch on the same recipe.
+† still the older 50-sample run; the 500-sample re-run is in progress.  Sample count matters more than
+it looks: at 50 samples per task the binomial 95% interval is about ±7 points and every exact-init
+kernel scored a flat 100 nearly everywhere, at 500 it is about ±3 and a stable ordering appears at 128K.
+`mamba1` and `mamba3` were dropped from the results — neither is being carried forward — so their rows
+are gone from both tables; the kernels stay in the registry.
 
 **Short context**, accuracy and relative score against the teacher in %:
 
@@ -290,17 +281,16 @@ third batch on the same recipe.
 | `kda_fullgate` | 0.481 (13.0) | 0.397 | 0.646 | 0.706 | 0.591 | 0.521 | 0.517 | 110.0 |
 | `gdn2` | 0.481 (13.4) | 0.390 | 0.644 | 0.705 | 0.597 | 0.521 | 0.514 | 109.9 |
 | `kda` | 0.476 (13.5) | 0.393 | 0.641 | 0.701 | 0.596 | 0.522 | 0.514 | 109.4 |
-| `gdn_breg` λ=0.003 (all layers) | 0.479 (13.3) | 0.395 | 0.649 | 0.703 | 0.593 | 0.519 | 0.510 | 109.4 |
-| `gdn_breg` λ=0.003 (layer 0 plain) | 0.478 (13.3) | 0.393 | 0.648 | 0.705 | 0.592 | 0.521 | 0.507 | 109.1 |
 | `rwkv7` | 0.479 (13.3) | 0.391 | 0.642 | 0.705 | 0.590 | 0.521 | 0.517 | 108.7 |
-| `gdn_breg` λ=0.01 (layer 0 plain) | 0.469 (14.1) | 0.385 | 0.633 | 0.711 | 0.598 | 0.518 | 0.501 | 108.1 |
-| `gdn_breg` λ=0.01 (all layers) | 0.469 (14.3) | 0.384 | 0.609 | 0.706 | 0.594 | 0.519 | 0.506 | 106.3 |
 | `mamba2` | 0.462 (14.2) | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
 | `swa` | 0.453 (15.3) | 0.372 | 0.617 | 0.702 | 0.595 | 0.503 | 0.456 | 101.0 |
 | `gla` | 0.454 (15.0) | 0.354 | 0.593 | 0.691 | 0.568 | 0.509 | 0.482 | 94.3 |
-| `mamba3` | 0.436 (16.7) | 0.340 | 0.574 | 0.691 | 0.573 | 0.492 | 0.429 | 88.2 |
 | `deltanet` | 0.382 (21.3) | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
-| `mamba1` | 0.413 (18.3) | 0.323 | 0.547 | 0.687 | 0.560 | 0.485 | 0.396 | 79.6 |
+
+The short-context suite runs each task in full, so it does not depend on the RULER sample count and
+these rows are unchanged.  The second batch (`kda`, `kda_fullgate`, `gla`, `deltanet`) was run months
+later on freshly tokenised DCLM and carried its own control: it came back at 110.0 -> 110.1, which is
+what licenses reading the batches in one table.
 
 **Throughput** (one L20X, bf16, batch 1, cached greedy decode, 256 new tokens):
 
@@ -315,49 +305,27 @@ Reading.
 * **The recipe, not the kernel, is what lifts the scores above the teacher.**  The control gains as
   much as the students on both suites (relative average 110.0, needles at 100 almost everywhere), so
   the right question is what the *swap* costs on top of it.
-* **With an exact init the swap is nearly free — for all four of them.**  `kda_fullgate` matches the
-  control (110.0), `kda` is 0.6 under it and `rwkv7` 1.3, and none of the three leaves the ±7-point
-  band at any needle length.  Four recurrences as different as the gated delta rule, a per-key-channel
-  gated delta rule and a DPLR generalised delta rule all land on the control, which says the swap is
-  paid for by the *initialisation*, not by the target architecture.
-* **KDA's low-rank forget gate is not a constraint.**  `kda` and `kda_fullgate` are the same kernel and
-  the same init, differing only in whether `f_proj` factors through the 128-dim bottleneck FLA ships or
-  a dense 2048x1024 matrix.  They finish 0.6 relative points apart and swap places across needle
-  lengths, so the rank limit costs nothing at this scale and budget; the dense variant buys 31M extra
-  parameters for noise.  (Compare the equal-budget `gdn` / `gdn2` / `kda` result below: a richer gate
-  does not beat GDN either.)
+* **With an exact init the swap is nearly free at short context, and costs a little at 128K.**  All
+  four land within 1.3 relative points of the control on the short-context suite (110.0 / 109.9 /
+  109.4 / 108.7) and hold every needle out to 64K.  What 500 samples adds is the 128K distractor
+  needle, where all four sit *below* the control — 96.2 for the control against 92.4
+  (`kda_fullgate`), 86.8 (`gdn2`), 86.6 (`rwkv7`), 85.6 (`kda`).  The gap is 4 to 11 points, larger
+  than the ±3 interval, and it was invisible at 50 samples where everything read 88-92 with a ±7 band.
+  Four recurrences as different as the gated delta rule, a per-key-channel gated delta rule and a DPLR
+  generalised delta rule still land on the control everywhere else, which says the swap is paid for by
+  the *initialisation*, not by the target architecture — but the bounded-state cost does show up at the
+  longest length the suite measures.
+* **KDA's low-rank forget gate does cost something at length.**  `kda` and `kda_fullgate` are the same
+  kernel and the same init, differing only in whether `f_proj` factors through the 128-dim bottleneck
+  FLA ships or a dense 2048x1024 matrix.  On short context they finish 0.6 relative points apart, as
+  before.  On needles the dense gate now leads at every length, by 6.8 points at 128K multikey (92.4
+  against 85.6), where the 50-sample run had them trading places inside noise.  31M extra parameters
+  buy nothing on the short-context suite and a measurable amount of long-context retrieval.
 * **The missing erase still costs.**  `mamba2` trails the control by 8.6 relative points and loses the
-  distractor needle at 128K (72 vs 90) — the same failure mode as under every earlier recipe.
-  `mamba3`, which also lacks the erase and additionally drops the short convolution, is worse still at
-  88.2 and already loses the distractor needle at 16K (74).
-* **A soft-thresholded state trades short context against retrieval, and not monotonically in λ.**
-  `gdn_breg` starts as an exact copy of GDN and adds `S <- sign(S) max(|S| - λ, 0)` after every
-  64-token chunk in all 18 GDN layers.  At λ=0.003 it matches the control on short context (109.4)
-  and on needles up to 16K, then loses retrieval with length: 46 on the multikey needle at 64K and
-  52 / 76 / 24 on `niah_single_2` / `_3` / multikey at 128K.  At λ=0.01 it gives up 3.7 relative
-  points (106.3; mostly ARC-e, ARC-c and LAMBADA) but stays within noise of the control to 64K on the single
-  needles and keeps multikey at 80 / 84 at 64K / 128K (control 96 / 90).  The final validation losses
-  (2.939 vs 2.944 after the `ce` step) do not separate the two, so this is a second case where only a
-  retrieval suite at several lengths shows the difference.  One seed; the 128K multikey gap (84 vs 24)
-  is far outside the ±7-point noise.
-* **`gdn2` behaves like the other exact inits.**  109.9 against the control's 110.0 and needles inside
-  the band at every length, for 113M new parameters — the richest gate in the registry buys nothing
-  over GDN at this scale, the same conclusion the `kda` / `kda_fullgate` pair gives.
-* **Leaving layer 0 unthresholded recovers part of `gdn_breg`'s cost but not the ordering.**  The
-  `;gdn@0` kernel map keeps layer 0 a stock GDN layer and thresholds the other 17.  λ=0.01 goes from
-  106.3 to 108.1 relative and its 128K multikey from 84 to 92; λ=0.003's 128K row improves from
-  52 / 76 / 24 to 86 / 88 / 40 while short context stays put (109.4 → 109.1).  λ=0.01 still holds
-  retrieval far better than λ=0.003 in both variants, so the first layer is not where the
-  length behaviour is decided.  (λ=0.01, layer 0 plain, is the one row that loses `niah_single_1` at
-  128K — 74 — while its multikey is the best of the four, which one seed at 50 samples cannot
-  separate from noise.)
-* **A 64-token softmax window is enough for the short-context suite and not for retrieval.**  `swa`
-  scores 101.0 relative with a state of 68 keys per head, but its multikey needle decays
-  96 / 84 / 72 / 62 across the four lengths and MMLU drops to 0.456 (81.1), the largest single-task
-  deficit in the table.
-* **`mamba1` is the floor.**  Values, gate, convolution and `out_proj` are copied but the SSM
-  parameters keep Mamba's init, and there is neither an erase nor a decay gate: 79.6 relative,
-  needles at 8–30 by 128K, below even `deltanet` on the short-context suite.
+  distractor needle at 128K (70.0 vs 96.2) — the same failure mode as under every earlier recipe.
+* **A bounded softmax window is the same story, sharper.**  `swa` keeps 101.0 relative on short
+  context with a 68-key state but decays 97.4 / 79.6 / 67.6 / 56.0 on the multikey needle across the
+  four lengths, and drops to 0.456 on MMLU (81.1 relative), the largest single-task deficit here.
 * **Inexact swaps fail with length, and the short-context suite cannot see it.**  `deltanet` matches
   the control at 4K (97.0 task average against 99.5) and then scores exactly 0 on all four needles from
   64K on; `gla` decays through 87 / 65.5 / 41 / 1.5.  Both remain respectable on LAMBADA, PIQA and
