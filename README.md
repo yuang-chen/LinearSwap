@@ -23,9 +23,6 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 | `mamba2`       | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped              | 0.3M       | no         |
 | `deltanet`     | DeltaNet (erase, no decay)                | shared weights copied, decay dropped              | 0.3M       | no         |
 | `gla`          | Gated Linear Attention                    | shared weights copied, decay MLP at FLA init      | 0.9M       | no         |
-| `mamba3` †     | Mamba-3                                   | decay/projections mapped into the fused `in_proj` | 0.05M      | no         |
-| `mamba1` †     | Mamba-1 selective SSM                     | values, gate, conv, `out_proj` copied             | 19M        | no         |
-| `gdn_breg` §   | GDN + soft-thresholded state              | weight copy; `lam` from the environment           | 0.6M       | at `lam=0` |
 | `swa` ¶        | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature                | 16 scalars | no         |
 
 
@@ -34,10 +31,10 @@ reproduces the original to bf16 noise; the rest have more to recover. Only the *
 replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
 0.8B backbone; `docs/framework.md` has the per-kernel mappings.
 
-<sub>‡ needs as many value heads as key heads. † needs `mamba_ssm` (see Install); Mamba-3 has no cached
-decode, use `evaluate --no_cache`. § external package, registered only when it imports. ¶ not linear
-attention: sliding-window softmax with sinks (arXiv 2608.28444) over the same projections, bounded
-68-key state; window / sinks / RoPE from `LINSWAP_SWA_WINDOW` / `_SINKS` / `_ROPE`.</sub>
+<sub>‡ needs as many value heads as key heads. ¶ not linear attention: sliding-window softmax with
+sinks (arXiv 2608.28444) over the same projections, bounded 68-key state; window / sinks / RoPE from
+`LINSWAP_SWA_WINDOW` / `_SINKS` / `_ROPE`.  `linswap kernels` lists everything registered, including
+kernels with no results here (`mamba1`, `mamba3`, `gdn_breg`).</sub>
 
 ## Install
 
@@ -55,8 +52,8 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 python tests/test_kernels.py && python tests/test_hf.py  # kernels match the control, HF round-trip exact
 ```
 
-Optional, for `mamba1` / `mamba3` (always build without dependency resolution, or it replaces your
-torch):
+Optional, for the `mamba1` / `mamba3` kernels (always build without dependency resolution, or it
+replaces your torch):
 
 ```bash
 CUDA_HOME=/usr/local/cuda MAX_JOBS=32 uv pip install --no-deps --no-build-isolation \
