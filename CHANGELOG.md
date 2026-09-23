@@ -24,8 +24,8 @@
   packages (`gated_breg_delta_rule`) register there too; before, `gdn_breg` checkpoints produced no
   predictions.
 * **RULER results are now at 500 samples per task** (the standard count) instead of 50, for the
-  teacher, the `gdn` control, `gdn2`, `kda`, `kda_fullgate`, `rwkv7`, `mamba2` and `swa`; `gla` and
-  `deltanet` are still the older 50-sample rows pending their re-run.  At 50 samples the binomial
+  teacher, the `gdn` control, `gdn2`, `kda`, `kda_fullgate`, `rwkv7`, `mamba2`, `swa`, `gla` and
+  `deltanet` — every row in both tables.  At 50 samples the binomial
   95% interval is about ±7 points and the exact-init kernels were an undifferentiated block of
   100s; at 500 it is about ±3 and every exact init is measurably below the control on the 128K
   distractor needle.

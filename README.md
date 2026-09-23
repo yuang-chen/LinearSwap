@@ -163,10 +163,8 @@ recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
 | `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
 | `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
 | `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
-| `gla` (per-channel decay, no erase) † | 58 / 100 / 96 / 94 | 0 / 100 / 90 / 72 | 0 / 82 / 40 / 42 | 0 / 2 / 0 / 4 |
-| `deltanet` (erase, no decay) † | 100 / 100 / 90 / 98 | 96 / 100 / 76 / 82 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
-
-<sub>† still the older 50-sample run; the 500-sample re-run is in progress.</sub>
+| `gla` (per-channel decay, no erase) | 53.2 / 100 / 99.0 / 97.8 | 1.4 / 100 / 85.4 / 72.2 | 0.0 / 77.8 / 51.0 / 44.0 | 0.0 / 1.2 / 1.2 / 3.8 |
+| `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
 
 **Short context**, accuracy (relative score vs the unmodified backbone in %)
 
@@ -212,9 +210,10 @@ What the numbers say:
 - Dropping the delta-rule erase is not free: `mamba2` trails the control by 8.6 relative points and
   loses the distractor needle at 128K (70.0 vs 96.2).
 - The inexact kernels fail *with length*, and the short-context suite does not
-  see it coming.  `deltanet` is at the control's level at 4K and scores exactly
-  0 on all four needles from 64K on; `gla` decays through 65 / 41 / 1.5 (task
-  average) as the context grows.  Both still look respectable on LAMBADA and
+  see it coming.  `deltanet` is at the control's level at 4K (98.7 task average
+  against 99.2) and then scores exactly 0 on all four needles from 64K on — 2,000
+  attempts per length, none answered; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6
+  (task average) as the context grows.  Both still look respectable on LAMBADA and
   PIQA, which is the argument for keeping a retrieval suite in the protocol:
   a swap can be nearly free at 4K and worthless at 64K.
 - Decoding is length-independent for all of them (constant state).  Prefill at

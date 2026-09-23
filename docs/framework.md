@@ -263,11 +263,10 @@ students' gains over the teacher cannot be attributed to the kernel.
 | `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
 | `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
 | `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
-| `gla` (per-channel decay, no erase) † | 58 / 100 / 96 / 94 | 0 / 100 / 90 / 72 | 0 / 82 / 40 / 42 | 0 / 2 / 0 / 4 |
-| `deltanet` (erase, no decay) † | 100 / 100 / 90 / 98 | 96 / 100 / 76 / 82 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| `gla` (per-channel decay, no erase) | 53.2 / 100 / 99.0 / 97.8 | 1.4 / 100 / 85.4 / 72.2 | 0.0 / 77.8 / 51.0 / 44.0 | 0.0 / 1.2 / 1.2 / 3.8 |
+| `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
 
-† still the older 50-sample run; the 500-sample re-run is in progress.  Sample count matters more than
-it looks: at 50 samples per task the binomial 95% interval is about ±7 points and every exact-init
+Sample count matters more than it looks: at 50 samples per task the binomial 95% interval is about ±7 points and every exact-init
 kernel scored a flat 100 nearly everywhere, at 500 it is about ±3 and a stable ordering appears at 128K.
 `mamba1` and `mamba3` were dropped from the results — neither is being carried forward — so their rows
 are gone from both tables; the kernels stay in the registry.
@@ -327,8 +326,11 @@ Reading.
   context with a 68-key state but decays 97.4 / 79.6 / 67.6 / 56.0 on the multikey needle across the
   four lengths, and drops to 0.456 on MMLU (81.1 relative), the largest single-task deficit here.
 * **Inexact swaps fail with length, and the short-context suite cannot see it.**  `deltanet` matches
-  the control at 4K (97.0 task average against 99.5) and then scores exactly 0 on all four needles from
-  64K on; `gla` decays through 87 / 65.5 / 41 / 1.5.  Both remain respectable on LAMBADA, PIQA and
+  the control at 4K (98.7 task average against 99.2) and then scores exactly 0 on all four needles from
+  64K on — at 500 samples that is 2,000 attempts per length with no answer, so it is the mechanism, not
+  the sampling; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6.  `gla` also fails one task out of order:
+  `niah_single_1` is at 53.2 at 4K and 1.4 at 16K while its other three needles are still at 72-100,
+  the only row in the table where the nominally easiest needle goes first.  Both remain respectable on LAMBADA, PIQA and
   HellaSwag — `gla` is at 94.3 relative — so a swap validated only on short-context benchmarks can be
   entirely broken at 64K.  This is the strongest argument in these results for scoring retrieval at
   several lengths rather than reporting a single accuracy.
