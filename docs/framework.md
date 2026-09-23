@@ -266,10 +266,8 @@ students' gains over the teacher cannot be attributed to the kernel.
 | `gla` (per-channel decay, no erase) | 53.2 / 100 / 99.0 / 97.8 | 1.4 / 100 / 85.4 / 72.2 | 0.0 / 77.8 / 51.0 / 44.0 | 0.0 / 1.2 / 1.2 / 3.8 |
 | `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
 
-Sample count matters more than it looks: at 50 samples per task the binomial 95% interval is about ±7 points and every exact-init
-kernel scored a flat 100 nearly everywhere, at 500 it is about ±3 and a stable ordering appears at 128K.
-`mamba1` and `mamba3` were dropped from the results — neither is being carried forward — so their rows
-are gone from both tables; the kernels stay in the registry.
+500 samples puts the binomial 95% interval at about ±3 points.  `mamba1` and `mamba3` are not being
+carried forward, so their rows are gone from both tables; the kernels stay in the registry.
 
 **Short context**, accuracy and relative score against the teacher in %:
 
@@ -308,18 +306,16 @@ Reading.
   four land within 1.3 relative points of the control on the short-context suite (110.0 / 109.9 /
   109.4 / 108.7) and hold every needle out to 64K.  What 500 samples adds is the 128K distractor
   needle, where all four sit *below* the control — 96.2 for the control against 92.4
-  (`kda_fullgate`), 86.8 (`gdn2`), 86.6 (`rwkv7`), 85.6 (`kda`).  The gap is 4 to 11 points, larger
-  than the ±3 interval, and it was invisible at 50 samples where everything read 88-92 with a ±7 band.
-  Four recurrences as different as the gated delta rule, a per-key-channel gated delta rule and a DPLR
+  (`kda_fullgate`), 86.8 (`gdn2`), 86.6 (`rwkv7`), 85.6 (`kda`): a gap of 4 to 11 points against a ±3
+  interval.  Four recurrences as different as the gated delta rule, a per-key-channel gated delta rule and a DPLR
   generalised delta rule still land on the control everywhere else, which says the swap is paid for by
   the *initialisation*, not by the target architecture — but the bounded-state cost does show up at the
   longest length the suite measures.
 * **KDA's low-rank forget gate does cost something at length.**  `kda` and `kda_fullgate` are the same
   kernel and the same init, differing only in whether `f_proj` factors through the 128-dim bottleneck
   FLA ships or a dense 2048x1024 matrix.  On short context they finish 0.6 relative points apart, as
-  before.  On needles the dense gate now leads at every length, by 6.8 points at 128K multikey (92.4
-  against 85.6), where the 50-sample run had them trading places inside noise.  31M extra parameters
-  buy nothing on the short-context suite and a measurable amount of long-context retrieval.
+  before.  On needles the dense gate leads at every length, by 6.8 points at 128K multikey (92.4
+  against 85.6).  31M extra parameters buy nothing on the short-context suite and a measurable amount of long-context retrieval.
 * **The missing erase still costs.**  `mamba2` trails the control by 8.6 relative points and loses the
   distractor needle at 128K (70.0 vs 96.2) — the same failure mode as under every earlier recipe.
 * **A bounded softmax window is the same story, sharper.**  `swa` keeps 101.0 relative on short

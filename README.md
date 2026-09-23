@@ -29,14 +29,15 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 | `swa` ¶        | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature                | 16 scalars | no         |
 
 
-An **exact** kernel contains Gated DeltaNet as a special case, so the swapped layer computes the
-same function as the original at step 0, verified to bf16 noise; the rest start from whatever maps
-and have more to recover. Every kernel then goes through the same distillation. Each target is the
-*sequence mixer* of the named architecture dropped into a backbone-compatible block — the backbone's
-projections, short convolutions and gated output norm are kept, so e.g. RWKV-7's token shift and
-GroupNorm are not used. Counts are for the 0.8B backbone; `docs/framework.md` has every mapping.
+An **exact** kernel contains Gated DeltaNet as a special case, so at step 0 the swapped layer
+reproduces the original to bf16 noise; the rest have more to recover. Only the *sequence mixer* is
+replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
+0.8B backbone; `docs/framework.md` has the per-kernel mappings.
 
-‡ needs as many value heads as key heads; refuses grouped-value-head backbones. † needs `mamba_ssm` (see Install); Mamba-3 has no cached decode, use `evaluate --no_cache`. § wraps an external in-development package, registered only when it imports. ¶ the one mixer that is not linear attention: sliding-window softmax with sinks (arXiv 2608.28444) over the same projections, with a bounded 68-key state instead of a matrix. Window / sinks / RoPE from `LINSWAP_SWA_WINDOW` / `_SINKS` / `_ROPE`.
+<sub>‡ needs as many value heads as key heads. † needs `mamba_ssm` (see Install); Mamba-3 has no cached
+decode, use `evaluate --no_cache`. § external package, registered only when it imports. ¶ not linear
+attention: sliding-window softmax with sinks (arXiv 2608.28444) over the same projections, bounded
+68-key state; window / sinks / RoPE from `LINSWAP_SWA_WINDOW` / `_SINKS` / `_ROPE`.</sub>
 
 ## Install
 
@@ -181,44 +182,30 @@ recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
 | `gla` | 0.454 | 0.354 | 0.593 | 0.691 | 0.568 | 0.509 | 0.482 | 94.3 |
 | `deltanet` | 0.382 | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
-The short-context suite runs every task in full, so it is unaffected by the RULER sample count.  The
-`kda` / `kda_fullgate` / `gla` / `deltanet` short-context rows come from a second batch, run months
-later on freshly tokenised DCLM; its own control reproduced the published 110.0 at 110.1, which is what
-licenses reading the batches in one table.
+The short-context suite scores every task in full.  The `kda` / `kda_fullgate` / `gla` / `deltanet`
+rows come from a second batch, run months later on freshly tokenised DCLM; its own control reproduced
+the published 110.0 at 110.1, which is what licenses one table.
 
 What the numbers say:
 
-- The recipe, not the kernel, is what lifts a swapped model above the original:
-  the control gains as much as the students on both suites.  The question a
-  swap experiment has to answer is therefore what the swap costs *on top of the
-  same training*, which is what the control row makes visible.
-- Sample count decides what is readable.  At 50 samples per task the four exact-init kernels were an
-  indistinguishable block of 100s and the binomial 95% interval was about ±7 points; at 500 it is about
-  ±3, and a consistent ordering appears at 128K that the smaller run could not have shown.
-- With an exact init the swap is nearly free *at short context and moderate length* — all four sit
-  within a point of the control on the short-context suite (110.0 / 109.9 / 109.4 / 108.7) and hold
-  every needle to 64K.  The residual cost is at 128K, on the distractor needle: control 96.2, then
-  `kda_fullgate` 92.4, `gdn2` 86.8, `rwkv7` 86.6, `kda` 85.6.  Every exact init is below the control
-  there, by 4 to 11 points — small, consistent, and invisible at 50 samples.
-- KDA's low-rank forget gate is not free after all.  `kda` and `kda_fullgate` differ only in whether the
-  per-channel decay factors through a rank-128 bottleneck or a dense projection; they are 0.6 relative
-  points apart on short context, but the dense gate leads at every needle length and by 6.8 points at
-  128K multikey.  At 50 samples the two traded places and the difference read as noise.
-- `swa` keeps short context (101.0) with a 64-token window, so most of what that suite measures is
-  local; retrieval is where the bounded state shows, decaying 97.4 / 79.6 / 67.6 / 56.0 on the multikey
-  needle.  Its MMLU is the outlier (0.456, 81.1 relative) — the task here that most needs long context.
-- Dropping the delta-rule erase is not free: `mamba2` trails the control by 8.6 relative points and
+- **The recipe, not the kernel, is what lifts a swapped model above the original.**  The control gains
+  as much as the students on both suites, so the question a swap has to answer is what it costs *on top
+  of the same training*.
+- **An exact init is nearly free, except at 128K.**  All four land within 1.3 relative points of the
+  control on short context and hold every needle to 64K; on the 128K distractor needle they trail it by
+  4 to 11 points (control 96.2, then `kda_fullgate` 92.4, `gdn2` 86.8, `rwkv7` 86.6, `kda` 85.6).
+- **KDA's low-rank forget gate costs retrieval.**  `kda` and `kda_fullgate` differ only in whether the
+  decay factors through a rank-128 bottleneck or a dense projection: 0.6 relative points apart on short
+  context, but the dense gate leads at every needle length and by 6.8 points at 128K.
+- **Dropping the delta-rule erase costs.**  `mamba2` trails the control by 8.6 relative points and
   loses the distractor needle at 128K (70.0 vs 96.2).
-- The inexact kernels fail *with length*, and the short-context suite does not
-  see it coming.  `deltanet` is at the control's level at 4K (98.7 task average
-  against 99.2) and then scores exactly 0 on all four needles from 64K on — 2,000
-  attempts per length, none answered; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6
-  (task average) as the context grows.  Both still look respectable on LAMBADA and
-  PIQA, which is the argument for keeping a retrieval suite in the protocol:
-  a swap can be nearly free at 4K and worthless at 64K.
-- Decoding is length-independent for all of them (constant state).  Prefill at
-  8K/32K: `gdn` 134K/141K tok/s, `mamba2` 119K/128K, `rwkv7` 79K/76K; decode
-  24.5 / 30.5 / 33.3 ms per token.
+- **A 64-token window holds short context, not retrieval.**  `swa` scores 101.0 relative but decays
+  97.4 / 79.6 / 67.6 / 56.0 on the multikey needle, and drops to 0.456 on MMLU (81.1) — the task here
+  that most needs long context.
+- **Inexact swaps fail with length, and the short suite cannot see it.**  `deltanet` matches the control
+  at 4K and then scores 0 on all four needles from 64K on; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6
+  (task average).  Both still look respectable on LAMBADA and PIQA: a swap can be free at 4K and
+  worthless at 64K.
 
 Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, constant state):
 
