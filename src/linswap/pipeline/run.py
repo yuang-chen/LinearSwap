@@ -36,6 +36,7 @@ def add_args(ap):
     ap.add_argument("--samples", type=int, default=50)
     ap.add_argument("--no_cache", action="store_true")
     ap.add_argument("--chat_template", action="store_true")
+    ap.add_argument("--ruler_jobs", type=int, default=3, help="RULER tasks to run at once (see evaluate)")
     ap.add_argument("--skip_ruler", action="store_true")
     ap.add_argument("--skip_lmeval", action="store_true")
     ap.add_argument("--lmeval_tasks", default=lmeval.DEFAULT_TASKS)
@@ -56,7 +57,8 @@ def main(args):
 
     e = _namespace(evaluate.add_args, ["--models", model, "--name", name,
                                        "--base_model_dir", args.base_model_dir, "--tasks", args.tasks,
-                                       "--lengths", args.lengths, "--samples", str(args.samples)]
+                                       "--lengths", args.lengths, "--samples", str(args.samples),
+                                       "--ruler_jobs", str(args.ruler_jobs)]
                    + (["--no_cache"] if args.no_cache else [])
                    + (["--chat_template"] if args.chat_template else [])
                    + (["--skip_ruler"] if args.skip_ruler else []))

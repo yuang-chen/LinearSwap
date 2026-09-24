@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model, read_checkpoint_kernel
@@ -41,6 +42,8 @@ def add_args(ap):
     ap.add_argument("--chat_template", action="store_true",
                     help="wrap RULER prompts in the backbone's chat template; the default is RULER's base "
                          "template (context + question + answer prefix).  Use the same setting for every model.")
+    ap.add_argument("--ruler_jobs", type=int, default=3,
+                    help="RULER tasks to run at once; decoding is latency-bound (~25%% GPU for one task)")
     ap.add_argument("--skip_ruler", action="store_true")
 
 
@@ -101,32 +104,51 @@ def path_slug(name):
     return re.sub(r"[^A-Za-z0-9._=-]", "_", name)
 
 
-def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, use_cache, out_dir: Path) -> dict:
-    """Returns {length: {task: score}}."""
+def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, use_cache, out_dir: Path,
+              jobs: int = 1) -> dict:
+    """Returns {length: {task: score}}.
+
+    ``jobs`` runs that many tasks at once.  RULER decodes one sequence at a time, so a single task
+    leaves the GPU mostly idle (~25 % on an L20X); several tasks in flight fill it without needing
+    more memory than one model copy each."""
     results = {}
-    log_file = out_dir / "ruler" / f"{path_slug(name)}.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    ruler_dir = out_dir / "ruler"
+    ruler_dir.mkdir(parents=True, exist_ok=True)
+    log_file = ruler_dir / f"{path_slug(name)}.log"
     for L in lengths:
-        res_dir = out_dir / "ruler" / path_slug(name) / str(L)
+        res_dir = ruler_dir / path_slug(name) / str(L)
         data_dir, pred_dir = res_dir / "data", res_dir / "pred"
         data_dir.mkdir(parents=True, exist_ok=True)
         pred_dir.mkdir(parents=True, exist_ok=True)
-        failed = []
-        for task in tasks:
+
+        def one_task(task):
+            # concurrent tasks write their own log, appended to the run log once the task is done
+            tlog = ruler_dir / f"{path_slug(name)}.{L}.{task}.log"
             t = time.time()
             try:
                 _run([sys.executable, "data/prepare.py", "--save_dir", data_dir, "--benchmark", "synthetic",
                       "--task", task, "--tokenizer_path", base_model_dir, "--tokenizer_type", "hf",
-                      "--max_seq_length", L, "--model_template_type", "base", "--num_samples", samples], log_file)
+                      "--max_seq_length", L, "--model_template_type", "base", "--num_samples", samples], tlog)
                 _run([sys.executable, "pred/call_api.py", "--data_dir", data_dir, "--save_dir", pred_dir,
                       "--benchmark", "synthetic", "--task", task,
                       "--server_type", "linswap" if use_cache else "linswap_nocache",
                       "--model_name_or_path", model_dir, "--temperature", "0.0", "--top_k", "32", "--top_p", "1.0",
-                      "--batch_size", "1"], log_file)
+                      "--batch_size", "1"], tlog)
                 print(f"    {name} L={L} {task}: {time.time()-t:.0f}s", flush=True)
+                return None
             except RuntimeError as e:  # keep going; the task is reported as missing
                 print(f"    {name} L={L} {task}: FAILED ({e})", flush=True)
-                failed.append(task)
+                return task
+            finally:
+                with open(log_file, "a") as dst, open(tlog) as src:
+                    dst.write(src.read())
+                tlog.unlink(missing_ok=True)
+
+        if jobs > 1:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                failed = [t for t in pool.map(one_task, tasks) if t]
+        else:
+            failed = [t for t in map(one_task, tasks) if t]
         _run([sys.executable, "eval/evaluate.py", "--data_dir", pred_dir, "--benchmark", "synthetic"], log_file)
         results[L] = _read_summary(pred_dir)
         for task in failed:
@@ -159,7 +181,8 @@ def main(args):
                 model_dir.mkdir(parents=True, exist_ok=True)
                 with open(model_dir / "config.json", "w") as f:
                     json.dump({"linear_kernel": kernel, "base_model_dir": str(base)}, f)
-            res = run_ruler(disp, model_dir, base, tasks, lengths, args.samples, not args.no_cache, out_dir)
+            res = run_ruler(disp, model_dir, base, tasks, lengths, args.samples, not args.no_cache, out_dir,
+                            jobs=args.ruler_jobs)
             for L, scores in res.items():
                 for t, s in scores.items():
                     row[f"{t}@{L}"] = s
