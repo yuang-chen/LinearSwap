@@ -22,7 +22,7 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 | `gdn2`         | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                     | 113M       | yes ‡      |
 | `mamba2`       | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped              | 0.3M       | no         |
 | `deltanet`     | DeltaNet (erase, no decay)                | shared weights copied, decay dropped              | 0.3M       | no         |
-| `gla`          | Gated Linear Attention                    | shared weights copied, decay MLP at FLA init      | 0.9M       | no         |
+| `gla`          | Gated Linear Attention                    | shared weights copied, decay fitted per head      | 0.9M       | no         |
 | `swa` ¶        | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature                | 16 scalars | no         |
 
 
@@ -161,7 +161,7 @@ recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
 | `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
 | `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
 | `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
-| `gla` (per-channel decay, no erase) | 53.2 / 100 / 99.0 / 97.8 | 1.4 / 100 / 85.4 / 72.2 | 0.0 / 77.8 / 51.0 / 44.0 | 0.0 / 1.2 / 1.2 / 3.8 |
+| `gla` (per-channel decay, no erase) | 97.4 / 100 / 99.6 / 99.2 | 52.8 / 100 / 99.6 / 89.0 | 29.0 / 96.2 / 96.8 / 82.0 | 32.0 / 94.4 / 90.0 / 58.8 |
 | `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
 
 **Short context**, accuracy (relative score vs the unmodified backbone in %)
@@ -176,7 +176,7 @@ recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
 | `rwkv7` | 0.479 | 0.391 | 0.642 | 0.705 | 0.590 | 0.521 | 0.517 | 108.7 |
 | `mamba2` | 0.462 | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
 | `swa` | 0.453 | 0.372 | 0.617 | 0.702 | 0.595 | 0.503 | 0.456 | 101.0 |
-| `gla` | 0.454 | 0.354 | 0.593 | 0.691 | 0.568 | 0.509 | 0.482 | 94.3 |
+| `gla` | 0.463 | 0.362 | 0.612 | 0.701 | 0.579 | 0.514 | 0.484 | 99.2 |
 | `deltanet` | 0.382 | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
 The short-context suite scores every task in full.  The `kda` / `kda_fullgate` / `gla` / `deltanet`
@@ -200,9 +200,14 @@ What the numbers say:
   97.4 / 79.6 / 67.6 / 56.0 on the multikey needle, and drops to 0.456 on MMLU (81.1) — the task here
   that most needs long context.
 - **Inexact swaps fail with length, and the short suite cannot see it.**  `deltanet` matches the control
-  at 4K and then scores 0 on all four needles from 64K on; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6
-  (task average).  Both still look respectable on LAMBADA and PIQA: a swap can be free at 4K and
-  worthless at 64K.
+  at 4K and then scores 0 on all four needles from 64K on while still looking respectable on LAMBADA
+  and PIQA: a swap can be free at 4K and worthless at 64K.  `gla` decays through 99.1 / 85.4 / 76.0 /
+  68.8 (task average).
+- **The init of the inexact part matters.**  `gla` with FLA's random gate init scored 87.5 / 64.8 / 43.2 /
+  1.6 on the same recipe; fitting GDN's per-head decay into the gate at init is what lifts it, and the
+  one task it still fails out of order (`niah_single_1`: 97.4 / 52.8 / 29.0 / 32.0, the repeated-noise
+  haystack) is where the fit loosens — the mechanism is described in `kernels/gla.py`.  Short context
+  moves from 94.3 to 99.2 relative.
 
 Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, constant state):
 

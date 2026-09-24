@@ -21,7 +21,7 @@ src/linswap/
   kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap
-  kernels/gla.py       "gla"          Gated Linear Attention, stock FLA layer, no custom code — inexact swap
+  kernels/gla.py       "gla"          Gated Linear Attention, stock FLA layer, GDN decay fitted per head into the gate — inexact swap
   kernels/mamba3.py    "mamba3"       FLA Mamba3 (mamba_ssm kernels), GDN decay mapped into the fused in_proj — inexact
   kernels/mamba1.py    "mamba1"       FLA Mamba (mamba_ssm kernels), values/gate/conv copied — inexact
   kernels/gdn_breg.py  "gdn_breg"     GDN + Bregman soft-thresholding of the state (external package, optional)
@@ -263,7 +263,7 @@ students' gains over the teacher cannot be attributed to the kernel.
 | `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
 | `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
 | `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
-| `gla` (per-channel decay, no erase) | 53.2 / 100 / 99.0 / 97.8 | 1.4 / 100 / 85.4 / 72.2 | 0.0 / 77.8 / 51.0 / 44.0 | 0.0 / 1.2 / 1.2 / 3.8 |
+| `gla` (per-channel decay, no erase) | 97.4 / 100 / 99.6 / 99.2 | 52.8 / 100 / 99.6 / 89.0 | 29.0 / 96.2 / 96.8 / 82.0 | 32.0 / 94.4 / 90.0 / 58.8 |
 | `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
 
 500 samples puts the binomial 95% interval at about ±3 points.  `mamba1` and `mamba3` are not being
@@ -281,13 +281,14 @@ carried forward, so their rows are gone from both tables; the kernels stay in th
 | `rwkv7` | 0.479 (13.3) | 0.391 | 0.642 | 0.705 | 0.590 | 0.521 | 0.517 | 108.7 |
 | `mamba2` | 0.462 (14.2) | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
 | `swa` | 0.453 (15.3) | 0.372 | 0.617 | 0.702 | 0.595 | 0.503 | 0.456 | 101.0 |
-| `gla` | 0.454 (15.0) | 0.354 | 0.593 | 0.691 | 0.568 | 0.509 | 0.482 | 94.3 |
+| `gla` | 0.463 (14.3) | 0.362 | 0.612 | 0.701 | 0.579 | 0.514 | 0.484 | 99.2 |
 | `deltanet` | 0.382 (21.3) | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
 The short-context suite runs each task in full, so it does not depend on the RULER sample count and
 these rows are unchanged.  The second batch (`kda`, `kda_fullgate`, `gla`, `deltanet`) was run months
 later on freshly tokenised DCLM and carried its own control: it came back at 110.0 -> 110.1, which is
-what licenses reading the batches in one table.
+what licenses reading the batches in one table.  The decay-fitted `gla` row is a third run
+(`outputs/eval/gla_mapped-lmeval`) scored against the same backbone reference.
 
 **Throughput** (one L20X, bf16, batch 1, cached greedy decode, 256 new tokens):
 
@@ -324,12 +325,26 @@ Reading.
 * **Inexact swaps fail with length, and the short-context suite cannot see it.**  `deltanet` matches
   the control at 4K (98.7 task average against 99.2) and then scores exactly 0 on all four needles from
   64K on — at 500 samples that is 2,000 attempts per length with no answer, so it is the mechanism, not
-  the sampling; `gla` decays through 87.5 / 64.8 / 43.2 / 1.6.  `gla` also fails one task out of order:
-  `niah_single_1` is at 53.2 at 4K and 1.4 at 16K while its other three needles are still at 72-100,
+  the sampling; `gla` decays through 99.1 / 85.4 / 76.0 / 68.8.  `gla` also fails one task out of order:
+  `niah_single_1` is at 52.8 at 16K and 29.0 at 64K while its other three needles are still at 82-100,
   the only row in the table where the nominally easiest needle goes first.  Both remain respectable on LAMBADA, PIQA and
-  HellaSwag — `gla` is at 94.3 relative — so a swap validated only on short-context benchmarks can be
+  HellaSwag, so a swap validated only on short-context benchmarks can be
   entirely broken at 64K.  This is the strongest argument in these results for scoring retrieval at
   several lengths rather than reporting a single accuracy.
+* **`gla`'s out-of-order failure is the gate init, and the fix is partial.**  With FLA's random
+  per-channel gate init `niah_single_1` went 53.2 / 1.4 / 0 / 0 (task average 87.5 / 64.8 / 43.2 / 1.6,
+  94.3 relative on short context) while the essay
+  needles held to 16K.  Measured on that checkpoint: retrieval in the hybrid is done by the six
+  full-attention layers (the linear layers' readout at the answer position carries under 0.3% needle in
+  every kernel, control included), and what breaks is the residual stream they read from.  On a
+  haystack of one sentence repeated thousands of times the GDN state reaches a fixed point (repeated
+  writes are idempotent under the delta rule) and Mamba-2's per-head scalar growth is cancelled by the
+  per-head RMSNorm, but GLA's per-channel decay lets channels of one head grow at different rates, so
+  its output keeps changing with the repeat count and drifts from the teacher — on distillation text
+  that regime never occurs.  84% of its heads had mixed horizons after distillation.  Fitting GDN's
+  per-head decay into the gate MLP at init (`kernels/gla.py`) starts every channel of a head on one
+  horizon; distillation regrows the spread in about a quarter of the heads, which is why the
+  repeated-noise needle recovers to 97.4 / 52.8 / 29.0 / 32.0 rather than to 100.
 * `deltanet`'s collapse is the predicted one: with `exp(g_t) = 1` the state never contracts, so stale
   associations survive until they are explicitly overwritten and the needle becomes unrecoverable once
   the context is long enough.  Distillation on 700M tokens moves the length at which that happens; it
