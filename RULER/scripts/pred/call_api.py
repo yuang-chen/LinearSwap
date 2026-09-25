@@ -31,6 +31,7 @@ prediction jsonl:
 """
 
 import argparse
+import hashlib
 import json
 import yaml
 import os
@@ -42,6 +43,20 @@ import time
 from tqdm import tqdm
 from pathlib import Path
 import traceback
+from collections import Counter
+
+
+def sample_key(sample):
+    """Identity of a sample, for resuming a partial prediction file.
+
+    ``index`` is not a sample id: niah.py sets it to the needle's character offset
+    (``input_text.find(answer[0])``), so distinct samples collide -- 58 of 500 in a typical
+    niah_single_1 file.  Keying resumption on it alone silently drops the colliding samples.
+    The input disambiguates; it is hashed so that a 128K-token task does not hold every
+    context string in memory twice.
+    """
+    digest = hashlib.blake2b(sample['input'].encode('utf-8'), digest_size=16).digest()
+    return (sample['index'], digest)
 
 
 def read_manifest(path):
@@ -254,8 +269,15 @@ def main():
 
     # Load data
     if os.path.exists(pred_file):
-        pred_index = [sample['index'] for sample in read_manifest(pred_file)]
-        data = [sample for sample in read_manifest(task_file) if sample['index'] not in pred_index]
+        # counted, so that n recorded predictions consume n pending samples if a key ever repeats
+        done = Counter(sample_key(sample) for sample in read_manifest(pred_file))
+        data = []
+        for sample in read_manifest(task_file):
+            key = sample_key(sample)
+            if done[key] > 0:
+                done[key] -= 1
+            else:
+                data.append(sample)
     else:
         data = read_manifest(task_file)
 
