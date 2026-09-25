@@ -245,6 +245,7 @@ like-for-like:
 `tools/throughput.py` measures prefill and decode speed, `tools/hard_tables.py` turns evaluation logs
 into markdown tables.  [gate_diagnostics.md](gate_diagnostics.md) measures what the training steps do to
 the swapped layers: how far the tiled per-channel gates spread, and which step moves the weights.
+[state_rank.md](state_rank.md) measures the rank of every head's memory state on real text.
 
 ## Results (Qwen3.5-0.8B, one seed)
 
