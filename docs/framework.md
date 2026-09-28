@@ -83,6 +83,27 @@ Then `tests/test_kernels.py` and `linswap verify --kernel <name> --baseline gdn`
 init is function preserving: every number should sit at the same level as the
 `gdn` column, which is pure Triton/bf16 noise.
 
+**Fit the gate rather than leaving it at the library's init.**  Where the target kernel's gate cannot
+hold the pretrained one exactly, fitting it is worth more than any amount of training that follows.
+`gla` is the worked example: FLA's `GatedLinearAttention` parameterises its decay as
+`logsigmoid(gk_proj x) / 16`, which cannot represent GDN's `-exp(A_log) softplus(a + dt_bias)`, so the
+kernel used to leave `gk_proj` at FLA's random init.  `kernels/gla.py::fit_gate` instead solves a
+per-head least squares in retention space over the range the pretrained gate actually occupies, then
+tiles the result across the head's channels.  The two inits differ by more than any training change
+measured in this project:
+
+| `gla` init | RULER task average, 4K / 16K / 64K / 128K | short context |
+|---|---|---|
+| FLA random gate | 87.5 / 64.8 / 43.2 / 1.6 | 94.3 |
+| per-head fit | 99.1 / 85.4 / 76.0 / 68.8 | 99.2 |
+
+**The layer step's initial loss is the number to watch.**  `linswap distill` prints it before deciding
+whether to run the step, and it separates the cases cleanly: 0 for an exact copy, ~5e-7 to 8e-7 for a
+function-preserving reparameterisation (`gdn2`, `kda`, `kda_fullgate`, `rwkv7`), 1.6e-2 for `gla`'s
+fitted gate, 1.8e-2 for `mamba2`, 1.1e-1 for `swa`.  Treat it as the fidelity of the init: driving it
+down by construction costs nothing at run time, and the training steps cannot buy back what a poor init
+gives away.
+
 ## KDA swap
 
 KDA (Kimi Linear, arXiv:2510.26692) is the gated delta rule with a
