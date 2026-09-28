@@ -24,7 +24,7 @@ The final checkpoint (``outputs/<kernel>/distill/checkpoint-N``) is what ``evalu
 score; no supervised fine-tuning follows.
 
 Every run writes ``train_log.jsonl`` and a TensorBoard run (``<output_dir>/tensorboard``, see
-``tools/tb_logger.py``): loss, grad norm (total and per parameter group: the kernel's new parameters,
+``linswap.tb_logger``): loss, grad norm (total and per parameter group: the kernel's new parameters,
 the swapped layers' shared projections, the rest of the backbone), lr, the per-layer losses of the
 ``layer`` step, and every ``--eval_every`` steps the validation loss, KL(teacher ‖ student) / top-1
 agreement / entropies on the held-out sequences and the groups' parameter norm, drift from the swap
@@ -36,7 +36,6 @@ from __future__ import annotations
 import itertools
 import json
 import math
-import sys
 import time
 from pathlib import Path
 
@@ -51,9 +50,8 @@ from ..registry import get_kernel
 from ..textdata import DEFAULT_TEXT_DIR, ensure_text_data
 from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn, evaluate
 
-sys.path.insert(0, str(REPO_ROOT / "tools"))
-from tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_grad_norms,  # noqa: E402
-                       group_param_norms, init_state, param_groups, snapshot, update_ratio)
+from ..tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_grad_norms, group_param_norms,
+                         init_state, param_groups, snapshot, update_ratio)
 
 STAGES = ("layer", "kl", "ce")
 # per-step defaults: sequence length, sequences per optimizer step, sequences per micro-batch, lr schedule

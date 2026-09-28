@@ -38,7 +38,7 @@ class TBLogger:
         try:
             from torch.utils.tensorboard import SummaryWriter
         except ImportError:
-            warnings.warn("TensorBoard logging disabled: `pip install tensorboard`")
+            warnings.warn('TensorBoard logging disabled: `pip install -e ".[tensorboard]"`')
             return
         self.writer = SummaryWriter(str(log_dir), purge_step=purge_step)
 
@@ -167,7 +167,7 @@ def evaluate_vs_teacher(student, teacher, dataloader, max_batches=10, chunk_size
                         pos_edges=(512, 2048)):
     """Teacher cross-entropy and :func:`distribution_stats` on the validation sequences, mean of
     per-batch values (the same convention as ``train_utils.evaluate``)."""
-    from linswap.train_utils import chunked_cross_entropy_eval
+    from .train_utils import chunked_cross_entropy_eval
 
     was_training = student.training
     student.eval()

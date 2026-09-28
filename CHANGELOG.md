@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-* **TensorBoard dashboard for `distill`** (`tools/tb_logger.py`, `--tensorboard_dir`, `--no_tensorboard`):
-  loss, grad norm, lr and the `layer` step's per-layer losses every step, with the gradient norm split
+* **TensorBoard dashboard for `distill`** (`linswap.tb_logger`, `--tensorboard_dir`, `--no_tensorboard`,
+  optional extra `.[tensorboard]`): loss, grad norm, lr and the `layer` step's per-layer losses every step, with the gradient norm split
   into the kernel's new parameters, the swapped layers' shared projections and the rest of the backbone;
   every `--eval_every` steps the validation loss, KL(teacher ‖ student), top-1 agreement and entropies
   on the held-out sequences (also per position bucket), and each group's parameter norm, drift from the
