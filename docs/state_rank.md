@@ -213,7 +213,7 @@ loss may be the recipe's rather than the swap's; the two students agreeing with 
 is consistent with either.  Rerunning `tools/state_rank.py` on a control checkpoint settles it.  Whether
 the loss costs anything is a separate question: the students match the control on short-context tasks
 and sit 4–11 points below it on the 128K distractor needle
-([framework.md](framework.md#results-qwen35-08b-one-seed)).
+([results.md](results.md#results-qwen35-08b-one-seed)).
 
 ## Reproduce
 

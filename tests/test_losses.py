@@ -4,7 +4,7 @@
 chunks and run the backward themselves, so no framework checks them.  The original SFT loss
 scaled the LM-head gradient by the token *sum* and the hidden-state gradient by the token
 *mean*; the LM head is tied to the embedding, so the tied matrix took a step several orders of
-magnitude too large and the pre-clip gradient norm sat near 1000 (docs/framework.md).  These
+magnitude too large and the pre-clip gradient norm sat near 1000 (docs/results.md).  These
 checks reproduce that setting -- tied head, masked prompt, right padding, uneven chunks -- and
 compare loss, hidden-path gradient and tied-matrix gradient against dense autograd.
 

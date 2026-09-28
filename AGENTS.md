@@ -1,5 +1,6 @@
 See README.md for the project layout and workflow, docs/framework.md for the
-kernel-swap design and results, and docs/original_task.md for the original
+framework and an index of the other notes (kernels.md, recipe.md, results.md,
+gate_diagnostics.md, state_rank.md), and docs/original_task.md for the original
 task statement (GDN→GDN2 swap; now generalised).  Work autonomously.
 
 Git: never attribute a commit to an agent.  No `Co-authored-by: Cursor

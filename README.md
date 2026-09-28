@@ -29,7 +29,7 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 An **exact** kernel contains Gated DeltaNet as a special case, so at step 0 the swapped layer
 reproduces the original to bf16 noise; the rest have more to recover. Only the *sequence mixer* is
 replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
-0.8B backbone; `docs/framework.md` has the per-kernel mappings.
+0.8B backbone; `docs/kernels.md` has the per-kernel mappings.
 
 <sub>‡ needs as many value heads as key heads. ¶ not linear attention: sliding-window softmax with
 sinks (arXiv 2608.28444) over the same projections, bounded 68-key state; window / sinks / RoPE from
@@ -159,7 +159,7 @@ Backbone Qwen3.5-0.8B, one seed, identical recipe for every row: 700M tokens of
 DCLM, no SFT, base-prompt evaluation.  The **control** is the *unswapped*
 backbone put through the same three steps — without it the students' gains over
 the unmodified backbone would be read as a kernel effect when they are the
-recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
+recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
 
 **Long-context retrieval** (`niah_single_1` / `_2` / `_3` / `niah_multikey_1`, 500 samples)
 
@@ -237,8 +237,8 @@ Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, co
 | `rwkv7`  | 79K / 76K         | 33.3          | 2.7 / 6.1     |
 
 
-Full tables, the per-kernel mappings and the approaches that were tried and dropped:
-[docs/framework.md](docs/framework.md).
+Full tables and the approaches that were tried and dropped: [docs/results.md](docs/results.md).
+Per-kernel mappings: [docs/kernels.md](docs/kernels.md).
 
 ## Citation
 

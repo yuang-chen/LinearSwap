@@ -12,7 +12,7 @@ answer them:
    `kl`, `ce`) with very different budgets and learning rates; the weights say which one does the work.
 
 All numbers: Qwen3.5-0.8B backbone, one seed, the standard recipe in
-[framework.md](framework.md#distillation-linswap-distill).
+[recipe.md](recipe.md#distillation-linswap-distill).
 
 ## Definitions
 
@@ -49,7 +49,7 @@ same value can mean repair or damage, which is what table C separates.
 
 `S(W)` at init and after the full recipe, with the `layer` step run and with it skipped.  Every row
 starts at exactly `0.0000`.  (`gla` is inexact, so it never skips the step — see the skip rule in
-[framework.md](framework.md#distillation-linswap-distill).)
+[recipe.md](recipe.md#distillation-linswap-distill).)
 
 | kernel | gate | init | final, `layer` step run | final, `layer` step skipped |
 |---|---|---|---|---|
