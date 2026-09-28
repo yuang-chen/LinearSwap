@@ -41,6 +41,18 @@
 * `evaluate` puts the repo root on `PYTHONPATH` for the RULER subprocesses, so repo-local kernel
   packages (`gated_breg_delta_rule`) register there too; before, `gdn_breg` checkpoints produced no
   predictions.
+* **The `layer` step skips itself when there is nothing to align** (`--layer_skip_below`, default
+  1e-4).  An exact init starts that step at bf16 noise (~1e-6), and Adam's normalised update at
+  lr 1e-3 walks the weights 18-20 % of their norm away from a function-preserving solution: its own
+  objective rises three orders of magnitude and validation degrades ~0.16 nats.  Skipping it is worth
+  9-11 points on the 128K distractor needle (`gdn2` 86.8 -> 96.4, `kda` 85.6 -> 96.4, `rwkv7`
+  86.6 -> 96.2, `kda_fullgate` 92.4 -> 96.6, control 96.8) and puts every exact-init kernel on the
+  control on both suites.  `gla`, `mamba2`, `swa` and `deltanet` start at 1.6e-2 to 1.1e-1 and run it.
+* **Two earlier conclusions are retracted.**  "An exact init costs 4-11 points at 128K" and "KDA's
+  low-rank decay gate costs retrieval" were both artifacts of that step; with it skipped the four
+  exact-init kernels are indistinguishable from the control and from each other.  The per-channel
+  gate spread they showed (S = 0.09-0.30) was drift from the same step, not learned structure: the
+  better checkpoints sit at 0.005-0.011.  `docs/gate_diagnostics.md` has the measurements.
 * **RULER results are now at 500 samples per task** (the standard count) instead of 50, for the
   teacher, the `gdn` control, `gdn2`, `kda`, `kda_fullgate`, `rwkv7`, `mamba2`, `swa`, `gla` and
   `deltanet` — every row in both tables.  At 50 samples the binomial

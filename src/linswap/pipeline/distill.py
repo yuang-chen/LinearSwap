@@ -95,6 +95,9 @@ def add_args(ap):
     ap.add_argument("--val_length", type=int, default=8192, help="length of the held-out packed sequences")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--ce_chunk_size", type=int, default=2048)
+    ap.add_argument("--layer_skip_below", type=float, default=1e-4,
+                    help="skip the layer step when its loss on the first batch is already below this "
+                         "(a function-preserving swap has nothing to align); 0 always runs it")
     ap.add_argument("--init_from", default=None,
                     help="resume from this checkpoint dir: finished steps are skipped and a partial one continues "
                          "on the same data (optimizer state restarts)")
@@ -123,6 +126,19 @@ def checkpoint_config(model, args, stage="distill"):
         "new_param_names": list(model.new_param_names),
     })
     return cfg
+
+
+@torch.no_grad()
+def layer_alignment_loss(teacher, student, ids):
+    """The layer step's own objective on one batch, without training: how far the swapped mixers sit
+    from the teacher's on the teacher's own input."""
+    student.eval()
+    t_in, t_out = teacher_layer_io(teacher, ids)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = sum(F.mse_loss(b.linear_attn(t_in[i])[0].float(), t_out[i].float())
+                   for i, b in linear_blocks(student))
+    student.train()
+    return float(loss)
 
 
 def log_jsonl(path, record):
@@ -383,6 +399,19 @@ def main(args) -> Path:
         if done:
             print(f"[distill] step={stage}: fast-forwarding the data past {done} steps", flush=True)
         loader = packed_loader(raw_train, length, micro, args.seed + step, skip=done * micro * accum)
+        if stage == "layer" and not done and args.layer_skip_below > 0:
+            # An exact init starts this step at bf16 noise (~1e-6) with nothing to learn, and Adam's
+            # normalised update at lr 1e-3 then walks the weights away from a function-preserving
+            # solution: the objective rises, and the model does not recover it in the later steps.
+            probe = layer_alignment_loss(teacher, student, next(iter(loader))["input_ids"].to(device))
+            if probe < args.layer_skip_below:
+                print(f"[distill] step=layer: skipped (initial loss {probe:.2e} < {args.layer_skip_below:.0e}, "
+                      f"the swap already reproduces the teacher's layers)", flush=True)
+                log_jsonl(log_path, {"stage": "layer", "step": step, "skipped": True, "initial_loss": probe})
+                step += steps          # keep the step counter, data order and checkpoint numbering unchanged
+                continue
+            print(f"[distill] step=layer: initial loss {probe:.2e} >= {args.layer_skip_below:.0e}, running it",
+                  flush=True)
         step = run_stage(stage, args, teacher, student, loader, teacher_ref, out_dir, log_path, step, steps,
                          length, micro, accum, schedule, done, tb=tb, init_sd=init_sd)
     ckpt = save(student, args, out_dir, step)
