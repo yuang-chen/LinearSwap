@@ -163,27 +163,41 @@ def distribution_stats(s_hidden, t_hidden, s_head, t_head, chunk_size=2048, temp
 
 
 @torch.no_grad()
-def evaluate_vs_teacher(student, teacher, dataloader, max_batches=10, chunk_size=2048, temperature=1.0,
-                        pos_edges=(512, 2048)):
-    """Teacher cross-entropy and :func:`distribution_stats` on the validation sequences, mean of
-    per-batch values (the same convention as ``train_utils.evaluate``)."""
+def teacher_reference(teacher, dataloader, max_batches=10, chunk_size=2048):
+    """The teacher's side of every validation comparison, computed once per run.  The teacher is frozen and
+    the validation sequences are fixed (``fixed_packed_val``), so its final hidden states and its loss do not
+    change between evaluations; keeping the hidden states (batches x length x d_model, bf16: ~170 MB at the
+    defaults on Qwen3.5-0.8B) replaces a teacher forward pass at every ``--eval_every`` step."""
     from .train_utils import chunked_cross_entropy_eval
 
-    was_training = student.training
-    student.eval()
-    device = next(student.parameters()).device
-    total, count = {}, 0
+    device = next(teacher.parameters()).device
+    batches, total = [], 0.0
     for i, batch in enumerate(dataloader):
         if i >= max_batches:
             break
         ids, labels = batch["input_ids"].to(device), batch["labels"].to(device)
+        hidden = teacher(ids, return_hidden=True)
+        total += chunked_cross_entropy_eval(hidden, labels, teacher.lm_head, chunk_size=chunk_size)
+        batches.append((ids, labels, hidden))
+    return {"batches": batches, "lm_head": teacher.lm_head, "loss": total / max(len(batches), 1)}
+
+
+@torch.no_grad()
+def evaluate_vs_teacher(student, ref, chunk_size=2048, temperature=1.0, pos_edges=(512, 2048)):
+    """One student pass over the validation sequences of ``ref`` (:func:`teacher_reference`): ``val_loss`` and
+    :func:`distribution_stats` against the cached teacher, each the mean of per-batch values (the convention
+    of ``train_utils.evaluate``, whose ``val_loss`` this reproduces)."""
+    from .train_utils import chunked_cross_entropy_eval
+
+    was_training = student.training
+    student.eval()
+    total = {}
+    for ids, labels, t_hidden in ref["batches"]:
         s_hidden = student(ids, return_hidden=True)
-        t_hidden = teacher(ids, return_hidden=True)
-        stats = distribution_stats(s_hidden, t_hidden, student.lm_head, teacher.lm_head, chunk_size, temperature, pos_edges)
-        stats["teacher_loss"] = chunked_cross_entropy_eval(t_hidden, labels, teacher.lm_head, chunk_size=chunk_size)
+        stats = distribution_stats(s_hidden, t_hidden, student.lm_head, ref["lm_head"], chunk_size, temperature, pos_edges)
+        stats["val_loss"] = chunked_cross_entropy_eval(s_hidden, labels, student.lm_head, chunk_size=chunk_size)
         for k, v in stats.items():
             total[k] = total.get(k, 0.0) + v
-        count += 1
     if was_training:
         student.train()
-    return {k: v / max(count, 1) for k, v in total.items()}
+    return {k: v / max(len(ref["batches"]), 1) for k, v in total.items()}

@@ -48,10 +48,10 @@ from torch.utils.data import DataLoader
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model
 from ..registry import get_kernel
 from ..textdata import DEFAULT_TEXT_DIR, ensure_text_data
-from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn, evaluate
+from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn
 
 from ..tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_grad_norms, group_param_norms,
-                         init_state, param_groups, snapshot, update_ratio)
+                         init_state, param_groups, snapshot, teacher_reference, update_ratio)
 
 STAGES = ("layer", "kl", "ce")
 # per-step defaults: sequence length, sequences per optimizer step, sequences per micro-batch, lr schedule
@@ -187,7 +187,7 @@ def stage_steps(args, stage, length, micro, accum):
 
 
 # --------------------------------------------------------------------- steps
-def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step0, steps,
+def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir, log_path, step0, steps,
               seq_length, micro, accum, schedule, done=0, tb=None, init_sd=None):
     device = next(student.parameters()).device
     lr = getattr(args, f"{stage}_lr")
@@ -267,13 +267,10 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
         tb.scalars(group_gn, gstep, "grad_norm/")
         tb.scalars({f"layer_{i}": v for i, v in layer_acc.items()}, gstep, "layer_loss/")
         if diag:
-            student.eval()
-            val = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
-            student.train()
+            stats = evaluate_vs_teacher(student, teacher_ref, args.ce_chunk_size)
+            val = stats["val_loss"]
             print(f"  {tag} step {step}: val_loss={val:.4f}", flush=True)
             log_jsonl(log_path, {"stage": tag, "step": step0 + step, "val_loss": val})
-            stats = {"val_loss": val, **evaluate_vs_teacher(student, teacher, val_loader, args.eval_batches,
-                                                            args.ce_chunk_size)}
             pstats = {"update_ratio": update_ratio(groups, before), "norm": group_param_norms(groups),
                       "drift_from_init": drift_from_init(groups, init_sd) if init_sd else {}}
             del before
@@ -363,15 +360,15 @@ def main(args) -> Path:
     init_sd = init_state(build_model(args.kernel, base_model_dir=args.base_model_dir, device="cpu")
                          if args.init_from else student)
 
-    val_t = evaluate(teacher, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
-    val0 = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
+    teacher_ref = teacher_reference(teacher, val_loader, args.eval_batches, args.ce_chunk_size)
+    stats0 = evaluate_vs_teacher(student, teacher_ref, args.ce_chunk_size)
+    val_t, val0 = teacher_ref["loss"], stats0["val_loss"]
     print(f"  step {step}: val_loss={val0:.4f} (teacher {val_t:.4f})" + (f" [from {args.init_from}]" if args.init_from else ""))
     log_jsonl(log_path, {"stage": "init" if not args.init_from else "resume", "step": step, "val_loss": val0,
                          "teacher_val_loss": val_t})
     groups0 = param_groups(student, list(student.parameters()))
     log_diagnostics(tb, log_path, "init" if not args.init_from else "resume", step,
-                    {"val_loss": val0, **evaluate_vs_teacher(student, teacher, val_loader, args.eval_batches,
-                                                             args.ce_chunk_size)},
+                    {**stats0, "teacher_loss": val_t},
                     {"norm": group_param_norms(groups0), "drift_from_init": drift_from_init(groups0, init_sd)})
 
     resume, step = step, 0
@@ -386,7 +383,7 @@ def main(args) -> Path:
         if done:
             print(f"[distill] step={stage}: fast-forwarding the data past {done} steps", flush=True)
         loader = packed_loader(raw_train, length, micro, args.seed + step, skip=done * micro * accum)
-        step = run_stage(stage, args, teacher, student, loader, val_loader, out_dir, log_path, step, steps,
+        step = run_stage(stage, args, teacher, student, loader, teacher_ref, out_dir, log_path, step, steps,
                          length, micro, accum, schedule, done, tb=tb, init_sd=init_sd)
     ckpt = save(student, args, out_dir, step)
     tb.close()
