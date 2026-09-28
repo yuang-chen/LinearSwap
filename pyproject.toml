@@ -24,6 +24,7 @@ dependencies = [
     "huggingface_hub",
     "datasets",
     "numpy",
+    "tensorboard",
 ]
 
 [project.optional-dependencies]

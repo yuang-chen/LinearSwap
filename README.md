@@ -126,6 +126,10 @@ Adam(0.9, 0.95), clip 1.0, bf16, about 6 GPU-hours per kernel at 0.8B. The first
 swapped layers, the other two everything. Budgets are tokens (`--kl_tokens 250e6`); every per-step
 knob is a flag.
 
+Each run writes `outputs/<kernel>/distill/train_log.jsonl` and a TensorBoard run next to it:
+`tensorboard --logdir outputs` overlays the kernels' loss, grad norm (total and per parameter group),
+lr, validation KL(teacher ‖ student) and the swapped layers' drift from their init.
+
 Evaluation runs on the students *and* on the unmodified backbone:
 
 ```bash

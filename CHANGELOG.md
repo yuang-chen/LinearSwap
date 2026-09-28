@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+* **TensorBoard dashboard for `distill`** (`tools/tb_logger.py`, `--tensorboard_dir`, `--no_tensorboard`):
+  loss, grad norm, lr and the `layer` step's per-layer losses every step, with the gradient norm split
+  into the kernel's new parameters, the swapped layers' shared projections and the rest of the backbone;
+  every `--eval_every` steps the validation loss, KL(teacher ‖ student), top-1 agreement and entropies
+  on the held-out sequences (also per position bucket), and each group's parameter norm, drift from the
+  swap init and update size.  A resumed run purges the events past its checkpoint and measures drift
+  from the swap init, not the checkpoint.  The same scalars go into `train_log.jsonl`.
 * **The pipeline is now verify → distill → evaluate.**  Distillation is three steps on generic web text
   (DCLM by default): layer-output alignment (100M tokens, length 512, lr 1e-3 cosine, swapped layers only),
   logit KL (500M tokens, length 512, lr 1e-5, all parameters) and context extension by plain
