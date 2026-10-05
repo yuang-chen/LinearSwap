@@ -16,8 +16,7 @@ src/linswap/
   kernels/base.py      BackboneMixer: projections + convs + cache + gated norm around an FLA op (custom recurrences)
   kernels/gdn.py       "gdn"          original GDN on FLA kernels (exact copy; control and distillation teacher)
   kernels/gdn2.py      "gdn2"         Gated DeltaNet-2 (scalar beta/decay tiled into b/w/f gates)
-  kernels/kda.py       "kda"          Kimi Delta Attention, low-rank per-channel decay gate (default KDA)
-                       "kda_fullgate" KDA with a dense decay projection
+  kernels/kda.py       "kda"          Kimi Delta Attention, low-rank per-channel decay gate (as in Kimi Linear)
   kernels/rwkv7.py     "rwkv7"        RWKV-7 generalised delta rule (DPLR kernel), exact tiled init
   kernels/mamba2.py    "mamba2"       Mamba-2 SSD on the simple-GLA kernel — inexact swap (exact_init=False)
   kernels/deltanet.py  "deltanet"     DeltaNet, no decay — inexact swap
@@ -109,7 +108,7 @@ measured in this project:
 
 **The layer step's initial loss is the number to watch.**  `linswap distill` prints it before deciding
 whether to run the step, and it separates the cases cleanly: 0 for an exact copy, ~5e-7 to 8e-7 for a
-function-preserving reparameterisation (`gdn2`, `kda`, `kda_fullgate`, `rwkv7`), 1.6e-2 for `gla`'s
+function-preserving reparameterisation (`gdn2`, `kda`, `rwkv7`), 1.6e-2 for `gla`'s
 fitted gate, 1.8e-2 for `mamba2`, 1.1e-1 for `swa`.  Treat it as the fidelity of the init: driving it
 down by construction costs nothing at run time, and the training steps cannot buy back what a poor init
 gives away.

@@ -24,8 +24,8 @@ projection carry over unchanged.
 The tiled decay matrix has rank ≤ 16 ≤ 128, so it fits KDA's low-rank
 `f_proj` *exactly*; the 112 unused bottleneck dimensions get `W2[:,16:]=0`,
 which keeps them invisible at init but gives them non-zero gradient so
-distillation can use the extra rank.  `kda_fullgate` uses a dense 2048×1024 `f_proj`
-instead.  New parameters: 7.4M (`kda`) / 38M (`kda_fullgate`) vs 113M for GDN2.
+distillation can use the extra rank.  This is Kimi Linear's own gate parameterisation, kept as
+FLA ships it.  New parameters: 7.4M vs 113M for GDN2.
 
 ### Verification (`linswap verify --kernel kda --baseline gdn`)
 

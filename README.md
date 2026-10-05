@@ -18,7 +18,6 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 | `gdn`          | Gated DeltaNet                            | weight copy (control, distillation teacher)       | 0.6M       | yes        |
 | `rwkv7`        | RWKV-7 generalised delta rule (DPLR)      | gates tiled, removal key = key                    | 14M        | yes        |
 | `kda`          | Kimi Delta Attention                      | decay tiled into the low-rank gate                | 7.4M       | yes        |
-| `kda_fullgate` | Kimi Delta Attention                      | … with a dense decay projection                   | 38M        | yes        |
 | `gdn2`         | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                     | 113M       | yes ‡      |
 | `mamba2`       | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped              | 0.3M       | no         |
 | `deltanet`     | DeltaNet (erase, no decay)                | shared weights copied, decay dropped              | 0.3M       | no         |
@@ -125,7 +124,7 @@ instruction data, no chat template, no supervised fine-tuning:
 The `layer` step measures its own loss on one batch before training and **skips itself** when that loss
 is below `--layer_skip_below` (1e-4): a swap that already reproduces the pretrained layer to bf16 noise
 has nothing to align, and training it there degrades the model instead of improving it.  In practice
-`gdn`, `gdn2`, `kda`, `kda_fullgate` and `rwkv7` skip it (initial loss 0 to 8e-7) while `gla`, `mamba2`,
+`gdn`, `gdn2`, `kda` and `rwkv7` skip it (initial loss 0 to 8e-7) while `gla`, `mamba2`,
 `swa` and `deltanet` run it (1.6e-2 to 1.1e-1).
 
 Adam(0.9, 0.95), clip 1.0, bf16, about 6 GPU-hours per kernel at 0.8B. The first step trains the
@@ -167,7 +166,6 @@ recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
 |---|---|---|---|---|
 | unmodified backbone | 96.4 / 65.0 / 97.8 / 79.4 | 98.4 / 76.2 / 90.6 / 81.6 | 96.4 / 98.4 / 94.6 / 91.8 | 99.2 / 91.6 / 96.6 / 91.0 |
 | control (`gdn`, same recipe) | 100 / 100 / 98.6 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.8 |
-| `kda_fullgate` (exact init) | 100 / 100 / 96.8 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 99.8 / 96.6 |
 | `gdn2` (exact init) | 100 / 100 / 94.2 / 100 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
 | `rwkv7` (exact init) | 100 / 100 / 96.0 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.2 |
 | `kda` (exact init) | 100 / 100 / 99.2 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
@@ -182,7 +180,6 @@ recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
 |---|---|---|---|---|---|---|---|---|
 | unmodified backbone | 0.437 | 0.374 | 0.611 | 0.693 | 0.583 | 0.496 | 0.504 | 100.0 |
 | control (`gdn`) | 0.476 | 0.402 | 0.649 | 0.704 | 0.589 | 0.525 | 0.515 | 110.1 |
-| `kda_fullgate` | 0.479 | 0.399 | 0.655 | 0.706 | 0.592 | 0.525 | 0.513 | **110.7** |
 | `gdn2` | 0.479 | 0.398 | 0.652 | 0.706 | 0.590 | 0.524 | 0.516 | 110.2 |
 | `kda` | 0.478 | 0.399 | 0.651 | 0.705 | 0.590 | 0.525 | 0.514 | 110.2 |
 | `rwkv7` | 0.480 | 0.399 | 0.655 | 0.704 | 0.590 | 0.525 | 0.513 | 110.3 |
@@ -191,7 +188,7 @@ recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
 | `gla` | 0.463 | 0.362 | 0.612 | 0.701 | 0.579 | 0.514 | 0.484 | 99.2 |
 | `deltanet` | 0.382 | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
-The short-context suite scores every task in full.  The `kda` / `kda_fullgate` / `gla` / `deltanet`
+The short-context suite scores every task in full.  The `kda` / `gla` / `deltanet`
 rows come from a second batch, run months later on freshly tokenised DCLM; its own control reproduced
 the published 110.0 at 110.1, which is what licenses one table.
 
@@ -200,18 +197,17 @@ What the numbers say:
 - **The recipe, not the kernel, is what lifts a swapped model above the original.**  The control gains
   as much as the students on both suites, so the question a swap has to answer is what it costs *on top
   of the same training*.
-- **An exact init is free.**  All four exact-init kernels land on the control on both suites: relative
-  average 110.2–110.7 against 110.1, and the 128K distractor needle 96.2–96.6 against 96.8.  What the
+- **An exact init is free.**  All three exact-init kernels land on the control on both suites: relative
+  average 110.2–110.3 against 110.1, and the 128K distractor needle 96.2–96.4 against 96.8.  What the
   target recurrence *is* matters far less than whether the pretrained function survives the change of
   parameterisation.
-- **A richer gate buys nothing.**  `kda` and `kda_fullgate` differ only in whether the decay factors
-  through a rank-128 bottleneck or a dense projection, and `gdn2` adds 113M parameters of separate
-  erase and write gates: all three finish within 0.5 relative points of each other and of the control,
-  at every needle length.
-- **Those two readings used to say the opposite**, because the `layer` step was damaging them.  It is
-  skipped for an exact init now (see [Pipeline](#pipeline)); under the old recipe the same four kernels
-  scored 85.6–92.4 at 128K and `kda_fullgate` appeared to lead `kda` by 6.8 points there.  The deficit
-  and the ordering were both artifacts of the step, not properties of the kernels.
+- **A richer gate buys nothing.**  `gdn2` adds 113M parameters of separate erase and write gates to
+  `kda`'s 7.4M low-rank per-channel decay: the two finish within 0.2 relative points of each other and
+  of the control, and their needle task averages match the control to 0.1 from 16K on (`gdn2` trails it
+  by 1.0 at 4K, on `niah_single_3`).
+- **The exact kernels used to look costly at 128K**, because the `layer` step was damaging them.  It is
+  skipped for an exact init now (see [Pipeline](#pipeline)); under the old recipe the same three kernels
+  scored 85.6–86.8 at 128K.  The deficit was an artifact of the step, not a property of the kernels.
 - **Dropping the delta-rule erase costs.**  `mamba2` trails the control by 8.6 relative points and
   loses the distractor needle at 128K (70.0 vs 96.2).
 - **A 64-token window holds short context, not retrieval.**  `swa` scores 101.0 relative but decays
