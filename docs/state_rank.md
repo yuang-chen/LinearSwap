@@ -207,13 +207,15 @@ Median numerical rank at 16K tokens, `gdn / gdn2 / kda`; **bold** = at most 20 i
   `gdn2`, 8 in `kda`).
 
 **Open: swap or recipe?**  The reference here is the unmodified backbone, not the control (the backbone
-put through the same three distillation steps), whose checkpoint is not kept.  The framework results
-show the recipe alone moves the control as much as the students on both benchmark suites, so the rank
-loss may be the recipe's rather than the swap's; the two students agreeing with each other this closely
-is consistent with either.  Rerunning `tools/state_rank.py` on a control checkpoint settles it.  Whether
-the loss costs anything is a separate question: the students match the control on short-context tasks
-and sit 4–11 points below it on the 128K distractor needle
-([results.md](results.md#results-qwen35-08b-one-seed)).
+put through the same three distillation steps, `outputs/radlads/gdn/distill/checkpoint-16338`), which
+has not been measured yet.  The results show the recipe alone moves the control as much as the students
+on both benchmark suites, so the rank loss may be the recipe's rather than the swap's; the two students
+agreeing with each other this closely is consistent with either.  Running `tools/state_rank.py` on the
+control settles it.  Whether the loss costs anything is a separate question.  The `gdn2` and `kda`
+checkpoints measured here ran the `layer` step and sit 9–10 points below the control on the 128K
+distractor needle (86.8 and 85.6 against 96.2); the recipe now skips that step for exact-init kernels,
+and those runs (`outputs/{gdn2,kda}_nolayer/distill/checkpoint-10235`) match the control at 96.4
+([results.md](results.md#results-qwen35-08b-one-seed)).  Their state ranks have not been measured.
 
 ## Reproduce
 
