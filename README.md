@@ -139,7 +139,8 @@ linswap lmeval   --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
 python tools/throughput.py --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
 ```
 
-- **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` at 4K–128K, 500 samples,
+- **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` (retrieval), `vt` (multi-hop
+variable tracking), `cwe` / `fwe` (common / frequent words extraction) at 4K–128K, 500 samples,
 cached greedy decoding, RULER's base prompt template (`--chat_template` switches).
 - **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot and MMLU 5-shot,
 reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.

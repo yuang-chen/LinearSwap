@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+* **RULER `vt`, `cwe`, `fwe` join the default evaluation tasks** (variable tracking, common / frequent
+  words extraction), scored as upstream RULER and lm-eval score them (case-insensitive substring
+  recall, full generation budget, no stop words).
+* `evaluate` falls back to `--base_model_dir` when a checkpoint's recorded `base_model_dir` does not
+  exist (a checkpoint trained on another machine) and passes the resolved directory to the RULER
+  wrapper (`LINSWAP_BASE_MODEL_DIR`); a task whose data RULER fails to generate is reported as failed
+  instead of surfacing as a missing file, and a length where every task failed no longer aborts the run.
+* RULER subprocesses cap the tokenizer (rayon) and OpenMP pools at 4 threads (`RAYON_NUM_THREADS`,
+  `OMP_NUM_THREADS`, overridable): several evaluations in parallel on a 224-core host exhausted thread
+  creation.  At 128K a `--ruler_jobs 3` evaluation peaks near 30 GiB per process (`rwkv7`), so three of
+  them on one 140 GiB GPU can run out of memory.
 * **TensorBoard dashboard for `distill`** (`linswap.tb_logger`, `--tensorboard_dir`, `--no_tensorboard`,
   optional extra `.[tensorboard]`): loss, grad norm, lr and the `layer` step's per-layer losses every step, with the gradient norm split
   into the kernel's new parameters, the swapped layers' shared projections and the rest of the backbone;

@@ -233,8 +233,11 @@ kernel at 0.8B on one L20X; the checkpoint under `outputs/<kernel>/distill/` is 
 Two suites, both applied to the students *and* to the unmodified backbone so the comparison is
 like-for-like:
 
-* **Long-context retrieval** (`linswap evaluate`): RULER's needle tasks `niah_single_1/2/3` and
-  `niah_multikey_1` at 4K / 16K / 64K / 128K, 500 samples each, cached greedy decoding.  Prompts use
+* **Long context** (`linswap evaluate`): RULER's needle tasks `niah_single_1/2/3` and
+  `niah_multikey_1`, plus `vt` (follow a 4-hop chain of variable assignments through noise) and `cwe` /
+  `fwe` (name the most common words of a list / coded text — aggregation over the whole context rather
+  than retrieval of one span), at 4K / 16K / 64K / 128K, 500 samples each, cached greedy decoding,
+  scored as upstream RULER does (case-insensitive substring recall, no stop words).  Prompts use
   RULER's own base template (context, question, answer prefix); `--chat_template` switches to the
   backbone's chat format.  Since the students never see an instruction format during distillation,
   base prompting is the setting in which teacher and student are scored the same way.
@@ -270,6 +273,42 @@ students' gains over the teacher cannot be attributed to the kernel.
 
 500 samples puts the binomial 95% interval at about ±3 points.  `mamba1` and `mamba3` are not being
 carried forward, so their rows are gone from both tables; the kernels stay in the registry.
+
+**RULER aggregation** (`vt` / `cwe` / `fwe`, 500 samples, same protocol).  Each kernel's best
+checkpoint: for the exact kernels and the control that is the recipe without the `layer` step
+(`outputs/<kernel>_nolayer/distill/checkpoint-10235`, KL + CE only), the others are the full recipe above.  These runs cut each prediction where the
+model restarted the task prompt; regenerating 1,800 paired samples without the cut (control, `mamba2`,
+`gla` at 16K and 128K) changed 4 sample scores and no cell by more than 0.3, so the table stands for
+standard RULER scoring, which is what `evaluate` now uses.
+
+| model | 4K | 16K | 64K | 128K |
+|---|---|---|---|---|
+| control (`gdn`, no layer) | 90.9 / 62.5 / 87.8 | 70.8 / 68.6 / 88.5 | 50.6 / 30.7 / 76.3 | 68.6 / 8.5 / 88.2 |
+| `gdn2` (no layer) | 91.8 / 63.9 / 86.1 | 71.0 / 70.6 / 86.5 | 50.6 / 26.0 / 75.7 | 67.6 / 5.0 / 85.9 |
+| `kda` (no layer) | 90.0 / 62.5 / 85.5 | 71.6 / 69.2 / 83.6 | 51.4 / 31.4 / 75.5 | 69.5 / 11.2 / 84.4 |
+| `kda_fullgate` (no layer) | 90.0 / 63.3 / 86.4 | 71.0 / 69.3 / 85.5 | 53.6 / 30.6 / 76.0 | 70.5 / 7.4 / 85.9 |
+| `rwkv7` (no layer) | 89.8 / 60.6 / 85.1 | 65.0 / 68.7 / 84.0 | 45.5 / 27.7 / 76.4 | 66.4 / 3.9 / 88.1 |
+| `mamba2` | 78.2 / 38.0 / 67.9 | 36.8 / 4.0 / 71.1 | 19.8 / 0.8 / 60.4 | 19.6 / 0.4 / 51.0 |
+| `swa` | 37.6 / 37.1 / 76.7 | 23.7 / 1.4 / 54.1 | 28.6 / 0.6 / 63.3 | 7.2 / 0.4 / 69.5 |
+| `gla` | 38.8 / 24.7 / 68.9 | 1.6 / 7.3 / 42.3 | 0.2 / 0.3 / 29.9 | 0.2 / 0.1 / 21.3 |
+| `deltanet` | 51.4 / 19.9 / 12.7 | 18.7 / 3.5 / 9.5 | 0.0 / 0.0 / 0.0 | 0.0 / 0.1 / 0.0 |
+
+- These tasks separate the kernels from 4K on, where the needles do not.  On the three-task average the
+  four exact kernels stay within 3.4 points of the control at every length (largest single-cell gaps:
+  `rwkv7` `vt` −5.7 at 16K, `gdn2` `cwe` −4.6 at 64K, `kda` `fwe` −4.9 at 16K); the inexact kernels
+  are 19 (`mamba2`) to 52 (`deltanet`) points down on the average at 4K already.
+- `cwe` collapses with length for every model, the control included (8.5 at 128K): 30 repeats of the
+  ten common words among ~5.5K distractor words (17K list entries at 128K) is past what this 0.8B backbone counts, so beyond 16K `cwe`
+  measures the backbone, not the swap.
+- `vt` dips at 64K and recovers at 128K for the control and every exact kernel.  It is not the sample
+  set: a fresh draw (seed 43, 100 samples) gives the control 54.6 at 64K and 66.2 at 128K.  The
+  dip is one failure mode: the model answers in the 3-letter format of the few-shot example's
+  variables instead of naming the queried chain — 91 of the control's 131 zero-score answers at 64K,
+  16 of 46 at 128K.
+  (`fwe`'s 64K dip mostly is the sample set: 80.0 vs 82.0 on the fresh draw.)
+- `fwe` is the one task a short window can partly solve: under a zeta(2) word distribution the top
+  three words dominate any local window, so `swa` holds 54–77 while its `vt` and `cwe` collapse.
+- `deltanet` fails even at 4K: it loops on one word (`likeness likeness …`, `... ... ...`).
 
 **Short context**, accuracy and relative score against the teacher in %:
 

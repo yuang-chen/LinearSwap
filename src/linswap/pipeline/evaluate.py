@@ -27,7 +27,8 @@ from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model, read_
 from ..registry import get_kernel, list_kernels
 
 RULER_DIR = REPO_ROOT / "RULER" / "scripts"
-DEFAULT_TASKS = "niah_single_1,niah_single_2,niah_single_3,niah_multikey_1"
+# needles (retrieval), then variable tracking and common / frequent words extraction (aggregation over the context)
+DEFAULT_TASKS = "niah_single_1,niah_single_2,niah_single_3,niah_multikey_1,vt,cwe,fwe"
 
 
 def add_args(ap):
@@ -67,23 +68,33 @@ def _resolve_model(spec: str, base_model_dir):
     kernel = cfg.get("linear_kernel") or read_checkpoint_kernel(d)
     step = d.name.split("-")[-1] if d.name.startswith("checkpoint-") else d.name
     mode = cfg.get("sft_mode", "sft").replace("gate_only", "gate")
-    return f"{kernel}-{mode}-{step}", kernel, Path(cfg.get("base_model_dir", base_model_dir)).resolve(), d
+    base = Path(cfg.get("base_model_dir", base_model_dir))
+    if not base.is_absolute():  # checkpoint configs may record repo-relative paths
+        base = REPO_ROOT / base
+    if not (base / "config.json").exists():  # e.g. a checkpoint trained on another machine
+        print(f"[evaluate] {d}: recorded base_model_dir {base} not found, using {base_model_dir}")
+        base = Path(base_model_dir)
+    return f"{kernel}-{mode}-{step}", kernel, base.resolve(), d
 
 
 # ------------------------------------------------------------------------------ RULER
-def _ruler_env():
-    env = dict(os.environ)
+def _ruler_env(extra=None):
+    env = dict(os.environ, **(extra or {}))
+    # the tokenizer's rayon pool and torch's OpenMP pool default to one thread per core: several evaluations
+    # at once (each with --ruler_jobs processes) then exhaust thread creation on a many-core host (EAGAIN)
+    for var in ("RAYON_NUM_THREADS", "OMP_NUM_THREADS"):
+        env.setdefault(var, "4")
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     # repo-local kernel packages (e.g. gated_breg_delta_rule) are not installed; RULER runs from its own cwd
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO_ROOT), env.get("PYTHONPATH")) if p)
     return env
 
 
-def _run(cmd, log_file):
+def _run(cmd, log_file, env=None):
     with open(log_file, "a") as log:
         log.write("\n$ " + " ".join(map(str, cmd)) + "\n")
         log.flush()
-        r = subprocess.run([str(c) for c in cmd], cwd=RULER_DIR, env=_ruler_env(), stdout=log, stderr=subprocess.STDOUT)
+        r = subprocess.run([str(c) for c in cmd], cwd=RULER_DIR, env=_ruler_env(env), stdout=log, stderr=subprocess.STDOUT)
     if r.returncode != 0:
         raise RuntimeError(f"RULER command failed (see {log_file}): {' '.join(map(str, cmd))}")
 
@@ -129,11 +140,15 @@ def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, us
                 _run([sys.executable, "data/prepare.py", "--save_dir", data_dir, "--benchmark", "synthetic",
                       "--task", task, "--tokenizer_path", base_model_dir, "--tokenizer_type", "hf",
                       "--max_seq_length", L, "--model_template_type", "base", "--num_samples", samples], tlog)
+                if not (data_dir / task / "validation.jsonl").exists():  # prepare.py exits 0 when its generator fails
+                    raise RuntimeError(f"no data generated for {task} (see {log_file})")
                 _run([sys.executable, "pred/call_api.py", "--data_dir", data_dir, "--save_dir", pred_dir,
                       "--benchmark", "synthetic", "--task", task,
                       "--server_type", "linswap" if use_cache else "linswap_nocache",
                       "--model_name_or_path", model_dir, "--temperature", "0.0", "--top_k", "32", "--top_p", "1.0",
-                      "--batch_size", "1"], tlog)
+                      "--batch_size", "1"], tlog,
+                     # the wrapper would otherwise read the checkpoint's recorded base_model_dir, which may not exist
+                     env={"LINSWAP_BASE_MODEL_DIR": str(base_model_dir)})
                 print(f"    {name} L={L} {task}: {time.time()-t:.0f}s", flush=True)
                 return None
             except RuntimeError as e:  # keep going; the task is reported as missing
@@ -149,8 +164,9 @@ def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, us
                 failed = [t for t in pool.map(one_task, tasks) if t]
         else:
             failed = [t for t in map(one_task, tasks) if t]
-        _run([sys.executable, "eval/evaluate.py", "--data_dir", pred_dir, "--benchmark", "synthetic"], log_file)
-        results[L] = _read_summary(pred_dir)
+        if len(failed) < len(tasks):  # RULER's scorer crashes on a directory with no predictions
+            _run([sys.executable, "eval/evaluate.py", "--data_dir", pred_dir, "--benchmark", "synthetic"], log_file)
+        results[L] = _read_summary(pred_dir) if len(failed) < len(tasks) else {}
         for task in failed:
             results[L].setdefault(task, None)
         print(f"  {name} L={L}: {results[L]}", flush=True)
