@@ -33,7 +33,7 @@ def add_args(ap):
     ap.add_argument("--baseline", default="gdn", help="second kernel for the verify comparison")
     ap.add_argument("--tasks", default=evaluate.DEFAULT_TASKS)
     ap.add_argument("--lengths", default="4096,16384,65536,131072", help="RULER sequence lengths")
-    ap.add_argument("--samples", type=int, default=50)
+    ap.add_argument("--samples", type=int, default=500)
     ap.add_argument("--no_cache", action="store_true")
     ap.add_argument("--chat_template", action="store_true")
     ap.add_argument("--ruler_jobs", type=int, default=3, help="RULER tasks to run at once (see evaluate)")

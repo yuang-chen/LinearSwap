@@ -38,7 +38,7 @@ def add_args(ap):
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--tasks", default=DEFAULT_TASKS, help="RULER synthetic tasks, comma separated")
     ap.add_argument("--lengths", default="4096,16384,65536,131072", help="RULER sequence lengths, comma separated")
-    ap.add_argument("--samples", type=int, default=50, help="RULER samples per task")
+    ap.add_argument("--samples", type=int, default=500, help="RULER samples per task")
     ap.add_argument("--no_cache", action="store_true", help="decode without KV / recurrent-state cache")
     ap.add_argument("--chat_template", action="store_true",
                     help="wrap RULER prompts in the backbone's chat template; the default is RULER's base "
