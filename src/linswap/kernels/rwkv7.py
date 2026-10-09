@@ -66,7 +66,7 @@ class RWKV7DeltaLayer(BackboneMixer):
         self.k_k = nn.Parameter(torch.ones(self.gate_dim))
         self.k_k._no_weight_decay = True
 
-    def recurrence(self, hidden_states, q, k, v, state, use_cache):
+    def recurrence(self, hidden_states, q, k, v, state, use_cache, cu_seqlens=None):
         B, T, H, K = k.shape  # H == num_v_heads here (q/k already repeated per value-head group)
         g = -self.A_log.float().exp().view(1, 1, H, 1) * F.softplus(
             self.f_proj(hidden_states).float().view(B, T, H, K) + self.dt_bias.float().view(1, 1, H, K))
@@ -77,7 +77,8 @@ class RWKV7DeltaLayer(BackboneMixer):
         b = (-beta * kappa.float()).to(dt)            # erase strength (per channel)
         k_w = (beta * k.float()).to(dt)               # write key
         fn = fused_recurrent_dplr_delta_rule if (self.use_recurrent_kernel and T <= 64) else chunk_dplr_delta_rule
-        return fn(q=q, k=k_w, v=v, a=a, b=b, gk=g.to(dt), initial_state=state, output_final_state=use_cache)
+        return fn(q=q, k=k_w, v=v, a=a, b=b, gk=g.to(dt), initial_state=state, output_final_state=use_cache,
+                  cu_seqlens=cu_seqlens)
 
 
 def build(cfg, layer_idx):

@@ -1,6 +1,6 @@
 """Batch > 1 correctness (one GPU, ~1 min), in float32 so kernel rounding cannot hide a padding bug:
 right-padded chunked loss == per-example dense loss, batched greedy generation == per-row generation,
-HF forward on a right-padded batch == per-row logits."""
+HF forward on a right- or left-padded batch == per-row logits."""
 
 import sys
 from pathlib import Path
@@ -80,11 +80,13 @@ def main():
     d_hf = max((out[0] - r0[0]).abs().max().item(), (out[1, :n1] - r1[0]).abs().max().item())
     same_hf = d_hf < 1e-2
     print(f"HF right-padded batch vs per-row logits: max diff {d_hf:.2e} (fp32)")
-    try:
-        hf(batch["input_ids"], attention_mask=am.flip(1), use_cache=False); left_ok = False
-    except ValueError:
-        left_ok = True
-    print(f"left padding rejected: {left_ok}")
+    # left-padded: row 1's real tokens moved to the end
+    ids_l = batch["input_ids"].clone(); ids_l[1] = ids_l[1].roll(ids_l.shape[1] - n1)
+    with torch.no_grad():
+        out_l = hf(ids_l, attention_mask=am.flip(1), use_cache=False).logits
+    d_l = max((out_l[0] - r0[0]).abs().max().item(), (out_l[1, -n1:] - r1[0]).abs().max().item())
+    left_ok = d_l < 1e-2
+    print(f"HF left-padded batch vs per-row logits: max diff {d_l:.2e} (fp32)")
     ok &= same_hf and left_ok
     print("PASS" if ok else "FAIL")
     if not ok:

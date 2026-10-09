@@ -25,14 +25,17 @@ score; no supervised fine-tuning follows.
 
 Every run writes ``train_log.jsonl`` and a TensorBoard run (``<output_dir>/tensorboard``, see
 ``tools/tb_logger.py``): loss, grad norm (total and per parameter group: the kernel's new parameters,
-the swapped layers' shared projections, the rest of the backbone), lr, the per-layer losses of the
-``layer`` step, and every ``--eval_every`` steps the validation loss, KL(teacher ‖ student) / top-1
+the swapped layers' shared projections, the rest of the backbone), lr, in the ``layer`` and ``kl``
+steps the per-layer ``layer_mse`` (MSE between each student linear-attention layer's output and the
+teacher's, each model running on its own hidden states, so it includes error carried in from earlier
+layers), and every ``--eval_every`` steps the validation loss, KL(teacher ‖ student) / top-1
 agreement / entropies on the held-out sequences and the groups' parameter norm, drift from the swap
 init and update size.  ``tensorboard --logdir outputs`` overlays the kernels.
 """
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import math
@@ -133,16 +136,42 @@ def log_jsonl(path, record):
 
 
 @torch.no_grad()
-def teacher_layer_io(teacher, ids):
-    """Inputs and outputs of every linear-attention layer of the teacher."""
+def teacher_layer_io(teacher, ids, inputs=True, **forward_kw):
+    """Inputs (if ``inputs``) and outputs of every linear-attention layer of the teacher, and what
+    ``teacher(ids, **forward_kw)`` returns."""
     ins, outs, hooks = {}, {}, []
     for i, b in linear_blocks(teacher):
-        hooks.append(b.input_layernorm.register_forward_hook(lambda m, a, o, i=i: ins.__setitem__(i, o.detach())))
+        if inputs:
+            hooks.append(b.input_layernorm.register_forward_hook(lambda m, a, o, i=i: ins.__setitem__(i, o.detach())))
         hooks.append(b.linear_attn.register_forward_hook(lambda m, a, o, i=i: outs.__setitem__(i, o[0].detach())))
-    teacher(ids, return_hidden_before_norm=True)
+    ret = teacher(ids, **forward_kw)
     for h in hooks:
         h.remove()
-    return ins, outs
+    return ins, outs, ret
+
+
+@contextlib.contextmanager
+def record_layer_mse(model, t_out, acc, scale=1.0):
+    """While ``model`` runs on its own hidden states, add ``scale`` × MSE(linear-attention output of layer
+    i, ``t_out[i]``) to ``acc[i]`` (a tensor, so nothing synchronises).  Only the first call of a layer
+    counts: activation checkpointing re-runs the blocks in the backward."""
+    seen, hooks = set(), []
+
+    def hook(m, a, o, i):
+        if i in seen:
+            return
+        seen.add(i)
+        with torch.no_grad():
+            mse = F.mse_loss(o[0].float(), t_out[i].float()) * scale
+        acc[i] = acc[i] + mse if i in acc else mse
+
+    for i, b in linear_blocks(model):
+        hooks.append(b.linear_attn.register_forward_hook(lambda m, a, o, i=i: hook(m, a, o, i)))
+    try:
+        yield
+    finally:
+        for h in hooks:
+            h.remove()
 
 
 def chunked_kl_with_backward(s_hidden, t_hidden, s_head, t_head, chunk_size=2048, temperature=1.0, loss_scale=1.0):
@@ -213,7 +242,7 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
     train_iter = iter(train_loader)
     start, step = time.time(), done
     while step < steps:
-        acc, layer_acc, t_step = 0.0, {}, time.time()
+        acc, mse_acc, t_step = 0.0, {}, time.time()
         for _ in range(accum):
             try:
                 batch = next(train_iter)
@@ -223,19 +252,22 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
             ids = batch["input_ids"].to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 if stage == "layer":
-                    t_in, t_out = teacher_layer_io(teacher, ids)
+                    t_in, t_out, _ = teacher_layer_io(teacher, ids, return_hidden_before_norm=True)
                     loss = 0.0
                     for i, b in linear_blocks(student):
                         o, _, _ = b.linear_attn(t_in[i])
-                        li = F.mse_loss(o.float(), t_out[i].float())
-                        layer_acc[i] = layer_acc.get(i, 0.0) + li.item() / accum
-                        loss = loss + li
+                        loss = loss + F.mse_loss(o.float(), t_out[i].float())
                     (loss / accum).backward()
                     acc += loss.item()
+                    del t_in
+                    with torch.no_grad(), record_layer_mse(student, t_out, mse_acc, 1.0 / accum):
+                        student(ids, return_hidden_before_norm=True)
+                    del t_out
                 elif stage == "kl":
-                    with torch.no_grad():
-                        t_hidden = teacher(ids, return_hidden=True)
-                    s_hidden = student(ids, return_hidden=True)
+                    _, t_out, t_hidden = teacher_layer_io(teacher, ids, inputs=False, return_hidden=True)
+                    with record_layer_mse(student, t_out, mse_acc, 1.0 / accum):
+                        s_hidden = student(ids, return_hidden=True)
+                    del t_out
                     acc += chunked_kl_with_backward(s_hidden, t_hidden, student.lm_head, teacher.lm_head,
                                                     args.ce_chunk_size, args.kl_temperature, 1.0 / accum)
                 else:  # ce
@@ -258,8 +290,9 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
                "lr": optimizer.param_groups[0]["lr"], "elapsed_s": round(time.time() - start, 1),
                "tokens": (step0 + step) * tok_per_step}
         rec.update({f"grad_norm_{g}": v for g, v in group_gn.items()})
-        if layer_acc:
-            rec["layer_loss"] = {str(i): v for i, v in sorted(layer_acc.items())}
+        layer_mse = {i: float(v) for i, v in sorted(mse_acc.items())}
+        if layer_mse:
+            rec["layer_mse"] = {str(i): v for i, v in layer_mse.items()}
         print(f"  {tag} step {step}/{steps}: loss={rec['loss']:.4f} grad_norm={rec['grad_norm']:.3f} "
               f"elapsed={rec['elapsed_s']/60:.1f}min", flush=True)
         log_jsonl(log_path, rec)
@@ -267,7 +300,7 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
         tb.scalars({"loss": rec["loss"], "grad_norm": rec["grad_norm"], "lr": rec["lr"], "tokens": rec["tokens"],
                     "step_time_s": time.time() - t_step, "stage": STAGES.index(stage)}, gstep, "train/")
         tb.scalars(group_gn, gstep, "grad_norm/")
-        tb.scalars({f"layer_{i}": v for i, v in layer_acc.items()}, gstep, "layer_loss/")
+        tb.scalars({f"layer_{i}": v for i, v in layer_mse.items()}, gstep, "layer_mse/")
         if diag:
             student.eval()
             val = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)

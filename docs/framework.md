@@ -240,7 +240,11 @@ like-for-like:
   base prompting is the setting in which teacher and student are scored the same way.
 * **Short context** (`linswap lmeval`): LAMBADA, ARC-c (acc_norm), ARC-e, PIQA, WinoGrande,
   HellaSwag (acc_norm) 0-shot and MMLU 5-shot through lm-eval-harness, reported both as accuracy and
-  as a relative score (s − r)/(t − r) against a reference row, with r the chance level.
+  as a relative score (s − r)/(t − r) against a reference row, with r the chance level.  IFEval
+  (prompt-level strict accuracy, plus instruction-level in `ifeval_inst`) runs generatively with the
+  chat template, thinking disabled, as left-padded batches: full attention masks the pad keys and the
+  linear layers run the prompt varlen (`cu_seqlens`), so a batch decodes like each prompt alone (`swa`,
+  whose sinks are absolute positions, stays at batch size 1).
 
 `tools/throughput.py` measures prefill and decode speed, `tools/hard_tables.py` turns evaluation logs
 into markdown tables.  [gate_diagnostics.md](gate_diagnostics.md) measures what the training steps do to

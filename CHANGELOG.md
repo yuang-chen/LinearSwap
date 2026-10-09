@@ -2,8 +2,22 @@
 
 ## Unreleased
 
+* **IFEval in `linswap lmeval`** (default task set, `--chat_tasks ifeval`): generated with the chat
+  template and thinking disabled, scored by prompt-level strict accuracy (`ifeval`) and
+  instruction-level strict accuracy (`ifeval_inst`), chance 0 in the relative score.  Needs `langdetect`
+  and `immutabledict` (added to the `eval` extra).  `--fewshot_tasks` entries not listed in `--tasks`
+  are no longer evaluated.
+* **Left-padded batches in the HF wrapper**, so `generate` takes prompts of different lengths (IFEval
+  runs at `--batch_size`): the padding mask reaches full attention (pad keys hidden) and the linear
+  layers, which unpad the prompt to varlen `cu_seqlens` (FLA layers natively, `BackboneMixer` kernels
+  — `rwkv7`, `mamba2` — now too).  Not `swa`.
+* **HF export writes a generation config** with the chat end-of-turn and backbone EOS ids (`<|im_end|>`,
+  `<|endoftext|>`) and the pad id.  Without it `generate` never stopped a row, so batched IFEval scored the
+  text finished rows kept generating after `<|im_end|>`.  Delete cached `outputs/eval/<name>/hf/` exports
+  to pick it up.
 * **TensorBoard dashboard for `distill`** (`tools/tb_logger.py`, `--tensorboard_dir`, `--no_tensorboard`):
-  loss, grad norm, lr and the `layer` step's per-layer losses every step, with the gradient norm split
+  loss, grad norm, lr and, in the `layer` and `kl` steps, the MSE of every linear-attention layer's
+  output against the teacher's (`layer_mse/`, each model on its own hidden states) every step, with the gradient norm split
   into the kernel's new parameters, the swapped layers' shared projections and the rest of the backbone;
   every `--eval_every` steps the validation loss, KL(teacher ‖ student), top-1 agreement and entropies
   on the held-out sequences (also per position bucket), and each group's parameter norm, drift from the

@@ -3,7 +3,9 @@
     linswap lmeval --models gdn rwkv7-distilled=outputs/rwkv7/distill/checkpoint-16338
 
 The default task set is the standard short-context suite (LAMBADA, ARC-c/e, PIQA, WinoGrande,
-HellaSwag 0-shot and MMLU 5-shot).  ``--relative_to`` adds the relative score (s - r)/(t - r) of every
+HellaSwag 0-shot and MMLU 5-shot) plus IFEval (0-shot, generative, prompt-level strict accuracy).
+``--chat_tasks`` (IFEval) run with the chat template and thinking disabled, at ``--batch_size`` with
+left-padded batched generation (batch size 1 for ``swa``, which has no padding support).  ``--relative_to`` adds the relative score (s - r)/(t - r) of every
 model against a reference row (usually the unmodified backbone), with r the chance level of the task.
 
 Each model is exported to an HF checkpoint (cached under outputs/eval/<name>/hf/) and
@@ -21,7 +23,7 @@ from pathlib import Path
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT
 from .evaluate import path_slug, resolve_model
 
-DEFAULT_TASKS = "lambada_openai,arc_challenge,arc_easy,piqa,winogrande,hellaswag,mmlu"
+DEFAULT_TASKS = "lambada_openai,arc_challenge,arc_easy,piqa,winogrande,hellaswag,mmlu,ifeval"
 
 
 def add_args(ap):
@@ -31,9 +33,14 @@ def add_args(ap):
     ap.add_argument("--limit", type=int, default=None, help="examples per task (None = all)")
     ap.add_argument("--num_fewshot", type=int, default=0)
     ap.add_argument("--fewshot_tasks", default="mmlu:5", help="tasks evaluated with their own shot count, e.g. mmlu:5")
+    ap.add_argument("--chat_tasks", default="ifeval",
+                    help="generative tasks evaluated with the chat template (thinking disabled), left-padded")
     ap.add_argument("--relative_to", default="gdn-base", help="row whose scores are the reference t in the relative "
                                                             "score (s - r)/(t - r), r = chance; '' to disable")
     ap.add_argument("--batch_size", default="8")
+    ap.add_argument("--fewshot_batch_size", default=None,
+                    help="batch size for the --fewshot_tasks (default: --batch_size); their prompts are much "
+                         "longer, and the full-vocabulary logits grow with batch x length")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
 
 
@@ -54,14 +61,23 @@ def main(args):
             export(kernel, hf_dir, base_model_dir=base, ckpt_dir=ckpt)
         t = time.time()
         margs = f"pretrained={hf_dir},dtype=bfloat16,trust_remote_code=False"
-        fs = {k: int(v) for k, v in (kv.split(":") for kv in args.fewshot_tasks.split(",") if kv)}
-        res = lm_eval.simple_evaluate(model="hf", model_args=margs, tasks=[t for t in tasks if t not in fs],
+        fs = {k: int(v) for k, v in (kv.split(":") for kv in args.fewshot_tasks.split(",") if kv)
+              if k in tasks}
+        chat = [t for t in args.chat_tasks.split(",") if t and t in tasks]
+        plain = [t for t in tasks if t not in fs and t not in chat]
+        res = lm_eval.simple_evaluate(model="hf", model_args=margs, tasks=plain,
                                       num_fewshot=args.num_fewshot, limit=args.limit, batch_size=args.batch_size,
-                                      log_samples=False) if [t for t in tasks if t not in fs] else {"results": {}}
+                                      log_samples=False) if plain else {"results": {}}
         for fs_task, n in fs.items():   # few-shot tasks run separately with their own shot count
             r2 = lm_eval.simple_evaluate(model="hf", model_args=margs, tasks=[fs_task], num_fewshot=n, limit=args.limit,
-                                         batch_size=args.batch_size, log_samples=False)
+                                         batch_size=args.fewshot_batch_size or args.batch_size, log_samples=False)
             res["results"].update(r2["results"])
+        if chat:   # batched generation left-pads; swa cannot mask pads (absolute sinks), so it runs one at a time
+            r3 = lm_eval.simple_evaluate(model="hf", model_args=margs + ",enable_thinking=False", tasks=chat,
+                                         num_fewshot=0, limit=args.limit, batch_size=1 if "swa" in kernel else args.batch_size,
+                                         apply_chat_template=True,
+                                         log_samples=False)
+            res["results"].update(r3["results"])
         (out_dir / "raw").mkdir(exist_ok=True)
         with open(out_dir / "raw" / f"{path_slug(disp)}.json", "w") as f:      # full lm-eval result dicts, for re-parsing
             json.dump({t: res["results"].get(t, {}) for t in tasks}, f, indent=1)
@@ -69,19 +85,22 @@ def main(args):
         for task in tasks:
             r = res["results"].get(task, {})
             # accuracy-like metrics first (acc_norm / acc / contains for SWDE, FDA, SQuAD-completion / exact match / F1),
-            # perplexity last; LAMBADA additionally reports its perplexity in a second column.
-            metric = next((k for k in ("acc_norm,none", "acc,none", "contains,none", "exact_match,none", "em,none",
+            # perplexity last; LAMBADA additionally reports its perplexity in a second column, IFEval its
+            # instruction-level strict accuracy.
+            metric = next((k for k in ("prompt_level_strict_acc,none", "acc_norm,none", "acc,none", "contains,none", "exact_match,none", "em,none",
                                        "f1,none", "perplexity,none") if k in r), None)
             row[task] = round(float(r[metric]), 4) if metric else None
             if "perplexity,none" in r and metric != "perplexity,none":
                 row[f"{task}_ppl"] = round(float(r["perplexity,none"]), 3)
+            if "inst_level_strict_acc,none" in r:
+                row[f"{task}_inst"] = round(float(r["inst_level_strict_acc,none"]), 4)
         rows.append(row)
         print(f"  {disp}: " + ", ".join(f"{k}={v}" for k, v in row.items() if k not in ("model", "kernel")) + f"  ({time.time()-t:.0f}s)", flush=True)
         with open(out_dir / "lmeval.json", "w") as f:
             json.dump(rows, f, indent=1)
     if args.relative_to:   # relative score: (student - chance) / (reference - chance), in percent
         chance = {"lambada_openai": 0.0, "piqa": 0.5, "winogrande": 0.5, "boolq": 0.5, "arc_easy": 0.25,
-                  "arc_challenge": 0.25, "hellaswag": 0.25, "mmlu": 0.25, "social_iqa": 1 / 3}
+                  "arc_challenge": 0.25, "hellaswag": 0.25, "mmlu": 0.25, "social_iqa": 1 / 3, "ifeval": 0.0}
         teacher = next((r for r in rows if r["model"] == args.relative_to), None)
         if teacher is None:
             print(f"[lmeval] --relative_to {args.relative_to!r} not among the evaluated models; skipping relative scores")

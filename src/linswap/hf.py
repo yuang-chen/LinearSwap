@@ -10,9 +10,9 @@
     model = LinearSwapForCausalLM.from_swap("kda", base_model_dir="models/Qwen3.5-0.8B")
     model.save_pretrained("hf/Qwen3.5-0.8B-KDA")
 
-Limitations: batches must be unpadded or right-padded (loss / logits); generation needs
-equal-length prompts; greedy / sampling decoding only — the model is stateful (recurrent
-state + KV cache), so beam search is unsupported.
+Limitations: batches may be right-padded (loss / logits) or left-padded (loss / logits and
+generation; not the ``swa`` kernel, whose sinks are absolute positions); greedy / sampling
+decoding only — the model is stateful (recurrent state + KV cache), so beam search is unsupported.
 """
 
 from __future__ import annotations
@@ -173,20 +173,27 @@ class LinearSwapForCausalLM(LinearSwapPreTrainedModel, GenerationMixin):
                 logits_to_keep=0, inputs_embeds=None, return_dict=None, **kwargs):
         if inputs_embeds is not None:
             raise ValueError("LinearSwapForCausalLM takes input_ids, not inputs_embeds")
+        pad_mask = None
         if attention_mask is not None and not bool(attention_mask.all()):
-            # Right padding is exact for a causal model (padded positions never influence real ones);
-            # left padding would need a mask inside attention / a recurrent-state reset.
-            if not bool((attention_mask.cummin(dim=1).values == attention_mask).all()):
-                raise ValueError("left padding is not supported: pad on the right (tokenizer.padding_side = 'right')")
-            if past_key_values is not None or use_cache:
-                raise ValueError("padded batches are supported for loss / logits only, not for cached generation")
+            if bool((attention_mask.cummax(dim=1).values == attention_mask).all()):
+                # Left padding (batched generation): the mask goes down the stack -- full attention hides the
+                # pad keys, the linear layers run the prompt chunk varlen.  Positions count the pads, which
+                # RoPE does not see (it only depends on relative positions).
+                pad_mask = attention_mask
+            elif not bool((attention_mask.cummin(dim=1).values == attention_mask).all()):
+                raise ValueError("attention_mask must be left or right padding")
+            elif past_key_values is not None or use_cache:
+                # Right padding is exact for a causal model (padded positions never influence real ones),
+                # but generation would append after the pads.
+                raise ValueError("right-padded batches are supported for loss / logits only; pad on the left "
+                                 "(tokenizer.padding_side = 'left') to generate")
         use_cache = self.config.use_cache if use_cache is None else use_cache
         if use_cache and past_key_values is None:
             past_key_values = LinearSwapCache(len(self.model.layers))
         cache = past_key_values.swap if past_key_values is not None else None
         if past_key_values is not None:
             self.model.current_pos = past_key_values.seq_len
-        hidden = self.model(input_ids, cache=cache, use_cache=cache is not None)
+        hidden = self.model(input_ids, cache=cache, use_cache=cache is not None, attention_mask=pad_mask)
         if past_key_values is not None:
             past_key_values.seq_len += input_ids.shape[1]
         keep = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else slice(None)
@@ -227,13 +234,24 @@ def register_auto_classes():
 def export(kernel, out_dir, base_model_dir=DEFAULT_BASE_MODEL_DIR, ckpt_dir=None, dtype=torch.bfloat16,
            save_tokenizer=True) -> Path:
     """Write a swapped model as an HF checkpoint (config + safetensors + tokenizer + model card)."""
-    from transformers import AutoTokenizer
+    import json
+
+    from transformers import AutoTokenizer, GenerationConfig
 
     model = LinearSwapForCausalLM.from_swap(kernel, base_model_dir=base_model_dir, ckpt_dir=ckpt_dir, dtype=dtype)
+    tok = AutoTokenizer.from_pretrained(base_model_dir)
+    # Stop on the chat end-of-turn token (the tokenizer's EOS, <|im_end|>) and the backbone's EOS (<|endoftext|>):
+    # without them `generate` never stops a row, and in a batch finished rows keep generating text
+    # instead of padding until the last row ends.
+    base_cfg = json.load(open(Path(base_model_dir) / "config.json"))
+    base_eos = base_cfg.get("eos_token_id", base_cfg.get("text_config", {}).get("eos_token_id"))
+    eos = [tok.eos_token_id, *(base_eos if isinstance(base_eos, list) else [base_eos])]
+    eos = list(dict.fromkeys(e for e in eos if e is not None))
+    model.generation_config = GenerationConfig(eos_token_id=eos, pad_token_id=tok.pad_token_id or eos[-1])
     out_dir = Path(out_dir)
     model.save_pretrained(out_dir, safe_serialization=True)
     if save_tokenizer:
-        AutoTokenizer.from_pretrained(base_model_dir).save_pretrained(out_dir)
+        tok.save_pretrained(out_dir)
     spec = get_kernel(model.config.kernel)
     (out_dir / "README.md").write_text(f"""---
 library_name: transformers

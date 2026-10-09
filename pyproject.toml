@@ -28,7 +28,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-eval = ["accelerate", "lm_eval", "tenacity", "nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm"]
+eval = ["accelerate", "lm_eval", "tenacity", "nltk", "wonderwords", "scipy", "beautifulsoup4", "html2text", "pandas", "pyyaml", "tqdm",
+        "langdetect", "immutabledict"]   # IFEval's instruction checkers
 # Mamba-1 / Mamba-3 kernels (mamba_ssm needs triton>=3.5, i.e. torch>=2.9).  Install these with
 #   pip install --no-deps --no-build-isolation --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
 # so that mamba-ssm cannot replace your torch build; see README "Installation".
