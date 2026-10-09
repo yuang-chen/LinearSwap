@@ -12,7 +12,7 @@ answer them:
    `kl`, `ce`) with very different budgets and learning rates; the weights say which one does the work.
 
 All numbers: Qwen3.5-0.8B backbone, one seed, the standard recipe in
-[framework.md](framework.md#distillation-linswap-distill).
+[recipe.md](recipe.md#distillation-linswap-distill).
 
 ## Definitions
 
@@ -47,18 +47,19 @@ same value can mean repair or damage, which is what table C separates.
 
 ## A. Do the tiled gates spread?
 
-`S(W)` at init and after the full recipe.  Every row starts at exactly `0.0000`.
+`S(W)` at init and after the full recipe, with the `layer` step run and with it skipped.  Every row
+starts at exactly `0.0000`.  (`gla` is inexact, so it never skips the step — see the skip rule in
+[recipe.md](recipe.md#distillation-linswap-distill).)
 
-| kernel | gate | init | final |
-|---|---|---|---|
-| `gdn2` | `w_proj` (write) | 0.0000 | 0.3009 |
-| `gdn2` | `b_proj` (erase) | 0.0000 | 0.2621 |
-| `gdn2` | `f_proj` (decay) | 0.0000 | 0.2009 |
-| `kda_fullgate` | `f_proj` (dense decay) | 0.0000 | 0.1879 |
-| `rwkv7` | `b_proj` (per-channel lr) | 0.0000 | 0.1652 |
-| `kda` | `f_proj` (rank-128 decay) | 0.0000 | 0.1121 |
-| `rwkv7` | `f_proj` (decay) | 0.0000 | 0.0931 |
-| `gla` | `gk_proj` (decay) | 0.0000 | 0.0858 |
+| kernel | gate | init | final, `layer` step run | final, `layer` step skipped |
+|---|---|---|---|---|
+| `gdn2` | `w_proj` (write) | 0.0000 | 0.3009 | 0.0106 |
+| `gdn2` | `b_proj` (erase) | 0.0000 | 0.2621 | 0.0078 |
+| `gdn2` | `f_proj` (decay) | 0.0000 | 0.2009 | 0.0054 |
+| `rwkv7` | `b_proj` (per-channel lr) | 0.0000 | 0.1652 | 0.0077 |
+| `kda` | `f_proj` (rank-128 decay) | 0.0000 | 0.1121 | 0.0054 |
+| `rwkv7` | `f_proj` (decay) | 0.0000 | 0.0931 | 0.0054 |
+| `gla` | `gk_proj` (decay) | 0.0000 | 0.0858 | — |
 
 `gdn`, `mamba2`, `swa` and `deltanet` are absent because the quantity does not exist for them, not
 because it was not measured: none has a per-channel gate tiled from a backbone scalar (`gdn` adds no
@@ -82,7 +83,6 @@ GDN-2's gate values on real text, the functional check on the same kernel:
 | `gdn` (control, exact copy) | 0.0000 | 0.0071 | — |
 | `gla` | 0.0716 | 0.0016 | 45× |
 | `rwkv7` | 0.1820 | 0.0038 | 48× |
-| `kda_fullgate` | 0.1843 | 0.0040 | 46× |
 | `kda` | 0.1850 | 0.0039 | 48× |
 | `gdn2` | 0.2034 | 0.0047 | 43× |
 | `swa` | 0.5328 | 0.0118 | 45× |
@@ -108,7 +108,7 @@ itself, at its first step, 5 % in, and at the end.
 | `mamba2` (inexact) | 7.5915 | 3.3877 | 3.1821 | 3.1510 | 1.8e-02 → 1.8e-03 → 5.7e-04 |
 | `swa` (inexact) | 14.0398 | 3.5160 | 3.3241 | 3.3219 | 1.1e-01 → 2.1e-03 → 9.7e-04 |
 
-`kda`, `kda_fullgate` and `deltanet` are absent: only their weights were transferred to this machine,
+`kda` and `deltanet` are absent: only their weights were transferred to this machine,
 without the `train_log.jsonl` the trajectory needs.
 
 ## Reading
@@ -122,26 +122,29 @@ without the `train_log.jsonl` the trajectory needs.
   update is normalised by gradient magnitude, so a 1e-6 gradient still produces a step of order the
   learning rate, and at 1e-3 over 6103 steps the weights random-walk away from a correct solution.
   Only the `gdn` control escapes, because its gradient is identically zero (it *is* the teacher).
-  The natural fixes are to skip the step when `KernelSpec.exact_init` is set, or to scale `--layer_lr`
-  to the initial loss.
+  Skipping it is now the default (`--layer_skip_below`), and it is worth 9-11 points on the 128K
+  distractor needle: `gdn2` 86.8 → 96.4, `kda` 85.6 → 96.4, `rwkv7` 86.6 → 96.2, against the
+  control's 96.8.  Short context moves 108.7–109.9 → 110.2–110.3.
 * **For an inexact init the same step is the whole repair.**  `swa` 14.04 → 3.32, `mamba2` 7.59 → 3.18,
   `gla` 7.45 → 3.18, with the objective falling monotonically.  The useful predictor of which case
   applies is the loss at step 1, not `exact_init`: `gla`'s mapped decay init is formally inexact but
   starts at 1.6e-2, two orders below where `swa` starts.
-* **The gates do use the extra freedom, and write/erase more than decay.**  In both kernels that
-  separate them, the write/erase-type gate spreads about twice as far as the decay gate (`gdn2`
-  0.30/0.26 vs 0.20; `rwkv7` 0.17 vs 0.09).  GDN's scalar decay is close to what the model wants; what
-  it lacks is per-channel control of *how much to write and erase*.
-* **Rank, not capacity, is what separates the KDA variants.**  `kda` and `kda_fullgate` are the same
-  kernel with the same init, differing only in whether the decay factors through a rank-128 bottleneck
-  or a dense matrix.  The dense gate spreads 1.7× further (0.188 vs 0.112) and leads at every RULER
-  length, by 6.8 points on the 128K distractor needle.
+* **The gates barely use the extra freedom — the earlier spread was damage.**  With the `layer` step
+  skipped, every tiled gate ends at `S = 0.005–0.011` instead of 0.09–0.30: 20–40× less, and those are
+  the checkpoints that score *better* (128K distractor needle 96.2–96.4 vs 85.6–86.8).  Almost all of
+  the spread in the middle column was produced by the step that walks an exact init away from the
+  teacher, not by the model finding a use for per-channel gates.  An earlier reading of this table —
+  "distillation uses the capacity GDN-2 and KDA add" — was wrong: at this scale and budget the useful
+  solution keeps the pretrained per-head gate nearly unchanged.  The residual ordering survives
+  (`gdn2`'s write gate still spreads furthest, 0.0106 vs 0.0054 for its decay) at a scale that explains
+  nothing.
 * **But spread is not a goal in itself.**  It is meaningful only relative to a structured init: a gate
   initialised at random has a large spread and no structure, and scores far worse than the same kernel
   initialised by tiling.  Read `S` as "how far from the tiled starting point", never as "how expressive".
-* **Caveat on A:** nearly all of the spread in table A appears during the `layer` step — the step that
-  demonstrably damages an exact-init model.  How much of it is learned structure and how much is
-  noise-driven drift is open; a run with `--stages kl,ce` settles it.
+* **Settled.**  The question this note left open — how much of table A's spread is learned structure
+  and how much is drift from a harmful step — is answered by the right-hand column: almost all of it was
+  drift.  The `layer` step now skips itself for an init that starts at bf16 noise, and the four
+  exact-init kernels land on the control on both suites.
 
 ## Reproducing
 

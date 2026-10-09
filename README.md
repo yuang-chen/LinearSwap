@@ -18,7 +18,6 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 | `gdn`          | Gated DeltaNet                            | weight copy (control, distillation teacher)       | 0.6M       | yes        |
 | `rwkv7`        | RWKV-7 generalised delta rule (DPLR)      | gates tiled, removal key = key                    | 14M        | yes        |
 | `kda`          | Kimi Delta Attention                      | decay tiled into the low-rank gate                | 7.4M       | yes        |
-| `kda_fullgate` | Kimi Delta Attention                      | … with a dense decay projection                   | 38M        | yes        |
 | `gdn2`         | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                     | 113M       | yes ‡      |
 | `mamba2`       | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped              | 0.3M       | no         |
 | `deltanet`     | DeltaNet (erase, no decay)                | shared weights copied, decay dropped              | 0.3M       | no         |
@@ -29,7 +28,7 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 An **exact** kernel contains Gated DeltaNet as a special case, so at step 0 the swapped layer
 reproduces the original to bf16 noise; the rest have more to recover. Only the *sequence mixer* is
 replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
-0.8B backbone; `docs/framework.md` has the per-kernel mappings.
+0.8B backbone; `docs/kernels.md` has the per-kernel mappings.
 
 <sub>‡ needs as many value heads as key heads. ¶ not linear attention: sliding-window softmax with
 sinks (arXiv 2608.28444) over the same projections, bounded 68-key state; window / sinks / RoPE from
@@ -122,11 +121,18 @@ instruction data, no chat template, no supervised fine-tuning:
 | `ce`    | cross-entropy, no teacher (context extension)                | 100M   | 16384  | 1e-5        |
 
 
+The `layer` step measures its own loss on one batch before training and **skips itself** when that loss
+is below `--layer_skip_below` (1e-4): a swap that already reproduces the pretrained layer to bf16 noise
+has nothing to align, and training it there degrades the model instead of improving it.  In practice
+`gdn`, `gdn2`, `kda` and `rwkv7` skip it (initial loss 0 to 8e-7) while `gla`, `mamba2`,
+`swa` and `deltanet` run it (1.6e-2 to 1.1e-1).
+
 Adam(0.9, 0.95), clip 1.0, bf16, about 6 GPU-hours per kernel at 0.8B. The first step trains the
 swapped layers, the other two everything. Budgets are tokens (`--kl_tokens 250e6`); every per-step
 knob is a flag.
 
-Each run writes `outputs/<kernel>/distill/train_log.jsonl` and a TensorBoard run next to it:
+Each run writes `outputs/<kernel>/distill/train_log.jsonl` and, with the `tensorboard` extra
+(`uv pip install -e ".[tensorboard]"`), a TensorBoard run next to it:
 `tensorboard --logdir outputs` overlays the kernels' loss, grad norm (total and per parameter group),
 lr, validation KL(teacher ‖ student) and the swapped layers' drift from their init.
 
@@ -138,7 +144,8 @@ linswap lmeval   --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
 python tools/throughput.py --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
 ```
 
-- **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` at 4K–128K, 500 samples,
+- **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` (retrieval), `vt` (multi-hop
+variable tracking), `cwe` / `fwe` (common / frequent words extraction) at 4K–128K, 500 samples,
 cached greedy decoding, RULER's base prompt template (`--chat_template` switches).
 - **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot, MMLU 5-shot and
 IFEval (chat template, generative), reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.
@@ -151,18 +158,17 @@ Backbone Qwen3.5-0.8B, one seed, identical recipe for every row: 700M tokens of
 DCLM, no SFT, base-prompt evaluation.  The **control** is the *unswapped*
 backbone put through the same three steps — without it the students' gains over
 the unmodified backbone would be read as a kernel effect when they are the
-recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
+recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
 
 **Long-context retrieval** (`niah_single_1` / `_2` / `_3` / `niah_multikey_1`, 500 samples)
 
 | model | 4K | 16K | 64K | 128K |
 |---|---|---|---|---|
 | unmodified backbone | 96.4 / 65.0 / 97.8 / 79.4 | 98.4 / 76.2 / 90.6 / 81.6 | 96.4 / 98.4 / 94.6 / 91.8 | 99.2 / 91.6 / 96.6 / 91.0 |
-| control (`gdn`, same recipe) | 100 / 100 / 97.0 / 99.8 | 100 / 100 / 100 / 98.4 | 100 / 100 / 99.8 / 97.2 | 100 / 100 / 99.8 / 96.2 |
-| `kda_fullgate` (exact init) | 100 / 100 / 95.0 / 99.6 | 100 / 100 / 100 / 97.6 | 100 / 100 / 100 / 95.4 | 100 / 100 / 99.4 / 92.4 |
-| `gdn2` (exact init) | 100 / 100 / 93.6 / 100 | 100 / 100 / 99.0 / 97.0 | 100 / 100 / 98.8 / 92.8 | 100 / 99.2 / 96.6 / 86.8 |
-| `rwkv7` (exact init) | 100 / 100 / 91.6 / 99.6 | 100 / 100 / 100 / 96.4 | 100 / 100 / 100 / 94.8 | 100 / 100 / 98.6 / 86.6 |
-| `kda` (exact init) | 100 / 100 / 94.8 / 99.6 | 100 / 100 / 99.8 / 96.6 | 100 / 100 / 100 / 95.0 | 100 / 99.8 / 98.8 / 85.6 |
+| control (`gdn`, same recipe) | 100 / 100 / 98.6 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.8 |
+| `gdn2` (exact init) | 100 / 100 / 94.2 / 100 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
+| `rwkv7` (exact init) | 100 / 100 / 96.0 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.2 |
+| `kda` (exact init) | 100 / 100 / 99.2 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
 | `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
 | `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
 | `gla` (per-channel decay, no erase) | 97.4 / 100 / 99.6 / 99.2 | 52.8 / 100 / 99.6 / 89.0 | 29.0 / 96.2 / 96.8 / 82.0 | 32.0 / 94.4 / 90.0 / 58.8 |
@@ -173,17 +179,16 @@ recipe.  Full tables and discussion in [docs/framework.md](docs/framework.md).
 | model | LAMBADA | ARC-c | ARC-e | PIQA | WinoGrande | HellaSwag | MMLU | rel. avg |
 |---|---|---|---|---|---|---|---|---|
 | unmodified backbone | 0.437 | 0.374 | 0.611 | 0.693 | 0.583 | 0.496 | 0.504 | 100.0 |
-| control (`gdn`) | 0.478 | 0.399 | 0.653 | 0.706 | 0.588 | 0.524 | 0.515 | **110.0** |
-| `kda_fullgate` | 0.481 | 0.397 | 0.646 | 0.706 | 0.591 | 0.521 | 0.517 | 110.0 |
-| `gdn2` | 0.481 | 0.390 | 0.644 | 0.705 | 0.597 | 0.521 | 0.514 | 109.9 |
-| `kda` | 0.476 | 0.393 | 0.641 | 0.701 | 0.596 | 0.522 | 0.514 | 109.4 |
-| `rwkv7` | 0.479 | 0.391 | 0.642 | 0.705 | 0.590 | 0.521 | 0.517 | 108.7 |
+| control (`gdn`) | 0.476 | 0.402 | 0.649 | 0.704 | 0.589 | 0.525 | 0.515 | 110.1 |
+| `gdn2` | 0.479 | 0.398 | 0.652 | 0.706 | 0.590 | 0.524 | 0.516 | 110.2 |
+| `kda` | 0.478 | 0.399 | 0.651 | 0.705 | 0.590 | 0.525 | 0.514 | 110.2 |
+| `rwkv7` | 0.480 | 0.399 | 0.655 | 0.704 | 0.590 | 0.525 | 0.513 | 110.3 |
 | `mamba2` | 0.462 | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
 | `swa` | 0.453 | 0.372 | 0.617 | 0.702 | 0.595 | 0.503 | 0.456 | 101.0 |
 | `gla` | 0.463 | 0.362 | 0.612 | 0.701 | 0.579 | 0.514 | 0.484 | 99.2 |
 | `deltanet` | 0.382 | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
 
-The short-context suite scores every task in full.  The `kda` / `kda_fullgate` / `gla` / `deltanet`
+The short-context suite scores every task in full.  The `kda` / `gla` / `deltanet`
 rows come from a second batch, run months later on freshly tokenised DCLM; its own control reproduced
 the published 110.0 at 110.1, which is what licenses one table.
 
@@ -192,12 +197,17 @@ What the numbers say:
 - **The recipe, not the kernel, is what lifts a swapped model above the original.**  The control gains
   as much as the students on both suites, so the question a swap has to answer is what it costs *on top
   of the same training*.
-- **An exact init is nearly free, except at 128K.**  All four land within 1.3 relative points of the
-  control on short context and hold every needle to 64K; on the 128K distractor needle they trail it by
-  4 to 11 points (control 96.2, then `kda_fullgate` 92.4, `gdn2` 86.8, `rwkv7` 86.6, `kda` 85.6).
-- **KDA's low-rank forget gate costs retrieval.**  `kda` and `kda_fullgate` differ only in whether the
-  decay factors through a rank-128 bottleneck or a dense projection: 0.6 relative points apart on short
-  context, but the dense gate leads at every needle length and by 6.8 points at 128K.
+- **An exact init is free.**  All three exact-init kernels land on the control on both suites: relative
+  average 110.2–110.3 against 110.1, and the 128K distractor needle 96.2–96.4 against 96.8.  What the
+  target recurrence *is* matters far less than whether the pretrained function survives the change of
+  parameterisation.
+- **A richer gate buys nothing.**  `gdn2` adds 113M parameters of separate erase and write gates to
+  `kda`'s 7.4M low-rank per-channel decay: the two finish within 0.2 relative points of each other and
+  of the control, and their needle task averages match the control to 0.1 from 16K on (`gdn2` trails it
+  by 1.0 at 4K, on `niah_single_3`).
+- **The exact kernels used to look costly at 128K**, because the `layer` step was damaging them.  It is
+  skipped for an exact init now (see [Pipeline](#pipeline)); under the old recipe the same three kernels
+  scored 85.6–86.8 at 128K.  The deficit was an artifact of the step, not a property of the kernels.
 - **Dropping the delta-rule erase costs.**  `mamba2` trails the control by 8.6 relative points and
   loses the distractor needle at 128K (70.0 vs 96.2).
 - **A 64-token window holds short context, not retrieval.**  `swa` scores 101.0 relative but decays
@@ -223,8 +233,8 @@ Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, co
 | `rwkv7`  | 79K / 76K         | 33.3          | 2.7 / 6.1     |
 
 
-Full tables, the per-kernel mappings and the approaches that were tried and dropped:
-[docs/framework.md](docs/framework.md).
+Full tables and the approaches that were tried and dropped: [docs/results.md](docs/results.md).
+Per-kernel mappings: [docs/kernels.md](docs/kernels.md).
 
 ## Citation
 

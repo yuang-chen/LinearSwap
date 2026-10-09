@@ -21,32 +21,21 @@ is representable *exactly* in that low-rank form:
 
 With ``W2[:, H:] = 0`` the extra rank is invisible at init but receives
 gradient (grad W2[:, H:] = dL/da ⊗ (W1[H:] x) != 0), so SFT can use it.
-Variant ``kda_fullgate`` uses a dense ``f_proj`` instead (more parameters,
-same function at init).
 
 KDA's default output gate is a low-rank *sigmoid*-gated norm; the backbone's is a
 full-rank *SiLU*-gated norm, which is not representable, so ``g_proj`` and
 ``o_norm`` are replaced by the backbone's parameterisation.
 """
 
-import torch.nn as nn
 from fla.layers import KimiDeltaAttention
 
-from .common import copy_, init_lowrank_tiled, tile_rows, tile_vec
+from .common import copy_, init_lowrank_tiled, tile_vec
 from .fla_layer import register_fla_kernel
-
-
-def dense_f_proj(layer, cfg):
-    ref = layer.q_proj.weight
-    layer.f_proj = nn.Linear(layer.hidden_size, layer.gate_dim, bias=False, device=ref.device, dtype=ref.dtype)
 
 
 def init_extra(layer, src):
     K = layer.head_k_dim
-    if isinstance(layer.f_proj, nn.Linear):
-        copy_(layer.f_proj.weight, tile_rows(src["a"], K), "f_proj")
-    else:
-        init_lowrank_tiled(layer.f_proj, src["a"], K, "f_proj")       # exact low-rank embedding of the tiled decay
+    init_lowrank_tiled(layer.f_proj, src["a"], K, "f_proj")       # exact low-rank embedding of the tiled decay
     copy_(layer.A_log, src["A_log"], "A_log")
     copy_(layer.dt_bias, tile_vec(src["dt_bias"], K), "dt_bias")
     copy_(layer.b_proj.weight, src["b"], "b_proj")
@@ -58,9 +47,4 @@ register_fla_kernel(
     "kda", KimiDeltaAttention,
     description="Kimi Delta Attention (FLA KimiDeltaAttention); scalar decay tiled into the low-rank per-channel gate.",
     init_extra=init_extra, new_param_names=_NEW, exact_init=True,
-)
-register_fla_kernel(
-    "kda_fullgate", KimiDeltaAttention,
-    description="KDA with a dense (full-rank) f_proj decay projection instead of the low-rank MLP.",
-    post_build=dense_f_proj, init_extra=init_extra, new_param_names=_NEW, exact_init=True,
 )

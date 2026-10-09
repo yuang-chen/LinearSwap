@@ -179,7 +179,8 @@ class LinearSwapModelWrapper:
         kernel = cfg.get("linear_kernel") or os.environ.get("LINSWAP_KERNEL")
         if kernel is None:
             raise ValueError(f"{model_dir}/config.json has no 'linear_kernel' and LINSWAP_KERNEL is unset")
-        base_model_dir = Path(cfg.get("base_model_dir", DEFAULT_BASE_MODEL_DIR))
+        # LINSWAP_BASE_MODEL_DIR (set by `linswap evaluate`) overrides the recorded path, which may be another machine's
+        base_model_dir = Path(os.environ.get("LINSWAP_BASE_MODEL_DIR") or cfg.get("base_model_dir", DEFAULT_BASE_MODEL_DIR))
         if not base_model_dir.is_absolute():  # checkpoint configs record repo-relative paths; RULER runs from RULER/scripts
             base_model_dir = Path(__file__).resolve().parents[3] / base_model_dir
         ckpt_dir = Path(cfg["ckpt_dir"]) if cfg.get("ckpt_dir") else model_dir

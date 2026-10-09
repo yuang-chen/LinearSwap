@@ -24,7 +24,7 @@ The final checkpoint (``outputs/<kernel>/distill/checkpoint-N``) is what ``evalu
 score; no supervised fine-tuning follows.
 
 Every run writes ``train_log.jsonl`` and a TensorBoard run (``<output_dir>/tensorboard``, see
-``tools/tb_logger.py``): loss, grad norm (total and per parameter group: the kernel's new parameters,
+``linswap.tb_logger``): loss, grad norm (total and per parameter group: the kernel's new parameters,
 the swapped layers' shared projections, the rest of the backbone), lr, in the ``layer`` and ``kl``
 steps the per-layer ``layer_mse`` (MSE between each student linear-attention layer's output and the
 teacher's, each model running on its own hidden states, so it includes error carried in from earlier
@@ -39,7 +39,6 @@ import contextlib
 import itertools
 import json
 import math
-import sys
 import time
 from pathlib import Path
 
@@ -52,11 +51,10 @@ from torch.utils.data import DataLoader
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model
 from ..registry import get_kernel
 from ..textdata import DEFAULT_TEXT_DIR, ensure_text_data
-from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn, evaluate
+from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn
 
-sys.path.insert(0, str(REPO_ROOT / "tools"))
-from tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_grad_norms,  # noqa: E402
-                       group_param_norms, init_state, param_groups, snapshot, update_ratio)
+from ..tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_grad_norms, group_param_norms,
+                         init_state, param_groups, snapshot, teacher_reference, update_ratio)
 
 STAGES = ("layer", "kl", "ce")
 # per-step defaults: sequence length, sequences per optimizer step, sequences per micro-batch, lr schedule
@@ -100,6 +98,9 @@ def add_args(ap):
     ap.add_argument("--val_length", type=int, default=8192, help="length of the held-out packed sequences")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--ce_chunk_size", type=int, default=2048)
+    ap.add_argument("--layer_skip_below", type=float, default=1e-4,
+                    help="skip the layer step when its loss on the first batch is already below this "
+                         "(a function-preserving swap has nothing to align); 0 always runs it")
     ap.add_argument("--init_from", default=None,
                     help="resume from this checkpoint dir: finished steps are skipped and a partial one continues "
                          "on the same data (optimizer state restarts)")
@@ -128,6 +129,19 @@ def checkpoint_config(model, args, stage="distill"):
         "new_param_names": list(model.new_param_names),
     })
     return cfg
+
+
+@torch.no_grad()
+def layer_alignment_loss(teacher, student, ids):
+    """The layer step's own objective on one batch, without training: how far the swapped mixers sit
+    from the teacher's on the teacher's own input."""
+    student.eval()
+    t_in, t_out, _ = teacher_layer_io(teacher, ids, return_hidden_before_norm=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = sum(F.mse_loss(b.linear_attn(t_in[i])[0].float(), t_out[i].float())
+                   for i, b in linear_blocks(student))
+    student.train()
+    return float(loss)
 
 
 def log_jsonl(path, record):
@@ -218,7 +232,7 @@ def stage_steps(args, stage, length, micro, accum):
 
 
 # --------------------------------------------------------------------- steps
-def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, log_path, step0, steps,
+def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir, log_path, step0, steps,
               seq_length, micro, accum, schedule, done=0, tb=None, init_sd=None):
     device = next(student.parameters()).device
     lr = getattr(args, f"{stage}_lr")
@@ -302,13 +316,10 @@ def run_stage(stage, args, teacher, student, train_loader, val_loader, out_dir, 
         tb.scalars(group_gn, gstep, "grad_norm/")
         tb.scalars({f"layer_{i}": v for i, v in layer_mse.items()}, gstep, "layer_mse/")
         if diag:
-            student.eval()
-            val = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
-            student.train()
+            stats = evaluate_vs_teacher(student, teacher_ref, args.ce_chunk_size)
+            val = stats["val_loss"]
             print(f"  {tag} step {step}: val_loss={val:.4f}", flush=True)
             log_jsonl(log_path, {"stage": tag, "step": step0 + step, "val_loss": val})
-            stats = {"val_loss": val, **evaluate_vs_teacher(student, teacher, val_loader, args.eval_batches,
-                                                            args.ce_chunk_size)}
             pstats = {"update_ratio": update_ratio(groups, before), "norm": group_param_norms(groups),
                       "drift_from_init": drift_from_init(groups, init_sd) if init_sd else {}}
             del before
@@ -398,15 +409,15 @@ def main(args) -> Path:
     init_sd = init_state(build_model(args.kernel, base_model_dir=args.base_model_dir, device="cpu")
                          if args.init_from else student)
 
-    val_t = evaluate(teacher, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
-    val0 = evaluate(student, val_loader, max_batches=args.eval_batches, chunk_size=args.ce_chunk_size)
+    teacher_ref = teacher_reference(teacher, val_loader, args.eval_batches, args.ce_chunk_size)
+    stats0 = evaluate_vs_teacher(student, teacher_ref, args.ce_chunk_size)
+    val_t, val0 = teacher_ref["loss"], stats0["val_loss"]
     print(f"  step {step}: val_loss={val0:.4f} (teacher {val_t:.4f})" + (f" [from {args.init_from}]" if args.init_from else ""))
     log_jsonl(log_path, {"stage": "init" if not args.init_from else "resume", "step": step, "val_loss": val0,
                          "teacher_val_loss": val_t})
     groups0 = param_groups(student, list(student.parameters()))
     log_diagnostics(tb, log_path, "init" if not args.init_from else "resume", step,
-                    {"val_loss": val0, **evaluate_vs_teacher(student, teacher, val_loader, args.eval_batches,
-                                                             args.ce_chunk_size)},
+                    {**stats0, "teacher_loss": val_t},
                     {"norm": group_param_norms(groups0), "drift_from_init": drift_from_init(groups0, init_sd)})
 
     resume, step = step, 0
@@ -421,7 +432,20 @@ def main(args) -> Path:
         if done:
             print(f"[distill] step={stage}: fast-forwarding the data past {done} steps", flush=True)
         loader = packed_loader(raw_train, length, micro, args.seed + step, skip=done * micro * accum)
-        step = run_stage(stage, args, teacher, student, loader, val_loader, out_dir, log_path, step, steps,
+        if stage == "layer" and not done and args.layer_skip_below > 0:
+            # An exact init starts this step at bf16 noise (~1e-6) with nothing to learn, and Adam's
+            # normalised update at lr 1e-3 then walks the weights away from a function-preserving
+            # solution: the objective rises, and the model does not recover it in the later steps.
+            probe = layer_alignment_loss(teacher, student, next(iter(loader))["input_ids"].to(device))
+            if probe < args.layer_skip_below:
+                print(f"[distill] step=layer: skipped (initial loss {probe:.2e} < {args.layer_skip_below:.0e}, "
+                      f"the swap already reproduces the teacher's layers)", flush=True)
+                log_jsonl(log_path, {"stage": "layer", "step": step, "skipped": True, "initial_loss": probe})
+                step += steps          # keep the step counter, data order and checkpoint numbering unchanged
+                continue
+            print(f"[distill] step=layer: initial loss {probe:.2e} >= {args.layer_skip_below:.0e}, running it",
+                  flush=True)
+        step = run_stage(stage, args, teacher, student, loader, teacher_ref, out_dir, log_path, step, steps,
                          length, micro, accum, schedule, done, tb=tb, init_sd=init_sd)
     ckpt = save(student, args, out_dir, step)
     tb.close()

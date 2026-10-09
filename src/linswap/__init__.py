@@ -1,6 +1,6 @@
 """Swap the Gated-DeltaNet linear-attention layers of a pretrained hybrid LLM for other linear kernels.
 
-    from linswap import build_model, list_kernels   # kernels: gdn, gdn2, kda, kda_fullgate, deltanet
+    from linswap import build_model, list_kernels   # kernels: gdn, gdn2, kda, deltanet
     model = build_model("kda")                       # exact, function-preserving init from the backbone in models/
     model = build_model(ckpt_dir="outputs/sft_kda_full/checkpoint-50")   # SFT checkpoint (kernel from config.json)
 """

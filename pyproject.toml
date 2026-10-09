@@ -24,7 +24,6 @@ dependencies = [
     "huggingface_hub",
     "datasets",
     "numpy",
-    "tensorboard",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +36,8 @@ mamba = ["causal-conv1d>=1.5", "mamba-ssm>=2.3.2"]
 # Hopper-class GPUs (compute capability 9.x) with Triton 3.4–3.7: FLA refuses the Triton backward of gated
 # chunk kernels (incorrect results, fla-org/flash-linear-attention#640) and uses TileLang instead.
 hopper = ["tilelang>=0.1.8"]
+# TensorBoard dashboard for `distill` (without it the run logs train_log.jsonl only, with a warning).
+tensorboard = ["tensorboard"]
 
 [project.scripts]
 linswap = "linswap.cli:main"
