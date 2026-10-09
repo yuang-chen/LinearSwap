@@ -40,6 +40,9 @@ def add_args(ap):
     ap.add_argument("--skip_ruler", action="store_true")
     ap.add_argument("--skip_lmeval", action="store_true")
     ap.add_argument("--lmeval_tasks", default=lmeval.DEFAULT_TASKS)
+    ap.add_argument("--lmeval_batch_size", default="8", help="lm-eval batch size (an int or 'auto')")
+    ap.add_argument("--lmeval_fewshot_batch_size", default=None,
+                    help="lm-eval batch size for the few-shot tasks, i.e. MMLU (default: --lmeval_batch_size)")
 
 
 def main(args):
@@ -66,6 +69,9 @@ def main(args):
 
     if not args.skip_lmeval:
         le = _namespace(lmeval.add_args, ["--models", args.baseline or "gdn", model, "--name", f"{name}-lmeval",
-                                          "--base_model_dir", args.base_model_dir, "--tasks", args.lmeval_tasks])
+                                          "--base_model_dir", args.base_model_dir, "--tasks", args.lmeval_tasks,
+                                          "--batch_size", args.lmeval_batch_size]
+                        + (["--fewshot_batch_size", args.lmeval_fewshot_batch_size]
+                           if args.lmeval_fewshot_batch_size else []))
         lmeval.main(le)
     return rows

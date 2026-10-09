@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from einops import rearrange
-from fla.layers.utils import get_layer_cache, update_layer_cache
+from fla.layers.utils import get_layer_cache, repad_hidden_states, unpad_hidden_states, update_layer_cache
 from fla.modules import FusedRMSNormSwishGate, ShortConvolution
 from fla.modules.l2norm import l2_norm
 
@@ -47,8 +47,9 @@ class BackboneMixer(nn.Module):
         self.o_norm = FusedRMSNormSwishGate(self.head_v_dim, eps=norm_eps)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-    def recurrence(self, hidden_states, q, k, v, state, use_cache):
-        """q, k: [B, T, H, K] (L2-normalised if ``qk_l2norm``), v: [B, T, H, V]; return (o [B, T, H, V], new state)."""
+    def recurrence(self, hidden_states, q, k, v, state, use_cache, cu_seqlens=None):
+        """q, k: [B, T, H, K] (L2-normalised if ``qk_l2norm``), v: [B, T, H, V]; return (o [B, T, H, V], new state).
+        With ``cu_seqlens`` the batch is packed (B == 1) and ``state`` has one entry per sequence."""
         raise NotImplementedError
 
     @property
@@ -56,15 +57,21 @@ class BackboneMixer(nn.Module):
         return not torch.is_grad_enabled()
 
     def forward(self, hidden_states, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
-        T = hidden_states.shape[1]
+        B, T = hidden_states.shape[:2]
         H = self.num_heads
         last_state = get_layer_cache(self, past_key_values)
+        # A padding mask packs the batch into one varlen sequence (B == 1, ``cu_seqlens``), as FLA's layers do.
+        hidden_states, indices, cu_seqlens = unpad_hidden_states(hidden_states, kwargs.get("cu_seqlens"),
+                                                                 attention_mask, T)
         conv_q = conv_k = conv_v = None
         if last_state is not None:
             conv_q, conv_k, conv_v = last_state["conv_state"]
-        q, conv_q = self.q_conv1d(x=self.q_proj(hidden_states), cache=conv_q, output_final_state=use_cache)
-        k, conv_k = self.k_conv1d(x=self.k_proj(hidden_states), cache=conv_k, output_final_state=use_cache)
-        v, conv_v = self.v_conv1d(x=self.v_proj(hidden_states), cache=conv_v, output_final_state=use_cache)
+        q, conv_q = self.q_conv1d(x=self.q_proj(hidden_states), cache=conv_q, output_final_state=use_cache,
+                                  cu_seqlens=cu_seqlens)
+        k, conv_k = self.k_conv1d(x=self.k_proj(hidden_states), cache=conv_k, output_final_state=use_cache,
+                                  cu_seqlens=cu_seqlens)
+        v, conv_v = self.v_conv1d(x=self.v_proj(hidden_states), cache=conv_v, output_final_state=use_cache,
+                                  cu_seqlens=cu_seqlens)
         q, k = (rearrange(x, "b t (h d) -> b t h d", h=H) for x in (q, k))
         v = rearrange(v, "b t (h d) -> b t h d", h=self.num_v_heads)
         if self.qk_l2norm:
@@ -72,10 +79,11 @@ class BackboneMixer(nn.Module):
         if self.v_groups > 1:  # grouped value heads: share each q/k head across its value-head group
             q, k = (x.repeat_interleave(self.v_groups, dim=2) for x in (q, k))
         state = last_state["recurrent_state"] if last_state is not None else None
-        o, state = self.recurrence(hidden_states, q, k, v, state, use_cache)
+        o, state = self.recurrence(hidden_states, q, k, v, state, use_cache, cu_seqlens=cu_seqlens)
         update_layer_cache(self, past_key_values, recurrent_state=state, conv_state=(conv_q, conv_k, conv_v), offset=T)
         o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "b t (h d) -> b t h d", h=self.num_v_heads))
-        return self.o_proj(rearrange(o, "b t h d -> b t (h d)")), None, past_key_values
+        o = self.o_proj(rearrange(o, "b t h d -> b t (h d)"))
+        return repad_hidden_states(o, indices, B, T), None, past_key_values
 
 
 def build_backbone_mixer(mixer_cls, cfg, layer_idx, **extra):

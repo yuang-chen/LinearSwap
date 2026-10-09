@@ -92,8 +92,8 @@ model = AutoModelForCausalLM.from_pretrained("hf/Qwen3.5-0.8B-RWKV7", dtype=torc
 
 Checkpoints use Qwen's tensor layout: everything except `model.layers.{i}.linear_attn.*` is
 byte-identical to the backbone, so quantisers and converters see "Qwen with a different linear
-layer". Batches must be unpadded or right-padded, generation takes equal-length prompts, and
-decoding is greedy or sampling (the model is stateful, so no beam search).
+layer". Batches may be right-padded (loss / logits) or left-padded (also HF `generate`, every kernel
+but `swa`), and decoding is greedy or sampling (the model is stateful, so no beam search).
 
 **Adding a kernel.** Two routes, one file each in `kernels/`. A stock FLA layer plus an init
 recipe, where `register_fla_kernel` copies what every layer shares with GDN and calls your
@@ -147,8 +147,8 @@ python tools/throughput.py --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-1
 - **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` (retrieval), `vt` (multi-hop
 variable tracking), `cwe` / `fwe` (common / frequent words extraction) at 4K–128K, 500 samples,
 cached greedy decoding, RULER's base prompt template (`--chat_template` switches).
-- **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot and MMLU 5-shot,
-reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.
+- **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot, MMLU 5-shot and
+IFEval (chat template, generative), reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.
 
 
 

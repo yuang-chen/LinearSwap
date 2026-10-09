@@ -51,13 +51,14 @@ class Mamba2SSDLayer(BackboneMixer):
         self.D = nn.Parameter(torch.zeros(HV))
         self.D._no_weight_decay = True
 
-    def recurrence(self, hidden_states, q, k, v, state, use_cache):
+    def recurrence(self, hidden_states, q, k, v, state, use_cache, cu_seqlens=None):
         T, H = k.shape[1], k.shape[2]
         delta = F.softplus(self.dt_proj(hidden_states).float() + self.dt_bias.float())   # Δ_t  [B, T, H]
         g = -self.A_log.float().exp() * delta                                              # log decay per head
         k_w = (k.float() * delta.unsqueeze(-1)).to(k.dtype)                                 # Δ_t B_t
         fn = fused_recurrent_simple_gla if (self.use_recurrent_kernel and T <= 64) else chunk_simple_gla
-        o, state = fn(q=q, k=k_w, v=v, g=g, scale=self.head_k_dim ** -0.5, initial_state=state, output_final_state=use_cache)
+        o, state = fn(q=q, k=k_w, v=v, g=g, scale=self.head_k_dim ** -0.5, initial_state=state, output_final_state=use_cache,
+                      cu_seqlens=cu_seqlens)
         return o + v * self.D.view(1, 1, H, 1).to(v.dtype), state
 
 

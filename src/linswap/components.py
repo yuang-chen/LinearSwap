@@ -166,7 +166,7 @@ class GroupedQueryAttention(nn.Module):
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values_cat_raw.repeat_interleave(self.group_size, dim=1)
 
-        if cache is None:
+        if cache is None and mask is None:
             # Training path: use Flash/Memory-Efficient SDPA with causal masking.
             attn_output = F.scaled_dot_product_attention(
                 queries,
@@ -177,11 +177,15 @@ class GroupedQueryAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            # Generation path with KV cache: build a 2-D causal mask.
+            # Generation path with KV cache and/or a padding mask: build the causal mask explicitly.
             kv_len = keys.size(-2)
             q_pos = torch.arange(num_tokens, device=queries.device).unsqueeze(1) + start_pos
             kv_pos = torch.arange(kv_len, device=keys.device).unsqueeze(0)
             attn_mask = q_pos >= kv_pos  # True = keep
+            if mask is not None:
+                # mask: [B, kv_len] 0/1 key padding (left padding).  Pad keys are hidden from every query;
+                # each position still sees itself, so a pad query's row is never empty (no NaN to leak).
+                attn_mask = (attn_mask & mask[:, None, None, :].bool()) | (q_pos == kv_pos)
             attn_output = F.scaled_dot_product_attention(
                 queries,
                 keys,

@@ -47,7 +47,7 @@ class TransformerBlock(nn.Module):
     def token_mixer(self):
         return self.self_attn if self.layer_type == "full_attention" else self.linear_attn
 
-    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, linear_cache=None, use_cache=False):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, linear_cache=None, use_cache=False, linear_mask=None):
         shortcut = x
         x = self.input_layernorm(x)
         if self.layer_type == "full_attention":
@@ -55,7 +55,8 @@ class TransformerBlock(nn.Module):
                 x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache, use_cache=use_cache,
             )
         else:
-            h, _, _ = self.linear_attn(x, past_key_values=linear_cache, use_cache=linear_cache is not None)
+            h, _, _ = self.linear_attn(x, attention_mask=linear_mask, past_key_values=linear_cache,
+                                       use_cache=linear_cache is not None)
             next_kv_cache = None
         x = h + shortcut
         return self.mlp(self.post_attention_layernorm(x)) + x, next_kv_cache
@@ -108,7 +109,10 @@ class LinearSwapBackbone(nn.Module):
             self._rope_tables = {key: (cos.to(device=device, dtype=dtype), sin.to(device=device, dtype=dtype))}
         return self._rope_tables[key]
 
-    def forward(self, in_idx, cache=None, use_cache=False, apply_norm=True):
+    def forward(self, in_idx, cache=None, use_cache=False, apply_norm=True, attention_mask=None):
+        """``attention_mask`` ([B, cached + T], 0 = pad) is for left-padded batches only: full attention hides
+        the pad keys, and the linear layers unpad the current chunk to varlen (``cu_seqlens``) when it holds
+        any pad -- a decode step never does, so it takes the unpadded path."""
         x = self.embed_tokens(in_idx)
         num_tokens = x.shape[1]
         if cache is not None or use_cache:
@@ -116,17 +120,20 @@ class LinearSwapBackbone(nn.Module):
             self.current_pos = start_pos + num_tokens
         else:
             start_pos = 0
-        mask = None  # full attention builds its own compact causal mask; never materialise a dense one
+        mask = attention_mask  # key padding only; full attention builds its own compact causal mask
+        linear_mask = None
+        if mask is not None and not bool(mask[:, -num_tokens:].all()):
+            linear_mask = mask[:, -num_tokens:]
         linear_cache = cache.linear_cache if cache is not None else None
         cos, sin = self.rope_tables(x.device, x.dtype)
         for i, block in enumerate(self.layers):
             kv_cache = cache.get(i) if cache is not None else None
             if self.gradient_checkpointing and self.training:
                 x, new_kv = checkpoint(block, x, mask, cos, sin, start_pos, kv_cache, linear_cache, use_cache,
-                                       use_reentrant=False)
+                                       linear_mask, use_reentrant=False)
             else:
                 x, new_kv = block(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=kv_cache,
-                                  linear_cache=linear_cache, use_cache=use_cache)
+                                  linear_cache=linear_cache, use_cache=use_cache, linear_mask=linear_mask)
             if cache is not None and new_kv is not None:
                 cache.update(i, new_kv)
         return self.norm(x) if apply_norm else x
