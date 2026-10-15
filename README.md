@@ -146,7 +146,8 @@ python tools/throughput.py --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-1
 
 - **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` (retrieval), `vt` (multi-hop
 variable tracking), `cwe` / `fwe` (common / frequent words extraction) at 4K–128K, 500 samples,
-cached greedy decoding, RULER's base prompt template (`--chat_template` switches).
+cached greedy decoding in left-padded batches (`--batch_size`), RULER's base prompt template
+(`--chat_template` switches).
 - **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot, MMLU 5-shot and
 IFEval (chat template, generative), reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.
 

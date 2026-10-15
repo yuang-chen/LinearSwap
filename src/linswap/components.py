@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def compute_rope_params(
@@ -176,8 +177,20 @@ class GroupedQueryAttention(nn.Module):
                 dropout_p=0.0,
                 is_causal=True,
             )
+        elif cache is None:
+            # Left-padded prefill (batched generation): causal attention per row over its real tokens.  A dense
+            # [B, T, T] mask would be quadratic in T (~50 GB per row at 128K); flash takes no mask and no extra memory.
+            # Pads are a contiguous prefix (the callers check), and a pad query's output is unused, so it is zero.
+            attn_output = torch.zeros_like(queries)
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                for r, s in enumerate((num_tokens - mask.sum(dim=1)).tolist()):
+                    if s < num_tokens:
+                        attn_output[r:r + 1, :, s:] = F.scaled_dot_product_attention(
+                            queries[r:r + 1, :, s:], keys[r:r + 1, :, s:], values[r:r + 1, :, s:],
+                            attn_mask=None, dropout_p=0.0, is_causal=True)
         else:
-            # Generation path with KV cache and/or a padding mask: build the causal mask explicitly.
+            # Decode step / continuation with a KV cache: build the causal mask explicitly (q is short, so the
+            # [B, 1, q, kv] mask is small).
             kv_len = keys.size(-2)
             q_pos = torch.arange(num_tokens, device=queries.device).unsqueeze(1) + start_pos
             kv_pos = torch.arange(kv_len, device=keys.device).unsqueeze(0)
@@ -186,14 +199,18 @@ class GroupedQueryAttention(nn.Module):
                 # mask: [B, kv_len] 0/1 key padding (left padding).  Pad keys are hidden from every query;
                 # each position still sees itself, so a pad query's row is never empty (no NaN to leak).
                 attn_mask = (attn_mask & mask[:, None, None, :].bool()) | (q_pos == kv_pos)
-            attn_output = F.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
+            # Not cuDNN: its SDPA backend compiles a plan per distinct KV length, ~0.4 s per decode step as the
+            # cache grows by one token.  Flash / mem-efficient have no per-shape cost.  The training branch above
+            # keeps PyTorch's default (cuDNN is the fastest there, and its shapes are fixed).
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                attn_output = F.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
 
         context = attn_output.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         context = context * torch.sigmoid(gate)

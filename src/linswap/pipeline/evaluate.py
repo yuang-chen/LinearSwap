@@ -43,8 +43,14 @@ def add_args(ap):
     ap.add_argument("--chat_template", action="store_true",
                     help="wrap RULER prompts in the backbone's chat template; the default is RULER's base "
                          "template (context + question + answer prefix).  Use the same setting for every model.")
+    ap.add_argument("--batch_size", type=int, default=1,
+                    help="prompts per generate call (left-padded); swa always runs one at a time")
+    ap.add_argument("--max_batch_tokens", type=int, default=131072,
+                    help="padded tokens (prompt + generation) per generate call; caps --batch_size per length, "
+                         "e.g. 32K prompts run 3 at a time and 128K prompts one at a time at the default")
     ap.add_argument("--ruler_jobs", type=int, default=3,
-                    help="RULER tasks to run at once; decoding is latency-bound (~25%% GPU for one task)")
+                    help="RULER tasks to run at once (separate processes, one model copy each); with "
+                         "--batch_size > 1 one job already fills the GPU")
     ap.add_argument("--skip_ruler", action="store_true")
 
 
@@ -84,6 +90,9 @@ def _ruler_env(extra=None):
     # at once (each with --ruler_jobs processes) then exhaust thread creation on a many-core host (EAGAIN)
     for var in ("RAYON_NUM_THREADS", "OMP_NUM_THREADS"):
         env.setdefault(var, "4")
+    # the KV cache grows by one token per decode step; without this the caching allocator fragments (reserved
+    # memory ~1.3x the peak allocation of a batch)
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     # repo-local kernel packages (e.g. gated_breg_delta_rule) are not installed; RULER runs from its own cwd
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO_ROOT), env.get("PYTHONPATH")) if p)
@@ -97,6 +106,33 @@ def _run(cmd, log_file, env=None):
         r = subprocess.run([str(c) for c in cmd], cwd=RULER_DIR, env=_ruler_env(env), stdout=log, stderr=subprocess.STDOUT)
     if r.returncode != 0:
         raise RuntimeError(f"RULER command failed (see {log_file}): {' '.join(map(str, cmd))}")
+
+
+def check_ruler_data(tasks):
+    """Fail before any model loads if a task's haystack / word list is missing: RULER's prepare.py exits 0
+    when its generator crashes, so otherwise the task only shows up as FAILED, at every length."""
+    import yaml
+    cfg = yaml.safe_load(open(RULER_DIR / "synthetic.yaml"))
+    json_dir = RULER_DIR / "data" / "synthetic" / "json"
+    missing = {}
+    for t in tasks:
+        if t not in cfg:
+            raise SystemExit(f"evaluate: unknown RULER task {t!r}; known: {', '.join(cfg)}")
+        a = cfg[t].get("args", {})
+        if a.get("type_haystack") == "essay":
+            f = "PaulGrahamEssays.json"
+        elif cfg[t]["task"] == "common_words_extraction":
+            f = "english_words.json"
+        elif cfg[t]["task"] == "qa":
+            f = f"{a['dataset']}.json"
+        else:
+            continue
+        if not (json_dir / f).exists():
+            missing.setdefault(f, []).append(t)
+    if missing:
+        lines = [f"  {f} (needed by {', '.join(ts)})" for f, ts in missing.items()]
+        raise SystemExit(f"evaluate: missing RULER data in {json_dir}:\n" + "\n".join(lines)
+                         + "\nfetch it with the download_*.{py,sh} scripts in that directory")
 
 
 def _read_summary(pred_dir: Path) -> dict:
@@ -116,12 +152,12 @@ def path_slug(name):
 
 
 def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, use_cache, out_dir: Path,
-              jobs: int = 1) -> dict:
+              jobs: int = 1, batch_size: int = 1, max_batch_tokens: int = 131072) -> dict:
     """Returns {length: {task: score}}.
 
-    ``jobs`` runs that many tasks at once.  RULER decodes one sequence at a time, so a single task
-    leaves the GPU mostly idle (~25 % on an L20X); several tasks in flight fill it without needing
-    more memory than one model copy each."""
+    ``jobs`` runs that many tasks at once, each a separate process with its own model copy.
+    ``batch_size`` prompts go into one generate call (left-padded), capped so that a call holds at most
+    ``max_batch_tokens`` padded tokens."""
     results = {}
     ruler_dir = out_dir / "ruler"
     ruler_dir.mkdir(parents=True, exist_ok=True)
@@ -146,9 +182,10 @@ def run_ruler(name, model_dir: Path, base_model_dir, tasks, lengths, samples, us
                       "--benchmark", "synthetic", "--task", task,
                       "--server_type", "linswap" if use_cache else "linswap_nocache",
                       "--model_name_or_path", model_dir, "--temperature", "0.0", "--top_k", "32", "--top_p", "1.0",
-                      "--batch_size", "1"], tlog,
+                      "--batch_size", batch_size], tlog,
                      # the wrapper would otherwise read the checkpoint's recorded base_model_dir, which may not exist
-                     env={"LINSWAP_BASE_MODEL_DIR": str(base_model_dir)})
+                     env={"LINSWAP_BASE_MODEL_DIR": str(base_model_dir),
+                          "LINSWAP_MAX_BATCH_TOKENS": str(max_batch_tokens)})
                 print(f"    {name} L={L} {task}: {time.time()-t:.0f}s", flush=True)
                 return None
             except RuntimeError as e:  # keep going; the task is reported as missing
@@ -180,6 +217,8 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     tasks = [t for t in args.tasks.split(",") if t]
     lengths = [int(x) for x in args.lengths.split(",") if x]
+    if not args.skip_ruler:
+        check_ruler_data(tasks)
     if not args.chat_template:
         os.environ["LINSWAP_NO_CHAT_TEMPLATE"] = "1"   # inherited by the RULER subprocesses
     print(f"[evaluate] RULER prompts: {'chat template' if args.chat_template else 'base template'}")
@@ -198,7 +237,7 @@ def main(args):
                 with open(model_dir / "config.json", "w") as f:
                     json.dump({"linear_kernel": kernel, "base_model_dir": str(base)}, f)
             res = run_ruler(disp, model_dir, base, tasks, lengths, args.samples, not args.no_cache, out_dir,
-                            jobs=args.ruler_jobs)
+                            jobs=args.ruler_jobs, batch_size=args.batch_size, max_batch_tokens=args.max_batch_tokens)
             for L, scores in res.items():
                 for t, s in scores.items():
                     row[f"{t}@{L}"] = s

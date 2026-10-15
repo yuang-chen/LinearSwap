@@ -115,6 +115,9 @@ args = parser.parse_args()
 args.stop_words = list(filter(None, args.stop_words.split(',')))
 if args.server_type == 'hf' or args.server_type == 'gemini' or args.server_type.startswith('linswap'):
     args.threads = 1
+# In-process models fail deterministically (e.g. CUDA OOM): retrying the same batch would loop forever.
+# Remote servers keep RULER's retry-until-success behaviour.
+LOCAL_SERVER_TYPES = ('hf', 'mamba', 'linswap', 'linswap_nocache')
 
 
 def get_llm(tokens_to_generate):
@@ -299,6 +302,9 @@ def main():
                 break
             except Exception as e:
                 traceback.print_exc()
+                if args.server_type in LOCAL_SERVER_TYPES:
+                    failures.append(e)
+                    return
 
         zipped_iter = zip(pred_list, idx_list, index_list, input_list,
                           outputs_list, others_list, truncation_list, length_list)
@@ -322,6 +328,7 @@ def main():
             }
 
     threads = []
+    failures = []
     outputs_parallel = [{} for _ in range(len(data))]
 
     batched_data = []
@@ -376,6 +383,9 @@ def main():
                         fout.write(json.dumps(outputs_parallel[idx]) + '\n')
 
                 start_idx = end_idx + 1
+
+                if failures:  # predictions written so far are kept; a rerun resumes after them
+                    sys.exit(f"{args.task}: generation failed ({type(failures[0]).__name__}: {failures[0]})")
 
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 
