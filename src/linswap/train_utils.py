@@ -1,8 +1,9 @@
 """Batching, packing and chunked losses for the distillation stages.
 
 ``collate_fn`` right-pads, ``PackedDataset`` concatenates documents into fixed-length sequences, and the
-chunked cross-entropy / evaluation helpers compute the loss in vocabulary chunks so the full logits are
-never materialised."""
+chunked cross-entropy / evaluation helpers compute the loss ``chunk_size`` token positions at a time
+(each chunk over the full vocabulary, so the loss is exact) so the logits of a whole batch are never
+materialised."""
 
 from __future__ import annotations
 

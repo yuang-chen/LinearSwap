@@ -10,15 +10,25 @@ no chat template anywhere:
   layer   every linear-attention layer of the student is fed the *teacher's* input to that layer and
           trained (L2) to reproduce the teacher layer's output; all layers at once, one optimizer, only
           the swapped layers' parameters.  100M tokens at length 512, lr 1e-3 decayed to 1e-5 (cosine).
-  kl      end-to-end KL(teacher ‖ student) on the next-token distributions, computed in vocabulary
-          chunks so the full logits are never materialised.  500M tokens at length 512, flat lr 1e-5,
-          *all* parameters (freezing the MLPs or the embeddings costs accuracy).
+  kl      end-to-end KL(teacher ‖ student) on the next-token distributions, computed over chunks of
+          token positions (full vocabulary in each) so the logits of a whole batch are never
+          materialised.  500M tokens at length 512, flat lr 1e-5, *all* parameters (freezing the MLPs
+          or the embeddings costs accuracy).
   ce      context-length extension: plain next-token cross-entropy without the teacher, 100M tokens at
           length 16384, flat lr 1e-5, all parameters.
 
 Budgets are given in tokens (``--<step>_tokens``) or in optimizer steps (``--<step>_steps``); the
 sequence length, sequences per step and schedule of each step have their own defaults (see ``add_args``)
 and can be overridden with ``--stage_length`` / ``--stage_batch`` / ``--stage_micro`` / ``--stage_schedule``.
+
+Bookkeeping.  ``step`` in the log and in ``checkpoint-N`` is the *nominal* global step of the plan: a
+``layer`` step that skips itself keeps its range, so checkpoint numbers and the data order of the later
+steps do not depend on whether it ran.  The work actually done is counted separately — ``updates``
+(optimizer steps), ``tokens`` (training tokens consumed) and ``teacher_tokens`` (tokens the teacher ran
+on) in every log record and in each checkpoint's ``train_state.json``; a skipped step adds nothing.
+``manifest.json`` records the code and package revisions, the base model, the corpus and the plan.
+A checkpoint written inside a step also holds the optimizer state (``optimizer.pt``, kept for the newest
+checkpoint only), so ``--init_from`` continues that step exactly; the data order is replayed from the seed.
 
 The final checkpoint (``outputs/<kernel>/distill/checkpoint-N``) is what ``evaluate`` and ``lmeval``
 score; no supervised fine-tuning follows.
@@ -49,6 +59,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from ..load_weights import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model
+from ..manifest import model_identity, write_manifest
 from ..registry import get_kernel
 from ..textdata import DEFAULT_TEXT_DIR, ensure_text_data
 from ..train_utils import PackedDataset, chunked_cross_entropy_with_backward, collate_fn
@@ -57,6 +68,8 @@ from ..tb_logger import (TBLogger, drift_from_init, evaluate_vs_teacher, group_g
                          init_state, param_groups, snapshot, teacher_reference, update_ratio)
 
 STAGES = ("layer", "kl", "ce")
+TEACHER_STAGES = ("layer", "kl")          # the steps that run the teacher
+COUNTERS = ("updates", "tokens", "teacher_tokens", "train_seconds")   # work actually done, see the module docstring
 # per-step defaults: sequence length, sequences per optimizer step, sequences per micro-batch, lr schedule
 STAGE_DEFAULTS = {
     "layer": dict(length=512, batch=32, micro=32, schedule="cosine"),
@@ -92,6 +105,11 @@ def add_args(ap):
     ap.add_argument("--adam_betas", default="0.9,0.95")
     ap.add_argument("--adam_eps", type=float, default=1e-8)
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    ap.add_argument("--param_dtype", default="bfloat16", choices=("bfloat16", "float32"),
+                    help="dtype of the student's trained weights; the forward pass runs in bf16 either way.  "
+                         "bfloat16 (the published recipe) rounds every update to the weight's own bf16 grid, "
+                         "which drops an lr 1e-5 Adam step on any weight above ~2.5e-3 (about 4 in 5); "
+                         "float32 keeps full-precision master weights and writes a float32 checkpoint")
     ap.add_argument("--eval_batches", type=int, default=10, help="held-out packed sequences for the validation loss")
     ap.add_argument("--eval_every", type=int, default=200)
     ap.add_argument("--save_every", type=int, default=2000)
@@ -103,7 +121,8 @@ def add_args(ap):
                          "(a function-preserving swap has nothing to align); 0 always runs it")
     ap.add_argument("--init_from", default=None,
                     help="resume from this checkpoint dir: finished steps are skipped and a partial one continues "
-                         "on the same data (optimizer state restarts)")
+                         "on the same data, with the optimizer state when the checkpoint holds it (optimizer.pt: "
+                         "the newest checkpoint of an unfinished run), restarting the optimizer otherwise")
     ap.add_argument("--init_step", type=int, default=None,
                     help="global step of --init_from (default: parsed from its checkpoint-N name)")
     ap.add_argument("--tensorboard_dir", default=None, help="default <output_dir>/tensorboard")
@@ -189,7 +208,8 @@ def record_layer_mse(model, t_out, acc, scale=1.0):
 
 
 def chunked_kl_with_backward(s_hidden, t_hidden, s_head, t_head, chunk_size=2048, temperature=1.0, loss_scale=1.0):
-    """KL(teacher ‖ student) averaged over positions, back-propagated in vocabulary-chunks."""
+    """KL(teacher ‖ student) averaged over positions, back-propagated in chunks of ``chunk_size`` positions
+    (each chunk's ``log_softmax`` covers the full vocabulary, so the loss is exact)."""
     b, T, d = s_hidden.shape
     s_flat, t_flat = s_hidden.reshape(-1, d), t_hidden.reshape(-1, d)
     grad = torch.zeros_like(s_flat)
@@ -221,7 +241,11 @@ def stage_plan(args, stage):
     batch = int(_stage_map(args.stage_batch).get(stage, d["batch"]))
     micro = min(int(_stage_map(args.stage_micro).get(stage, d["micro"])), batch)
     schedule = _stage_map(args.stage_schedule).get(stage, d["schedule"])
-    return length, micro, max(1, batch // micro), schedule
+    if batch % micro:
+        raise SystemExit(f"distill: step {stage!r}: {batch} sequences per optimizer step is not a multiple of the "
+                         f"micro-batch {micro} (--stage_batch / --stage_micro); accumulation would train on "
+                         f"{batch // micro * micro} sequences per step instead")
+    return length, micro, batch // micro, schedule
 
 
 def stage_steps(args, stage, length, micro, accum):
@@ -231,9 +255,57 @@ def stage_steps(args, stage, length, micro, accum):
     return max(1, int(float(getattr(args, f"{stage}_tokens")) // (micro * accum * length)))
 
 
+def stage_table(args, stages):
+    """The plan, one row per requested step.  ``start_step`` is the nominal global step the step begins at
+    (it numbers the checkpoints and, through ``data_seed``, fixes the step's data order)."""
+    rows, step = [], 0
+    for stage in stages:
+        length, micro, accum, schedule = stage_plan(args, stage)
+        steps = stage_steps(args, stage, length, micro, accum)
+        tok_per_step = micro * accum * length
+        rows.append(dict(stage=stage, length=length, micro=micro, accum=accum, schedule=schedule,
+                         lr=getattr(args, f"{stage}_lr"), steps=steps, tokens_per_step=tok_per_step,
+                         tokens=steps * tok_per_step, start_step=step, data_seed=args.seed + step))
+        step += steps
+    return rows
+
+
+def new_counters():
+    return dict.fromkeys(COUNTERS, 0)
+
+
+def resume_counters(init_from, plan, resume):
+    """The work done before nominal step ``resume``: the checkpoint's own ``train_state.json``, or, for a
+    checkpoint written before that file existed, the plan up to ``resume`` without a ``layer`` step that the
+    run's log records as skipped (wall time is unknown there and restarts at 0)."""
+    state = Path(init_from) / "train_state.json"
+    if state.exists():
+        with open(state) as f:
+            saved = json.load(f)
+        return {k: saved.get(k, 0) for k in COUNTERS}
+    log = Path(init_from).parent / "train_log.jsonl"
+    skipped = False
+    if log.exists():
+        with open(log) as f:
+            skipped = any('"skipped": true' in line for line in f)
+    counters = new_counters()
+    for row in plan:
+        done = min(max(resume - row["start_step"], 0), row["steps"])
+        if row["stage"] == "layer" and skipped:
+            continue
+        counters["updates"] += done
+        counters["tokens"] += done * row["tokens_per_step"]
+        if row["stage"] in TEACHER_STAGES:
+            counters["teacher_tokens"] += done * row["tokens_per_step"]
+    return counters
+
+
 # --------------------------------------------------------------------- steps
 def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir, log_path, step0, steps,
-              seq_length, micro, accum, schedule, done=0, tb=None, init_sd=None):
+              seq_length, micro, accum, schedule, done=0, tb=None, init_sd=None, counters=None, optimizer_state=None):
+    """Train one step of the recipe from its ``done``-th optimizer step.  ``counters`` accumulates the work
+    done (``COUNTERS``); ``optimizer_state`` is the AdamW state a resumed step continues from."""
+    counters = new_counters() if counters is None else counters
     device = next(student.parameters()).device
     lr = getattr(args, f"{stage}_lr")
     params = linear_params(student) if stage == "layer" else list(student.parameters())
@@ -245,11 +317,15 @@ def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir,
     student.gradient_checkpointing = stage in ("kl", "ce") and student.supports_activation_checkpointing
     betas = tuple(float(b) for b in args.adam_betas.split(","))
     optimizer = AdamW([{"params": params, "lr": lr, "weight_decay": 0.0}], betas=betas, eps=args.adam_eps)
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
     tag = stage if stage != "ce" else f"ce@{seq_length}"
     tok_per_step = micro * accum * seq_length
     print(f"[distill] step={tag} steps={steps} lr={lr} ({schedule}) betas={betas} micro={micro} accum={accum} "
           f"trainable={sum(p.numel() for p in params)/1e6:.1f}M tokens/step={tok_per_step/1e3:.0f}K "
-          f"total={steps*tok_per_step/1e6:.0f}M" + (f" (resuming after {done})" if done else ""), flush=True)
+          f"total={steps*tok_per_step/1e6:.0f}M"
+          + (f" (resuming after {done}, optimizer state {'restored' if optimizer_state is not None else 'restarted'})"
+             if done else ""), flush=True)
     tb.text("stage", f"step {step0 + done}: {tag} ({steps} steps, lr {lr} {schedule}, {seq_length} x {micro} x {accum})",
             step0 + done)
 
@@ -300,9 +376,15 @@ def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir,
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
+        counters["updates"] += 1
+        counters["tokens"] += tok_per_step
+        if stage in TEACHER_STAGES:
+            counters["teacher_tokens"] += tok_per_step
+        counters["train_seconds"] = round(counters["train_seconds"] + time.time() - t_step, 3)
         rec = {"stage": tag, "step": step0 + step, "loss": acc / accum, "grad_norm": float(gn),
                "lr": optimizer.param_groups[0]["lr"], "elapsed_s": round(time.time() - start, 1),
-               "tokens": (step0 + step) * tok_per_step}
+               "updates": counters["updates"], "tokens": counters["tokens"],
+               "teacher_tokens": counters["teacher_tokens"]}
         rec.update({f"grad_norm_{g}": v for g, v in group_gn.items()})
         layer_mse = {i: float(v) for i, v in sorted(mse_acc.items())}
         if layer_mse:
@@ -325,7 +407,9 @@ def run_stage(stage, args, teacher, student, train_loader, teacher_ref, out_dir,
             del before
             log_diagnostics(tb, log_path, tag, gstep, stats, pstats)
         if step % args.save_every == 0 or last:
-            save(student, args, out_dir, step0 + step)
+            # A finished step hands nothing to the next one (each step builds its own optimizer), so only a
+            # checkpoint inside a step carries the optimizer state.
+            save(student, args, out_dir, step0 + step, counters, stage, step, None if last else optimizer)
     return step0 + step
 
 
@@ -342,12 +426,23 @@ def log_diagnostics(tb, log_path, stage, step, stats, pstats):
           f"top1={stats.get('top1_agreement', float('nan')):.3f}", flush=True)
 
 
-def save(student, args, out_dir, step):
+def save(student, args, out_dir, step, counters=None, stage=None, stage_step=None, optimizer=None):
+    """Write ``checkpoint-<step>``: weights and config, ``train_state.json`` (where the run stands and the
+    work done so far) and, with ``optimizer``, its state for an exact continuation of a step in progress.
+    The optimizer state is twice the size of the weights, so only the newest checkpoint keeps one."""
     ckpt = Path(out_dir) / f"checkpoint-{step}"
     ckpt.mkdir(parents=True, exist_ok=True)
     torch.save(student.state_dict(), ckpt / "model.pt")
     with open(ckpt / "config.json", "w") as f:
         json.dump(checkpoint_config(student, args), f, indent=1)
+    if counters is not None:
+        with open(ckpt / "train_state.json", "w") as f:
+            json.dump({"step": step, "stage": stage, "stage_step": stage_step, **counters}, f, indent=1)
+    for old in Path(out_dir).glob("checkpoint-*/optimizer.pt"):
+        old.unlink()
+    if optimizer is not None:
+        torch.save({"stage": stage, "stage_step": stage_step, "optimizer": optimizer.state_dict()},
+                   ckpt / "optimizer.pt")
     print(f"  saved {ckpt}", flush=True)
     return ckpt
 
@@ -394,7 +489,19 @@ def main(args) -> Path:
         if s not in STAGES:
             raise SystemExit(f"distill: unknown step {s!r} (choose from {STAGES})")
 
+    plan = stage_table(args, stages)
     text_dir = ensure_text_data(args.base_model_dir, args.text_data, args.text_shards, args.text_dir)
+    with open(text_dir / "info.json") as f:
+        data_info = json.load(f)
+    write_manifest(out_dir / ("manifest.json" if not args.init_from else f"manifest_resume{step}.json"),
+                   kernel=spec.name, teacher=args.teacher, seed=args.seed, init_from=args.init_from, init_step=step,
+                   base_model=model_identity(args.base_model_dir),
+                   data={**data_info, "dir": str(text_dir),
+                         "packing": "per step: documents shuffled each epoch by random.Random(data_seed), "
+                                    "concatenated and cut into sequences of the step's length",
+                         "validation": f"first {args.eval_batches} packed sequences of {args.val_length} "
+                                       "tokens of the validation split (seed 0)"},
+                   stages=plan)
     raw_train = load_from_disk(str(text_dir / "train"))
     val_loader = fixed_packed_val(load_from_disk(str(text_dir / "validation")), args.val_length, args.eval_batches)
     print(f"[distill] corpus {text_dir} ({len(raw_train)} docs); validation = {args.eval_batches} packed "
@@ -403,10 +510,11 @@ def main(args) -> Path:
     teacher = build_model(args.teacher, base_model_dir=args.base_model_dir, device=device).eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
+    param_dtype = getattr(torch, args.param_dtype)
     student = build_model(args.kernel, base_model_dir=args.base_model_dir, ckpt_dir=args.init_from,
-                          device=device).train()
+                          device=device, dtype=param_dtype).train()
     # Drift is measured from the swap init, so a resumed run rebuilds it (on CPU) instead of taking the checkpoint.
-    init_sd = init_state(build_model(args.kernel, base_model_dir=args.base_model_dir, device="cpu")
+    init_sd = init_state(build_model(args.kernel, base_model_dir=args.base_model_dir, device="cpu", dtype=param_dtype)
                          if args.init_from else student)
 
     teacher_ref = teacher_reference(teacher, val_loader, args.eval_batches, args.ce_chunk_size)
@@ -420,18 +528,26 @@ def main(args) -> Path:
                     {**stats0, "teacher_loss": val_t},
                     {"norm": group_param_norms(groups0), "drift_from_init": drift_from_init(groups0, init_sd)})
 
-    resume, step = step, 0
-    for stage in stages:
-        length, micro, accum, schedule = stage_plan(args, stage)
-        steps = stage_steps(args, stage, length, micro, accum)
+    resume = step
+    counters = resume_counters(args.init_from, plan, resume) if args.init_from else new_counters()
+    opt_state = None
+    if args.init_from and (Path(args.init_from) / "optimizer.pt").exists():
+        opt_state = torch.load(Path(args.init_from) / "optimizer.pt", map_location="cpu", weights_only=True)
+    for idx, row in enumerate(plan):
+        stage, steps, step = row["stage"], row["steps"], row["start_step"]
+        length, micro, accum, schedule = row["length"], row["micro"], row["accum"], row["schedule"]
         done = min(max(resume - step, 0), steps)
         if done == steps:
             print(f"[distill] step={stage}: already done in {args.init_from}")
-            step += steps
             continue
+        if teacher is not None and not any(r["stage"] in TEACHER_STAGES for r in plan[idx:]):
+            # Nothing left runs the teacher: the validation comparison uses the hidden states and the head
+            # cached in ``teacher_ref``, so its decoder need not stay on the GPU through the ``ce`` step.
+            teacher = None
+            torch.cuda.empty_cache()
         if done:
             print(f"[distill] step={stage}: fast-forwarding the data past {done} steps", flush=True)
-        loader = packed_loader(raw_train, length, micro, args.seed + step, skip=done * micro * accum)
+        loader = packed_loader(raw_train, length, micro, row["data_seed"], skip=done * micro * accum)
         if stage == "layer" and not done and args.layer_skip_below > 0:
             # An exact init starts this step at bf16 noise (~1e-6) with nothing to learn, and Adam's
             # normalised update at lr 1e-3 then walks the weights away from a function-preserving
@@ -441,13 +557,23 @@ def main(args) -> Path:
                 print(f"[distill] step=layer: skipped (initial loss {probe:.2e} < {args.layer_skip_below:.0e}, "
                       f"the swap already reproduces the teacher's layers)", flush=True)
                 log_jsonl(log_path, {"stage": "layer", "step": step, "skipped": True, "initial_loss": probe})
-                step += steps          # keep the step counter, data order and checkpoint numbering unchanged
+                # Its nominal steps stay reserved, so the later steps' data order and checkpoint numbers do
+                # not depend on the skip; ``counters`` is untouched because no work was done.
                 continue
             print(f"[distill] step=layer: initial loss {probe:.2e} >= {args.layer_skip_below:.0e}, running it",
                   flush=True)
-        step = run_stage(stage, args, teacher, student, loader, teacher_ref, out_dir, log_path, step, steps,
-                         length, micro, accum, schedule, done, tb=tb, init_sd=init_sd)
-    ckpt = save(student, args, out_dir, step)
+        restore = None
+        if done and opt_state is not None and (opt_state["stage"], opt_state["stage_step"]) == (stage, done):
+            restore = opt_state["optimizer"]
+        run_stage(stage, args, teacher, student, loader, teacher_ref, out_dir, log_path, step, steps,
+                  length, micro, accum, schedule, done, tb=tb, init_sd=init_sd, counters=counters,
+                  optimizer_state=restore)
+        opt_state = None
+    step = sum(row["steps"] for row in plan)
+    ckpt = save(student, args, out_dir, step, counters)
+    log_jsonl(log_path, {"stage": "done", "step": step, **counters})
+    print(f"[distill] work done: {counters['updates']} updates, {counters['tokens']:,} training tokens, "
+          f"{counters['teacher_tokens']:,} teacher tokens")
     tb.close()
     print(f"[distill] done: {ckpt}")
     del teacher, student

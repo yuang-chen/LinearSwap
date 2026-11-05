@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+* **The recipe trains about a fifth of the weights: the rest cannot move in bf16.**  The student's weights
+  are stored and updated in bf16, and an lr 1e-5 Adam step is below half a bf16 grid step for any weight
+  above ~2.5e-3 in magnitude, so it rounds away.  In the finished `gdn` / `kda` runs (10,235 updates, 599M
+  tokens) 79 % of the backbone and shared-projection weights are bit-identical to their init, and the
+  entries of `kda`'s `f_proj.1` that carry GDN's decay did not change at all.  Every published row was
+  trained this way, control included, so the rows stay comparable with each other; what the tables say
+  about how little the gates move needs re-measuring.  `distill --param_dtype float32` keeps
+  full-precision master weights (same bf16 forward pass, float32 checkpoint); the default is unchanged
+  until the recipe is re-run with it.  See `docs/recipe.md`.
+* **`linswap.upstream`: the swap inside `transformers`' own Qwen3.5 model**, text-only or
+  vision-language.  Only `linear_attn` is replaced (an adapter for the upstream decoder layer's mixer
+  call plus a cache bridge); vision tower, merger, multimodal RoPE, processor and `generate` stay
+  upstream.  `build_upstream_model(kernel | ckpt_dir=...)` also loads a text-distilled checkpoint into
+  the full model.  `tests/test_upstream.py`: on a processed image the exact kernels match the native
+  model at the control's noise level, and on text the logits are bit-identical to `build_model`'s.
+  Inference only, in memory, greedy / sampling; needs the new `vision` extra (torchvision).
+* **`tokens` in `train_log.jsonl` was wrong and is now the tokens actually consumed.**  It was the global
+  step times the *current* step's tokens per update, so the default recipe ended at 25.7B (16.1B without the
+  `layer` step) for 699M (599M) consumed.  The training loop and its data were never affected, only the
+  logged number; ignore it in logs written before this change.  Every record now carries `updates`,
+  `tokens` and `teacher_tokens`, a skipped `layer` step adds nothing to them, each checkpoint saves them
+  in `train_state.json`, and `step` / `checkpoint-N` stay the plan's nominal numbering.
+* **`--init_from` continues a step with its optimizer state.**  A checkpoint written inside a step holds
+  `optimizer.pt` (the newest checkpoint only; it is twice the size of the weights, and a finished run keeps
+  none); resuming used to restart AdamW's moments.  `tests/test_resume.py` compares an interrupted and
+  resumed run with the same run left alone.
+* **`distill` refuses a batch its micro-batch does not divide** (`--stage_batch ce:96 --stage_micro ce:10`
+  silently trained on 90 sequences per step).
+* **`distill` writes `manifest.json`**: git revision, package versions (with the git commit of
+  `flash-linear-attention`), base-model and tokenizer hashes, corpus, and the stage plan with token totals.
+* **A prepared corpus is tied to its tokenizer.**  `info.json` records the tokenizer's sha256 and
+  `ensure_text_data` stops when `--base_model_dir` has a different one, instead of feeding another
+  backbone token ids it reads differently.  Existing corpora get the fingerprint on first use.
+* **`verify` judges exact kernels.**  With `--baseline`, an `exact_init` kernel must stay within
+  `--tolerance` (3×) of the baseline's layer and logit errors and `--agreement_slack` of its cache /
+  generation agreement; it returns and (`--json`) writes the measurements with `pass` / `fail` /
+  `not_gated`, and exits non-zero on `fail`, which stops `linswap run`.
+* **The teacher's decoder leaves the GPU before the `ce` step**, which never runs it; validation keeps
+  its cached hidden states and head.
+* `linswap run --control name=checkpoint` evaluates the same-recipe `gdn` control next to the student.
+* Docs: the chunked losses run over token positions with the full vocabulary (not "vocabulary chunks");
+  the README states that a swapped model is the language backbone of a vision-language checkpoint and
+  splits the kernels' gate-group sizes from their net parameter change.
+
 * **RULER scores measured before this change understate the unmodified backbone.**  The RULER wrapper now
   stops at `<|endoftext|>` as well as `<|im_end|>`.  On base prompts the backbone answers, emits
   `<|endoftext|>` and often continues into a generated chat turn with a `<think>` block; the wrapper kept

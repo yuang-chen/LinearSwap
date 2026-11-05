@@ -192,8 +192,12 @@ def evaluate_vs_teacher(student, ref, chunk_size=2048, temperature=1.0, pos_edge
     was_training = student.training
     student.eval()
     total = {}
+    # A student trained with float32 master weights (``distill --param_dtype float32``) is still a bf16 model
+    # at inference, so it is validated under autocast; a bf16 student runs as it is, as it always has.
+    amp = next(student.parameters()).dtype != torch.bfloat16
     for ids, labels, t_hidden in ref["batches"]:
-        s_hidden = student(ids, return_hidden=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
+            s_hidden = student(ids, return_hidden=True)
         stats = distribution_stats(s_hidden, t_hidden, student.lm_head, ref["lm_head"], chunk_size, temperature, pos_edges)
         stats["val_loss"] = chunked_cross_entropy_eval(s_hidden, labels, student.lm_head, chunk_size=chunk_size)
         for k, v in stats.items():

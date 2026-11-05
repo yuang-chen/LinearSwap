@@ -13,7 +13,7 @@ benchmarks it. `--kernel <name>` is the only thing that changes between experime
 ## Kernels
 
 
-| kernel         | sequence mixer                            | init from the pretrained layer                    | new params | exact      |
+| kernel         | sequence mixer                            | init from the pretrained layer                    | gate params | exact      |
 | -------------- | ----------------------------------------- | ------------------------------------------------- | ---------- | ---------- |
 | `gdn`          | Gated DeltaNet                            | weight copy (control, distillation teacher)       | 0.6M       | yes        |
 | `rwkv7`        | RWKV-7 generalised delta rule (DPLR)      | gates tiled, removal key = key                    | 14M        | yes        |
@@ -29,6 +29,11 @@ An **exact** kernel contains Gated DeltaNet as a special case, so at step 0 the 
 reproduces the original to bf16 noise; the rest have more to recover. Only the *sequence mixer* is
 replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
 0.8B backbone; `docs/kernels.md` has the per-kernel mappings.
+
+*Gate params* is the size of the kernel's own gate / recurrence group (`new_param_names`), copied gates
+included: `gdn`'s 0.6M are the pretrained gates themselves, not additions. The net change of the whole
+model against `gdn` (752.4M) is `gdn2` +112.7M, `rwkv7` +13.6M, `kda` +6.8M, `gla` +0.3M, `mamba2` and
+`deltanet` −0.3M, `swa` −0.6M.
 
 <sub>‡ needs as many value heads as key heads. ¶ not linear attention: sliding-window softmax with
 sinks (arXiv 2608.28444) over the same projections, bounded 68-key state; window / sinks / RoPE from
@@ -77,6 +82,29 @@ The architecture is read from the backbone's HF `config.json`; any GDN-based hyb
 Qwen3-Next layout loads, including grouped-value-head configurations (every kernel except `gdn2`,
 `gla` and `deltanet`). `linswap kernels` lists what is registered.
 
+**Scope: the language backbone.** Qwen3.5-0.8B is a vision-language checkpoint
+(`Qwen3_5ForConditionalGeneration`). LinearSwap loads its language model only (`text_config`,
+`model.language_model.*`), takes `input_ids`, and trains and evaluates on text; the vision tower and
+merger are not part of a swapped model or of its export, and no benchmark here measures image or video
+inputs. Read every "reproduces the original" below as a statement about the text path.
+
+To run a swap, or a checkpoint distilled on text, on images, `linswap.upstream` puts the swapped mixers
+into the model `transformers` itself loads — vision tower, merger, multimodal RoPE, processor and
+`generate` stay upstream — instead of rebuilding the backbone:
+
+```python
+from linswap.upstream import build_upstream_model            # needs the `vision` extra (torchvision)
+model = build_upstream_model("kda")                          # Qwen3_5ForConditionalGeneration, mixers swapped
+model = build_upstream_model(ckpt_dir="outputs/kda/distill/checkpoint-16338")   # + distilled language weights
+out = model.generate(**processor.apply_chat_template(messages, tokenize=True, return_dict=True,
+                                                     add_generation_prompt=True, return_tensors="pt").to("cuda"))
+```
+
+At step 0 an exact kernel there matches the native model on a processed image as closely as the `gdn`
+control does (`tests/test_upstream.py`), and on text its logits are bit-identical to `build_model`'s.
+It is an in-memory, inference-only path (greedy / sampling); what text-only distillation does to image
+tasks is not benchmarked yet.
+
 **Hugging Face.** Swapped models are `PreTrainedModel`s (`LinearSwapForCausalLM`, registered with
 the Auto classes on `import linswap`), so they save, load, generate and evaluate like any HF model:
 
@@ -106,6 +134,10 @@ the projections, convolutions, cache protocol and gated output norm (`rwkv7.py`,
 
 **verify → distill → evaluate → lmeval**, one command each; `run` chains all four.
 
+`verify` is a gate, not only a printout: with `--baseline gdn` an `exact_init` kernel must keep every
+layer and logit error within `--tolerance` (3×) of the baseline's own noise, measured in the same run,
+or the command exits non-zero and `run` stops before training (`--json` saves the measurements).
+
 ```bash
 linswap run --kernel rwkv7            # everything, results in outputs/eval/rwkv7
 ```
@@ -131,6 +163,14 @@ Adam(0.9, 0.95), clip 1.0, bf16, about 6 GPU-hours per kernel at 0.8B. The first
 swapped layers, the other two everything. Budgets are tokens (`--kl_tokens 250e6`); every per-step
 knob is a flag.
 
+`step` in the log and in `checkpoint-N` is the plan's nominal step — a skipped `layer` step keeps its
+range so the numbering does not depend on the skip. The work actually done is logged next to it
+(`updates`, `tokens`, `teacher_tokens`) and saved in each checkpoint's `train_state.json`; the default
+recipe with the `layer` step skipped is 10,235 updates on 599M tokens. (Logs written before November
+2026 carry a `tokens` field that multiplied the global step by the current step's batch; ignore it.)
+`manifest.json` records the code and package revisions, the base model, the corpus and the plan.
+`--init_from` a checkpoint written inside a step continues it with its optimizer state, on the same data.
+
 Each run writes `outputs/<kernel>/distill/train_log.jsonl` and, with the `tensorboard` extra
 (`uv pip install -e ".[tensorboard]"`), a TensorBoard run next to it:
 `tensorboard --logdir outputs` overlays the kernels' loss, grad norm (total and per parameter group),
@@ -155,74 +195,63 @@ IFEval (chat template, generative), reported as accuracy and as a relative score
 
 ## Benchmarks
 
-Backbone Qwen3.5-0.8B, one seed, identical recipe for every row: 700M tokens of
-DCLM, no SFT, base-prompt evaluation.  The **control** is the *unswapped*
-backbone put through the same three steps — without it the students' gains over
-the unmodified backbone would be read as a kernel effect when they are the
-recipe.  Full tables and discussion in [docs/results.md](docs/results.md).
+Backbone Qwen3.5-0.8B, one seed, RULER base prompts, 500 samples per cell.  `gdn` is the **control**: the
+*unswapped* backbone put through the same training.  The control and the exact-init kernels use the recipe
+with the `layer` step skipped; the inexact kernels use the full recipe.
 
-**Long-context retrieval** (`niah_single_1` / `_2` / `_3` / `niah_multikey_1`, 500 samples)
+**These tables are selected, not representative.**  `vt` and `cwe` are the only tasks in the 500-sample runs
+where the exact-init kernels differ by 5 points or more at two or more lengths.  On the needle tasks, `fwe`
+and the short-context suite they sit closer together.  All the tables are in
+[docs/results.md](docs/results.md).
+
+**`vt`** (variable tracking)
 
 | model | 4K | 16K | 64K | 128K |
 |---|---|---|---|---|
-| unmodified backbone | 96.4 / 65.0 / 97.8 / 79.4 | 98.4 / 76.2 / 90.6 / 81.6 | 96.4 / 98.4 / 94.6 / 91.8 | 99.2 / 91.6 / 96.6 / 91.0 |
-| control (`gdn`, same recipe) | 100 / 100 / 98.6 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.8 |
-| `gdn2` (exact init) | 100 / 100 / 94.2 / 100 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
-| `rwkv7` (exact init) | 100 / 100 / 96.0 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.2 | 100 / 100 / 100 / 96.2 |
-| `kda` (exact init) | 100 / 100 / 99.2 / 99.6 | 100 / 100 / 100 / 98.4 | 100 / 100 / 100 / 97.0 | 100 / 100 / 100 / 96.4 |
-| `mamba2` (no erase) | 100 / 100 / 99.4 / 98.8 | 100 / 100 / 99.8 / 93.6 | 100 / 98.4 / 99.4 / 84.6 | 100 / 95.0 / 94.6 / 70.0 |
-| `swa` (window 64 + 4 sinks) | 100 / 100 / 99.8 / 97.4 | 100 / 99.2 / 97.6 / 79.6 | 100 / 98.0 / 95.4 / 67.6 | 100 / 81.4 / 89.4 / 56.0 |
-| `gla` (per-channel decay, no erase) | 97.4 / 100 / 99.6 / 99.2 | 52.8 / 100 / 99.6 / 89.0 | 29.0 / 96.2 / 96.8 / 82.0 | 32.0 / 94.4 / 90.0 / 58.8 |
-| `deltanet` (erase, no decay) | 100 / 99.8 / 96.6 / 98.2 | 98.4 / 100 / 82.6 / 85.2 | 0.0 / 0.0 / 0.0 / 0.0 | 0.0 / 0.0 / 0.0 / 0.0 |
+| control (`gdn`) | 90.9 | 70.8 | 50.6 | 68.6 |
+| `gdn2` (exact init) | 91.8 | 71.0 | 50.6 | 67.6 |
+| `kda` (exact init) | 90.0 | 71.6 | 51.4 | 69.5 |
+| `rwkv7` (exact init) | 89.8 | 65.0 | 45.5 | 66.4 |
+| *spread, control + exact* | *1.9* | *6.6* | *5.9* | *3.2* |
+| `mamba2` | 78.2 | 36.8 | 19.8 | 19.6 |
+| `swa` | 37.6 | 23.7 | 28.6 | 7.2 |
+| `gla` | 38.8 | 1.6 | 0.2 | 0.2 |
+| `deltanet` | 51.4 | 18.7 | 0.0 | 0.0 |
 
-**Short context**, accuracy (relative score vs the unmodified backbone in %)
+**`cwe`** (common words extraction)
 
-| model | LAMBADA | ARC-c | ARC-e | PIQA | WinoGrande | HellaSwag | MMLU | rel. avg |
-|---|---|---|---|---|---|---|---|---|
-| unmodified backbone | 0.437 | 0.374 | 0.611 | 0.693 | 0.583 | 0.496 | 0.504 | 100.0 |
-| control (`gdn`) | 0.476 | 0.402 | 0.649 | 0.704 | 0.589 | 0.525 | 0.515 | 110.1 |
-| `gdn2` | 0.479 | 0.398 | 0.652 | 0.706 | 0.590 | 0.524 | 0.516 | 110.2 |
-| `kda` | 0.478 | 0.399 | 0.651 | 0.705 | 0.590 | 0.525 | 0.514 | 110.2 |
-| `rwkv7` | 0.480 | 0.399 | 0.655 | 0.704 | 0.590 | 0.525 | 0.513 | 110.3 |
-| `mamba2` | 0.462 | 0.372 | 0.610 | 0.701 | 0.578 | 0.520 | 0.501 | 101.4 |
-| `swa` | 0.453 | 0.372 | 0.617 | 0.702 | 0.595 | 0.503 | 0.456 | 101.0 |
-| `gla` | 0.463 | 0.362 | 0.612 | 0.701 | 0.579 | 0.514 | 0.484 | 99.2 |
-| `deltanet` | 0.382 | 0.331 | 0.562 | 0.694 | 0.569 | 0.475 | 0.415 | 82.8 |
-
-The short-context suite scores every task in full.  The `kda` / `gla` / `deltanet`
-rows come from a second batch, run months later on freshly tokenised DCLM; its own control reproduced
-the published 110.0 at 110.1, which is what licenses one table.
+| model | 4K | 16K | 64K | 128K |
+|---|---|---|---|---|
+| control (`gdn`) | 62.5 | 68.6 | 30.7 | 8.5 |
+| `gdn2` (exact init) | 63.9 | 70.6 | 26.0 | 5.0 |
+| `kda` (exact init) | 62.5 | 69.2 | 31.4 | 11.2 |
+| `rwkv7` (exact init) | 60.6 | 68.7 | 27.7 | 3.9 |
+| *spread, control + exact* | *3.3* | *2.0* | *5.3* | *7.4* |
+| `mamba2` | 38.0 | 4.0 | 0.8 | 0.4 |
+| `swa` | 37.1 | 1.4 | 0.6 | 0.4 |
+| `gla` | 24.7 | 7.3 | 0.3 | 0.1 |
+| `deltanet` | 19.9 | 3.5 | 0.0 | 0.1 |
 
 What the numbers say:
 
-- **The recipe, not the kernel, is what lifts a swapped model above the original.**  The control gains
-  as much as the students on both suites, so the question a swap has to answer is what it costs *on top
-  of the same training*.
-- **An exact init is free.**  All three exact-init kernels land on the control on both suites: relative
-  average 110.2–110.3 against 110.1, and the 128K distractor needle 96.2–96.4 against 96.8.  What the
-  target recurrence *is* matters far less than whether the pretrained function survives the change of
-  parameterisation.
-- **A richer gate buys nothing.**  `gdn2` adds 113M parameters of separate erase and write gates to
-  `kda`'s 7.4M low-rank per-channel decay: the two finish within 0.2 relative points of each other and
-  of the control, and their needle task averages match the control to 0.1 from 16K on (`gdn2` trails it
-  by 1.0 at 4K, on `niah_single_3`).
-- **The exact kernels used to look costly at 128K**, because the `layer` step was damaging them.  It is
-  skipped for an exact init now (see [Pipeline](#pipeline)); under the old recipe the same three kernels
-  scored 85.6–86.8 at 128K.  The deficit was an artifact of the step, not a property of the kernels.
-- **Dropping the delta-rule erase costs.**  `mamba2` trails the control by 8.6 relative points and
-  loses the distractor needle at 128K (70.0 vs 96.2).
-- **A 64-token window holds short context, not retrieval.**  `swa` scores 101.0 relative but decays
-  97.4 / 79.6 / 67.6 / 56.0 on the multikey needle, and drops to 0.456 on MMLU (81.1) — the task here
-  that most needs long context.
-- **Inexact swaps fail with length, and the short suite cannot see it.**  `deltanet` matches the control
-  at 4K and then scores 0 on all four needles from 64K on while still looking respectable on LAMBADA
-  and PIQA: a swap can be free at 4K and worthless at 64K.  `gla` decays through 99.1 / 85.4 / 76.0 /
-  68.8 (task average).
-- **The init of the inexact part matters.**  `gla` with FLA's random gate init scored 87.5 / 64.8 / 43.2 /
-  1.6 on the same recipe; fitting GDN's per-head decay into the gate at init is what lifts it, and the
-  one task it still fails out of order (`niah_single_1`: 97.4 / 52.8 / 29.0 / 32.0, the repeated-noise
-  haystack) is where the fit loosens — the mechanism is described in `kernels/gla.py`.  Short context
-  moves from 94.3 to 99.2 relative.
+- **`rwkv7` trails on `vt`.**  It is 5.7 / 5.1 / 2.2 points below the control at 16K / 64K / 128K (paired
+  bootstrap over samples, 95% intervals exclude zero).
+- **On `cwe`, `kda` holds up at long context where `gdn2` and `rwkv7` drop.**  Against the control, `gdn2`
+  is 4.6 / 3.5 below and `rwkv7` 3.0 / 4.7 below at 64K / 128K, while `kda` is level at 64K and 2.7 above
+  at 128K.  Every model is near the floor at 128K, the control included.
+- **The inexact kernels are much further away.**  Their gaps to the control reach 50 points or more on
+  `vt` and 60 or more on `cwe`, against at most 7.4 among the exact kernels.
+
+How far to trust them:
+
+- **These intervals cover the RULER samples, not training.**  This is one trained checkpoint per kernel.
+  Two older runs of `gdn`, `gdn2`, `kda` and `rwkv7` under a retired recipe (50 samples) show that the
+  training seed can matter more: `gdn` on `vt` at 16K moves from 92.4 to 60.4 between seeds, while the four
+  kernels stay within 4.8 of each other inside each seed.  `rwkv7` is the lowest of the four at every
+  length in one seed and not in the other.  Do not read these tables as a settled kernel ranking.
+- **The exact and inexact rows differ in recipe as well as kernel**, as described above.
+- **These runs predate the RULER wrapper's `<|endoftext|>` stop** (see the changelog).  That fix was only
+  checked on the backbone and on the control's needle tasks, not on these rows.
 
 Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, constant state):
 

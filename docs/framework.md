@@ -28,8 +28,11 @@ src/linswap/
                        — Qwen's module tree and state-dict keys; SwapCache; per-layer kernel maps
   components.py        RMSNorm / GQA / MLP / RoPE;  backbones.py  load_backbone_config() from the HF config
   load_weights.py      build_model(kernel | ckpt_dir), HF-format and native checkpoint loading
-  textdata.py          generic-text corpora (DCLM, FineWeb-Edu) tokenised once;  train_utils.py  packing + chunked losses
-  pipeline/verify.py     stage 1: function-preservation checks vs the HF backbone
+  textdata.py          generic-text corpora (DCLM, FineWeb-Edu) tokenised once per tokenizer;  train_utils.py  packing + chunked losses
+  manifest.py          run manifests (code / package revisions, base model, corpus, stage plan), tokenizer fingerprint
+  upstream.py          the swapped mixers inside transformers' own Qwen3.5 model (text or vision-language):
+                       adapter for the upstream decoder layer's mixer call + cache bridge; image / video inputs
+  pipeline/verify.py     stage 1: function-preservation checks vs the HF backbone, gated on the baseline's noise level
   pipeline/distill.py    stage 2: the three training steps (layer alignment -> KL -> context extension)
   pipeline/evaluate.py   stage 3: RULER (calls RULER's scripts directly) -> summary table
   pipeline/lmeval.py     stage 3: short-context suite through lm-eval-harness, with relative scores
@@ -37,7 +40,10 @@ src/linswap/
   pipeline/export.py     write a swapped model / checkpoint as an HF checkpoint (safetensors + tokenizer + card)
 tools/                 throughput.py (prefill / decode speed), hard_tables.py (evaluation logs -> markdown tables)
 tests/                 test_kernels.py (all kernels vs control), test_hf.py (HF round-trip), test_batch.py (padded batches),
-                       test_gva.py (grouped value heads), test_losses.py (chunked CE / KL vs dense autograd; CPU, no model)
+                       test_gva.py (grouped value heads), test_losses.py (chunked CE / KL vs dense autograd; CPU, no model),
+                       test_bookkeeping.py (stage plan and token totals, verify gate, tokenizer check, manifest; CPU, no model),
+                       test_resume.py (interrupted + resumed distill vs uninterrupted),
+                       test_upstream.py (swap inside the upstream vision-language model, text and a real image)
 examples/quickstart.ipynb
 RULER/scripts/pred/model_wrappers.py::LinearSwapModelWrapper, server types linswap[_nocache]
 ```
@@ -116,7 +122,8 @@ gives away.
 ## Environment
 
 Python 3.11, torch 2.9.1 / CUDA 12.8 / Triton 3.5.1, `flash-linear-attention` 0.6.0 (git 8e84ed4),
-transformers 5.16.1; `causal-conv1d` and `mamba_ssm` built from source for the `mamba1` / `mamba3`
+transformers 5.16.1 and 5.17.0 (each `distill` run records the versions it ran on in `manifest.json`);
+`causal-conv1d` and `mamba_ssm` built from source for the `mamba1` / `mamba3`
 kernels.  On Hopper-class GPUs FLA refuses the Triton backward of its gated chunk kernels under
 Triton 3.4–3.7 (issue #640): install `tilelang` (`pip install -e ".[hopper]"`) for `gdn` / `gdn2` /
 `kda`, and use Triton < 3.4 or ≥ 3.7.1 to *train* `mamba2` (the simple-GLA op has no TileLang

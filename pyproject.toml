@@ -38,6 +38,10 @@ mamba = ["causal-conv1d>=1.5", "mamba-ssm>=2.3.2"]
 hopper = ["tilelang>=0.1.8"]
 # TensorBoard dashboard for `distill` (without it the run logs train_log.jsonl only, with a warning).
 tensorboard = ["tensorboard"]
+# Image / video inputs through the upstream Qwen processor (linswap.upstream, tests/test_upstream.py).
+# Install the torchvision build that matches your torch without dependency resolution, or it replaces
+# torch:  pip install --no-deps torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+vision = ["torchvision", "pillow"]
 
 [project.scripts]
 linswap = "linswap.cli:main"

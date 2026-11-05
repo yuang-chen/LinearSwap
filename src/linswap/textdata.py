@@ -5,10 +5,18 @@ fixed-length sequences — no instruction data and no chat template.  This modul
 once per tokenizer: documents are tokenised, an EOS token is appended to each, and the result is saved
 as an HF ``datasets`` directory with ``train`` / ``validation`` splits of ``{"input_ids"}``
 documents that ``train_utils.PackedDataset`` packs on the fly.
+
+The directory is named after the corpus and its shard count only, so ``info.json`` records which
+tokenizer produced it (``tokenizer_sha256``) and ``ensure_text_data`` refuses to hand token ids to a
+backbone with a different one.
 """
 
 import json
+import os
+import warnings
 from pathlib import Path
+
+from .manifest import tokenizer_fingerprint
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HF_CACHE_DIR = REPO_ROOT / "data" / "hf_cache"
@@ -53,7 +61,8 @@ def prepare_text_data(base_model_dir, name="dclm", shards=1, out_dir=DEFAULT_TEX
     n_tok = sum(len(x) for x in ds["input_ids"])
     with open(out / "info.json", "w") as f:
         json.dump({"corpus": name, "repo": repo, "shards": shards, "docs": len(ds), "tokens": n_tok,
-                   "tokenizer": str(base_model_dir), "validation_docs": val_docs}, f, indent=1)
+                   "tokenizer": str(base_model_dir), "tokenizer_sha256": tokenizer_fingerprint(base_model_dir),
+                   "validation_docs": val_docs, "shuffle_seed": seed}, f, indent=1)
     print(f"[textdata] {name}: {len(ds)} docs, {n_tok/1e6:.0f}M tokens -> {out}")
     return out
 
@@ -61,5 +70,43 @@ def prepare_text_data(base_model_dir, name="dclm", shards=1, out_dir=DEFAULT_TEX
 def ensure_text_data(base_model_dir, name="dclm", shards=1, out_dir=DEFAULT_TEXT_DIR) -> Path:
     out = text_data_dir(name, shards, out_dir)
     if (out / "info.json").exists():
+        check_tokenizer(out, base_model_dir)
         return out
     return prepare_text_data(base_model_dir, name, shards, out_dir)
+
+
+def check_tokenizer(data_dir, base_model_dir) -> None:
+    """Stop if the corpus in ``data_dir`` was tokenised with another tokenizer than ``base_model_dir``'s.
+
+    A corpus prepared before fingerprints were recorded names its tokenizer by path only: the fingerprint
+    is then taken from that path (and written back when it matches), and a path that no longer exists
+    leaves the corpus unverifiable, which is reported and let through."""
+    data_dir = Path(data_dir)
+    with open(data_dir / "info.json") as f:
+        info = json.load(f)
+    want = tokenizer_fingerprint(base_model_dir)
+    have, backfill = info.get("tokenizer_sha256"), False
+    if have is None and info.get("tokenizer"):
+        recorded = Path(info["tokenizer"])
+        for cand in (recorded, REPO_ROOT / recorded):
+            if cand.is_dir():
+                have, backfill = tokenizer_fingerprint(cand), True
+                break
+    if have is None or want is None:
+        warnings.warn(f"{data_dir}: cannot check that it was tokenised for {base_model_dir} "
+                      f"(recorded tokenizer: {info.get('tokenizer')!r})")
+        return
+    if have != want:
+        raise SystemExit(f"[textdata] {data_dir} was tokenised with {info.get('tokenizer')!r} "
+                         f"(sha256 {have[:12]}), not with the tokenizer of {base_model_dir} (sha256 {want[:12]}): "
+                         f"its token ids mean something else for this backbone.  Pass another --text_dir, or "
+                         f"remove the directory to tokenise the corpus again.")
+    if backfill:
+        info["tokenizer_sha256"] = have
+        tmp = data_dir / f"info.json.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(info, f, indent=1)
+            os.replace(tmp, data_dir / "info.json")
+        except OSError:
+            tmp.unlink(missing_ok=True)       # a read-only corpus stays as it is
