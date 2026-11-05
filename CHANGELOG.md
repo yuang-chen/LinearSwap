@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+* **RULER scores measured before this change understate the unmodified backbone.**  The RULER wrapper now
+  stops at `<|endoftext|>` as well as `<|im_end|>`.  On base prompts the backbone answers, emits
+  `<|endoftext|>` and often continues into a generated chat turn with a `<think>` block; the wrapper kept
+  only the text after `</think>`, which deleted the answer.  On the backbone (100 samples per cell)
+  `niah_single_2` goes from 65 to 100 at 4K and 73 to 100 at 16K, `niah_multikey_1` from 85 to 100 and 80
+  to 100, and `vt` is unchanged.  The distilled `gdn` control is unaffected on `niah_single_2` and
+  `niah_multikey_1` at 4K (40 samples): it never emitted `<|endoftext|>`.  Other distilled kernels were not
+  checked.  The backbone rows in the README and `docs/results.md` predate the fix, so do not compare them
+  with new runs until they are re-measured.  `--batch_size` above 1 is not bit-identical to batch size 1:
+  in the same comparison 3-28 % of predictions changed, with scores within 2 points.
 * **IFEval in `linswap lmeval`** (default task set, `--chat_tasks ifeval`): generated with the chat
   template and thinking disabled, scored by prompt-level strict accuracy (`ifeval`) and
   instruction-level strict accuracy (`ifeval_inst`), chance 0 in the relative score.  Needs `langdetect`
