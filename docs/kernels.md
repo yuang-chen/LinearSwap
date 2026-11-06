@@ -77,32 +77,58 @@ GPUs FLA's only correct backward for it (TileLang, fla#640) needs q/k/v in the s
 ## Mamba-3 swap (inexact, optional)
 
 FLA's `Mamba3` layer on `mamba_ssm`'s kernels (`pip install -e ".[mamba3]"`; the kernel registers only when
-they import).  Mamba-3 is a diagonal state-space model with data-dependent decay `A`, step `Δ`, a
-trapezoidal update and a rotary (complex-valued) state, read out through per-group `B` / `C` vectors.  The
-layer fuses `[z, x, B, C, dd_dt, dd_A, trap, angles]` into one `in_proj` and has no short convolution.
+they import), behind the backbone's short convolutions.  Mamba-3 is a diagonal state-space model with
+data-dependent decay `A`, step `Δ`, a trapezoidal update and a rotary (complex-valued) state, read out
+through per-group `B` / `C` vectors.  The layer fuses `[z, x, B, C, dd_dt, dd_A, trap, angles]` into one
+`in_proj`.
 
 | pretrained GDN | Mamba-3 | how |
 |---|---|---|
 | `in_proj_z` | `z` rows of `in_proj` | copied (output gate) |
 | `v` rows of `in_proj_qkv` | `x` rows | copied |
 | `k`, `q` rows of `in_proj_qkv` | `B`, `C` rows, one group per key head | copied; Mamba-3 expands groups to value heads as GDN does |
+| `conv1d` (q / k / v) | `q_conv1d`, `k_conv1d`, `v_conv1d` on `C`, `B`, `x` | copied; **added to FLA's layer**, see below |
 | `in_proj_a`, `dt_bias` | `dd_dt` rows, `dt_bias` | copied, so `Δ` equals GDN's |
 | `A_log` | bias of the `dd_A` rows (weights zero) | `A = -softplus(bias) = -exp(A_log)`: the decay `exp(A·Δ)` starts at GDN's |
-| — | `trap`, rotary `angles` rows | zero: neutral mixing, no rotation |
+| — | `trap`, rotary `angles` rows | zero: the library's even trapezoid mix, no rotation |
 | q / k L2 normalisation, `1/√K` | `B_norm`, `C_norm` weights | `1/√S`, with the query scale folded into `C_norm` |
-| `norm`, `out_proj` | per-head gated `norm`, `out_proj` | tiled per head, copied |
+| `norm`, `out_proj` | per-head gated `norm` (the backbone's eps), `out_proj` | tiled per head, copied |
 
-Still different from GDN: no erase, `Δ`-scaled instead of `β`-scaled writes, and no short convolution on
-q / k / v, so the untrained swap is far from the teacher (step-0 KL 15 on text, 12 on an image).
+Still different from GDN: no erase and `Δ`-scaled instead of `β`-scaled writes, as in `mamba2`.
 
-Three things the layer needs from us (`kernels/mamba3.py`, `linswap.model`, `linswap.distill`):
+**Why the short convolution is kept.**  Mamba-3 has none.  The backbone passes q / k / v through a 4-tap
+causal convolution and SiLU, with small taps of either sign per channel, and for keys and values the tap on
+the *previous* token is as large as the one on the current token: the pretrained layer writes pairs that
+span two tokens.  Three variants, each layer fed the teacher layer's input (mean over the 18 layers) and
+then distilled:
+
+| variant | layer output vs the teacher's at step 0 | gap at 12.5M tokens | at 100M |
+|---|---|---|---|
+| FLA's layer as is, projections copied | NMSE 70.6, cosine −0.02, 3–13× too large | 0.884 | 0.245 (2.12 GPU-hours) |
+| the same, current-token tap folded into the projections | NMSE 3.1, cosine 0.26 | 0.931 | — |
+| **short convolutions kept (the kernel)** | NMSE 0.56, cosine 0.74 | 0.134 ¹ | running |
+| `mamba2`, for reference | NMSE 0.73, cosine 0.74 | 0.127 | 0.071 |
+
+¹ measured with the trapezoid logit at +12 (a pure Euler step, exactly `mamba2`'s function at step 0); the
+kernel leaves it at 0, which is ahead at every milestone up to 6M tokens (0.166 against 0.174) and keeps
+the coefficient trainable.
+
+* The scale: the teacher's readout before its output norm has an RMS of 5e-4 – 1e-2, comparable to the
+  norm's epsilon, so the norm passes magnitude through.  Without the convolution's small taps the values were
+  10–40 times larger, the norm saturated, and the layer output was 3–13 times the teacher's.
+* The correlation: without the per-channel sign of the taps the query and key channels no longer line up.
+* A better init of FLA's layer alone does not help: fixing sign and scale brings the init 20 times closer
+  and changes nothing in training, because the layer still cannot write a pair that spans two tokens.
+
+Two more things the layer needs from us (`kernels/mamba3.py`, `linswap.model`, `linswap.distill`):
 
 * **Cached decoding.**  The prefill kernel returns the last key in float32; the single-token kernel is
   compiled for one dtype shared by the cached key, the new key and the new query, which the layer computes
   in the model's dtype.  Our subclass hands the cached key over in the model's dtype, as the layer's own
-  `allocate_inference_cache` does.  It needs `nvidia-cutlass-dsl` ≥ 4.8 with `quack-kernels` 0.6.5; with
-  4.7 the kernel did not compile.  On a trained checkpoint cached decoding then matches a full forward as
-  closely as the teacher kernel's does (KL 7e-4 against 1e-3).
+  `allocate_inference_cache` does, and carries the convolution caches with the state.  It needs
+  `nvidia-cutlass-dsl` ≥ 4.8 with `quack-kernels` 0.6.5; with 4.7 the kernel did not compile.  On a
+  distilled checkpoint cached decoding matches a full forward as closely as the teacher kernel's does (KL
+  9e-4 against 1e-3).
 * **Padding.**  With a bias in the fused projection a zeroed hidden state still writes, so the layer gets the
   padding mask and packs the valid tokens (`takes_padding_mask`); left-padded batches then match unpadded
   rows (KL 7e-4, the teacher kernel's level).

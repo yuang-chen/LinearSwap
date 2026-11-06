@@ -141,7 +141,7 @@ sequence.
   about 6 GPU-hours, the whole model trained on web text) left `gla` at a gap of 0.55, mostly on images
   (1.70). Training only the swapped layers against the teacher's hidden states brings it to 0.13 after
   12.5M tokens (10 GPU-minutes) and to 0.077 at the 100M-token cap (1.35 GPU-hours), evenly across text,
-  chat, images and long context; `deltanet` ends at 0.107 and `swa` at 0.118. The return diminishes
+  chat, images and long context; `mamba2` ends at 0.071, `deltanet` at 0.107 and `swa` at 0.118. The return diminishes
   steeply: the last two thirds of the tokens move `gla` from 0.106 to 0.077.
 
 The full distillation runs and the standard test sets are in [docs/results.md](docs/results.md).

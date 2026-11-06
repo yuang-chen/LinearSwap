@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* **`mamba3` keeps the backbone's short convolutions** in front of FLA's Mamba-3 layer.  The layer has none,
+  and the pretrained keys and values depend on the previous token through them: as it stood the swap started
+  at NMSE 70 per layer from the teacher (now 0.56) and was at a gap of 0.88 after 12.5M tokens (now 0.13,
+  with `mamba2`).  A better init of the unchanged layer (the current-token tap folded in) did not help
+  training.  Checkpoints of the earlier `mamba3` do not load.
 * **`mamba3` is back, as an optional kernel** (docs/kernels.md): FLA's Mamba-3 layer on `mamba_ssm`'s
   kernels, registered when they import (`pip install -e ".[mamba3]"`).  Cached decoding works with
   `nvidia-cutlass-dsl` ≥ 4.8 once the cached key is handed to the step kernel in the model's dtype; the layer
