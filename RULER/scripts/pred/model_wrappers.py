@@ -146,19 +146,10 @@ class MambaModel:
 
 
 class LinearSwapModelWrapper:
-    """RULER wrapper for kernel-swapped hybrid models built with ``linswap``.
-
-    ``name_or_path`` is a directory whose ``config.json`` records:
-        linear_kernel   registry name of the kernel (e.g. "kda", "gdn2", "gdn", "deltanet")
-        base_model_dir  (optional) HF backbone checkpoint used for the function-preserving init
-        ckpt_dir        (optional) directory holding a native ``model.pt``; defaults to ``name_or_path``
-    SFT checkpoints written by ``scripts/sft.py`` already carry these fields;
-    ``scripts/register_ruler_model.py`` creates such a directory under
-    ``outputs/ruler_models/<name>`` for a base (no-SFT) swap or any checkpoint.
-    """
+    """RULER wrapper for a ``linswap`` model: ``name_or_path`` is ``native`` (the unmodified backbone), a
+    kernel name (the swap at step 0) or a checkpoint directory written by ``linswap distill``."""
 
     def __init__(self, name_or_path: str, **generation_kwargs) -> None:
-        import json
         import os
         import sys
         from pathlib import Path
@@ -171,46 +162,28 @@ class LinearSwapModelWrapper:
             sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
             from linswap import DEFAULT_BASE_MODEL_DIR, build_model
 
-        model_dir = Path(name_or_path)
-        cfg = {}
-        if (model_dir / "config.json").exists():
-            with open(model_dir / "config.json") as f:
-                cfg = json.load(f)
-        kernel = cfg.get("linear_kernel") or os.environ.get("LINSWAP_KERNEL")
-        if kernel is None:
-            raise ValueError(f"{model_dir}/config.json has no 'linear_kernel' and LINSWAP_KERNEL is unset")
-        # LINSWAP_BASE_MODEL_DIR (set by `linswap evaluate`) overrides the recorded path, which may be another machine's
-        base_model_dir = Path(os.environ.get("LINSWAP_BASE_MODEL_DIR") or cfg.get("base_model_dir", DEFAULT_BASE_MODEL_DIR))
-        if not base_model_dir.is_absolute():  # checkpoint configs record repo-relative paths; RULER runs from RULER/scripts
-            base_model_dir = Path(__file__).resolve().parents[3] / base_model_dir
-        ckpt_dir = Path(cfg["ckpt_dir"]) if cfg.get("ckpt_dir") else model_dir
-        if not (ckpt_dir / "model.pt").exists():
-            ckpt_dir = None
-        print(f"[LinearSwapModelWrapper] kernel={kernel} base={base_model_dir} ckpt={ckpt_dir}")
-
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_dir, trust_remote_code=True)
+        base_model_dir = os.environ.get("LINSWAP_BASE_MODEL_DIR") or DEFAULT_BASE_MODEL_DIR
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.device = torch.device("cuda")
-        # The HF wrapper's generate handles left-padded batches (pads masked out of attention and of the linear
-        # layers' state), per-row EOS and the cache.
-        from linswap.hf import LinearSwapForCausalLM
-        self.model = LinearSwapForCausalLM.from_swap(kernel, base_model_dir=base_model_dir, ckpt_dir=ckpt_dir,
-                                                     device=self.device).eval()
+        # transformers' own model and generate: left-padded batches, per-row EOS, the cache
+        self.model = build_model(name_or_path, base_model_dir, device=self.device)
+        print(f"[LinearSwapModelWrapper] {name_or_path} -> kernel {self.model.linswap_kernel}")
         # Stop on end-of-turn (chat template) or end-of-text (base template).
         self.stop_ids = sorted({self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|endoftext|>")})
         # Rows per generate call: at most the batch call_api hands over, and at most LINSWAP_MAX_BATCH_TOKENS
         # padded tokens (prompt + generation) per call, so 128K prompts run one at a time at the default budget.
         # swa has no padding support (its sinks are absolute positions): one row at a time.
         self.max_batch_tokens = int(os.environ.get("LINSWAP_MAX_BATCH_TOKENS", 131072))
-        self.max_rows = 1 if "swa" in kernel else None
+        self.max_rows = 1 if self.model.linswap_kernel == "swa" else None
 
         self.generation_kwargs = generation_kwargs
         self.stop = self.generation_kwargs.pop("stop")
         self.max_new_tokens = self.generation_kwargs.pop("max_new_tokens")
         self.use_chat_template = self.generation_kwargs.pop("use_chat_template", True) and \
-            not os.environ.get("LINSWAP_NO_CHAT_TEMPLATE")   # base-prompt mode (RADLADS / KL-guided protocol)
+            not os.environ.get("LINSWAP_NO_CHAT_TEMPLATE")   # RULER's base prompt instead of the chat template
         self.use_cache = self.generation_kwargs.pop("use_cache", True)
 
     def __call__(self, prompt: str, **kwargs) -> dict:

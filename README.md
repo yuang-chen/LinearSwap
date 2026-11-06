@@ -1,270 +1,154 @@
 ![LinearSwap](docs/logo.png)
 
-**Swap the linear-attention kernel of a pretrained hybrid LLM in place.**
+**Swap the linear-attention kernel of Qwen3.5 in place, and distil the result back to the teacher as
+cheaply as possible.**
 
-LinearSwap replaces the Gated-DeltaNet layers of a Qwen3-Next / Qwen3.5 / 3.6 / 3.8 backbone with
-another linear sequence mixer — RWKV-7, Mamba-2, Kimi Delta Attention, Gated DeltaNet-2, DeltaNet —
-keeps everything else, then distils the result back to the original on generic web text and
-benchmarks it. `--kernel <name>` is the only thing that changes between experiments. 
+Qwen3.5 is a hybrid vision-language model: 18 of its 24 decoder layers are Gated DeltaNet, 6 are full
+attention. LinearSwap replaces the Gated-DeltaNet layers with another sequence mixer and keeps everything
+else — `transformers`' own model, vision tower and processor included. The unmodified backbone is the
+**teacher**; a swapped model is a **student**, and the goal is for the student to *approach the teacher*
+on text, long context and images with the least training.
 
-[Kernels](#kernels) · [Install](#install) · [Usage](#usage) · [Pipeline](#pipeline) ·
-[Benchmarks](#benchmarks) · [Citation](#citation) · [Acknowledgements](#acknowledgements)
+[Kernels](#kernels) · [Install](#install) · [Usage](#usage) · [Distillation](#distillation) ·
+[Evaluation](#evaluation) · [Results](#results) · [Adding a kernel](#adding-a-kernel)
 
 ## Kernels
 
+| kernel     | sequence mixer                            | init from the pretrained layer               | exact |
+| ---------- | ----------------------------------------- | -------------------------------------------- | ----- |
+| `gdn`      | Gated DeltaNet on FLA's kernels           | weight copy — the teacher                    | yes   |
+| `rwkv7`    | RWKV-7 generalised delta rule (DPLR)      | gates tiled, removal key = key               | yes   |
+| `kda`      | Kimi Delta Attention                      | decay tiled into the low-rank gate           | yes   |
+| `gdn2`     | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                | yes   |
+| `mamba2`   | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped         | no    |
+| `deltanet` | DeltaNet (erase, no decay)                | shared weights copied, decay dropped         | no    |
+| `gla`      | Gated Linear Attention                    | shared weights copied, decay fitted per head | no    |
+| `swa`      | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature           | no    |
 
-| kernel         | sequence mixer                            | init from the pretrained layer                    | gate params | exact      |
-| -------------- | ----------------------------------------- | ------------------------------------------------- | ---------- | ---------- |
-| `gdn`          | Gated DeltaNet                            | weight copy (control, distillation teacher)       | 0.6M       | yes        |
-| `rwkv7`        | RWKV-7 generalised delta rule (DPLR)      | gates tiled, removal key = key                    | 14M        | yes        |
-| `kda`          | Kimi Delta Attention                      | decay tiled into the low-rank gate                | 7.4M       | yes        |
-| `gdn2`         | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                     | 113M       | yes ‡      |
-| `mamba2`       | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped              | 0.3M       | no         |
-| `deltanet`     | DeltaNet (erase, no decay)                | shared weights copied, decay dropped              | 0.3M       | no         |
-| `gla`          | Gated Linear Attention                    | shared weights copied, decay fitted per head      | 0.9M       | no         |
-| `swa` ¶        | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature                | 16 scalars | no         |
-
-
-An **exact** kernel contains Gated DeltaNet as a special case, so at step 0 the swapped layer
-reproduces the original to bf16 noise; the rest have more to recover. Only the *sequence mixer* is
-replaced — the backbone's projections, convolutions and gated output norm stay. Counts are for the
-0.8B backbone; `docs/kernels.md` has the per-kernel mappings.
-
-*Gate params* is the size of the kernel's own gate / recurrence group (`new_param_names`), copied gates
-included: `gdn`'s 0.6M are the pretrained gates themselves, not additions. The net change of the whole
-model against `gdn` (752.4M) is `gdn2` +112.7M, `rwkv7` +13.6M, `kda` +6.8M, `gla` +0.3M, `mamba2` and
-`deltanet` −0.3M, `swa` −0.6M.
-
-<sub>‡ needs as many value heads as key heads. ¶ not linear attention: sliding-window softmax with
-sinks (arXiv 2608.28444) over the same projections, bounded 68-key state; window / sinks / RoPE from
-`LINSWAP_SWA_WINDOW` / `_SINKS` / `_ROPE`.  `linswap kernels` lists everything registered, including
-kernels with no results here (`mamba1`, `mamba3`, `gdn_breg`).</sub>
+An **exact** kernel contains Gated DeltaNet as a special case: at step 0 the swapped model reproduces
+the teacher to bf16 noise and needs no training. The others lack something the teacher uses and have
+to be distilled. [docs/kernels.md](docs/kernels.md) has the per-kernel mappings.
 
 ## Install
 
 Python 3.11, PyTorch ≥ 2.7 with a matching Triton ≥ 3.3; tested on torch 2.9.1 / CUDA 12.8 /
-Triton 3.5.1. `flash-linear-attention` must come from git: the published wheels ship only
-`fla/layers` and `fla/models`.
+Triton 3.5.1 / transformers 5.17. `flash-linear-attention` must come from git: the published wheels ship
+only `fla/layers` and `fla/models`.
 
 ```bash
 git clone https://github.com/yuang-chen/LinearSwap && cd LinearSwap
 uv venv .venv --python 3.11 && source .venv/bin/activate
 uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+uv pip install --no-deps torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 uv pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention@8e84ed4"
-uv pip install -e ".[eval]"                              # the `linswap` command; [eval] adds RULER's deps
+uv pip install -e ".[eval]"                      # the `linswap` command; [eval] adds the three harnesses
 hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
-python tests/test_kernels.py && python tests/test_hf.py  # kernels match the control, HF round-trip exact
-```
-
-Optional, for the `mamba1` / `mamba3` kernels (always build without dependency resolution, or it
-replaces your torch):
-
-```bash
-CUDA_HOME=/usr/local/cuda MAX_JOBS=32 uv pip install --no-deps --no-build-isolation \
-    --no-binary causal-conv1d --no-binary mamba-ssm causal-conv1d mamba-ssm
+python tests/test_linswap.py                     # every kernel on text and an image, a short distillation
 ```
 
 On Hopper GPUs with Triton 3.4–3.7, FLA rejects the Triton backward of its gated chunk kernels
-(issue #640): add `uv pip install -e ".[hopper]"` (TileLang) to train `gdn` / `gdn2` / `kda`, and
-use Triton < 3.4 or ≥ 3.7.1 to train `mamba2` (inference is unaffected). RULER's word list and QA
-data are fetched by `RULER/scripts/data/synthetic/json/download_*.{py,sh}`.
+(fla#640): add `uv pip install -e ".[hopper]"` (TileLang) to train. RULER's haystacks are fetched by
+`RULER/scripts/data/synthetic/json/download_*.{py,sh}`; every other dataset comes from the Hub on first use.
 
 ## Usage
 
-```python
-from linswap import build_model
-model = build_model("rwkv7")                                          # exact init from the backbone
-model = build_model(ckpt_dir="outputs/rwkv7/distill/checkpoint-16338")  # kernel read from config.json
-out = model.generate(input_ids, max_new_tokens=32)                    # greedy, cached decode
+```bash
+linswap kernels                                   # what is registered
+linswap verify  --kernel kda                      # is the swap faithful, on text and on an image?
+linswap distill --kernel gla                      # train the swapped layers -> outputs/distill/gla
+linswap eval    --models native kda outputs/distill/gla --name main    # the standard test sets
+linswap eval    --models gla --smoke              # a functional check in minutes, not a score
 ```
 
-The architecture is read from the backbone's HF `config.json`; any GDN-based hybrid with the
-Qwen3-Next layout loads, including grouped-value-head configurations (every kernel except `gdn2`,
-`gla` and `deltanet`). `linswap kernels` lists what is registered.
-
-**Scope: the language backbone.** Qwen3.5-0.8B is a vision-language checkpoint
-(`Qwen3_5ForConditionalGeneration`). LinearSwap loads its language model only (`text_config`,
-`model.language_model.*`), takes `input_ids`, and trains and evaluates on text; the vision tower and
-merger are not part of a swapped model or of its export, and no benchmark here measures image or video
-inputs. Read every "reproduces the original" below as a statement about the text path.
-
-To run a swap, or a checkpoint distilled on text, on images, `linswap.upstream` puts the swapped mixers
-into the model `transformers` itself loads — vision tower, merger, multimodal RoPE, processor and
-`generate` stay upstream — instead of rebuilding the backbone:
-
 ```python
-from linswap.upstream import build_upstream_model            # needs the `vision` extra (torchvision)
-model = build_upstream_model("kda")                          # Qwen3_5ForConditionalGeneration, mixers swapped
-model = build_upstream_model(ckpt_dir="outputs/kda/distill/checkpoint-16338")   # + distilled language weights
-out = model.generate(**processor.apply_chat_template(messages, tokenize=True, return_dict=True,
+from linswap import build_model
+model = build_model("kda")                        # transformers' Qwen3.5 vision-language model, mixers swapped
+model = build_model("outputs/distill/gla")        # a distilled checkpoint
+out = model.generate(**processor.apply_chat_template(messages_with_images, tokenize=True, return_dict=True,
                                                      add_generation_prompt=True, return_tensors="pt").to("cuda"))
 ```
 
-At step 0 an exact kernel there matches the native model on a processed image as closely as the `gdn`
-control does (`tests/test_upstream.py`), and on text its logits are bit-identical to `build_model`'s.
-It is an in-memory, inference-only path (greedy / sampling); what text-only distillation does to image
-tasks is not benchmarked yet.
+`build_model` loads the backbone with `transformers` and replaces only each decoder layer's
+`linear_attn`; `"native"` is the backbone untouched. A checkpoint holds just the swapped layers
+(`swap.safetensors`, plus `linswap.json` naming the kernel), since nothing else is trained.
 
-**Hugging Face.** Swapped models are `PreTrainedModel`s (`LinearSwapForCausalLM`, registered with
-the Auto classes on `import linswap`), so they save, load, generate and evaluate like any HF model:
-
-```bash
-linswap export --kernel rwkv7 --out hf/Qwen3.5-0.8B-RWKV7
+```
+src/linswap/
+  model.py       the swap inside transformers' Qwen3.5 model; checkpoints; build_model
+  registry.py    KernelSpec and the kernel registry
+  kernels/       one file per kernel: how to build the layer and initialise it from Gated DeltaNet
+  verify.py      swapped model vs the backbone on text and an image, gated for exact kernels
+  data.py        the distillation stream: web text, chat, image chats
+  distill.py     local matching, then closed loop, stopped by measurement
+  evaluate.py    lm-eval (text), RULER (long context), lmms-eval (images); --smoke
+RULER/           NVIDIA's RULER, with a model wrapper for linswap
+tests/           test_linswap.py: the whole path on one GPU
 ```
 
-```python
-import torch, linswap                                   # registers the architecture
-from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("hf/Qwen3.5-0.8B-RWKV7", dtype=torch.bfloat16).cuda()
-```
+## Distillation
 
-Checkpoints use Qwen's tensor layout: everything except `model.layers.{i}.linear_attn.*` is
-byte-identical to the backbone, so quantisers and converters see "Qwen with a different linear
-layer". Batches may be right-padded (loss / logits) or left-padded (also HF `generate`, every kernel
-but `swa`), and decoding is greedy or sampling (the model is stateful, so no beam search).
+`linswap distill` trains **only the swapped layers**, against **the teacher's activations**, on **the
+kinds of input the teacher handles** (web text up to 16K tokens, chat, image chats). There are no labels
+and no ground-truth loss, and the rest of the model stays the teacher's, frozen.
 
-**Adding a kernel.** Two routes, one file each in `kernels/`. A stock FLA layer plus an init
-recipe, where `register_fla_kernel` copies what every layer shares with GDN and calls your
-`init_extra` for the rest (`gla.py`); or a bare FLA op wrapped in `kernels.base.BackboneMixer`,
-where you implement `recurrence(hidden_states, q, k, v, state, use_cache)` and the base supplies
-the projections, convolutions, cache protocol and gated output norm (`rwkv7.py`, `mamba2.py`). Set
-`exact_init=True` only if the init is function preserving — `linswap verify --kernel <name> --baseline gdn` must then sit at the control's noise level. Tensor layout: `kernels/common.py`.
+1. **local** — every swapped layer learns to reproduce the teacher layer's output from the teacher
+   layer's input: 18 independent regressions on one teacher forward, without the vocabulary head and
+   without a backward pass through the depth of the model.
+2. **loop** — the student runs on its own hidden states, which are matched to the teacher's after every
+   block.
 
-## Pipeline
+The gap to the teacher is measured on held-out text, chat, images and a 32K sequence at token
+milestones, and the run ends when more tokens stop closing it. The trained layers keep float32 master
+weights (a small step on a bf16 weight rounds away) while the forward pass runs in bf16; the gap is
+measured on, and the checkpoint holds, the bf16 cast. An exact kernel is not trained at all. Every run
+writes `train_log.jsonl` and, with `tensorboard` installed, the same curves as scalars:
+`tensorboard --logdir outputs/distill` shows the runs side by side while they train.
+[docs/recipe.md](docs/recipe.md) has the reasoning and the measurements behind each choice.
 
-**verify → distill → evaluate → lmeval**, one command each; `run` chains all four.
+## Evaluation
 
-`verify` is a gate, not only a printout: with `--baseline gdn` an `exact_init` kernel must keep every
-layer and logit error within `--tolerance` (3×) of the baseline's own noise, measured in the same run,
-or the command exits non-zero and `run` stops before training (`--json` saves the measurements).
+`linswap eval` runs each suite with the harness that defines its protocol, on the full test set:
 
-```bash
-linswap run --kernel rwkv7            # everything, results in outputs/eval/rwkv7
-```
+- **text** — [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness): LAMBADA,
+  ARC-c/e, PIQA, WinoGrande, HellaSwag (0-shot), MMLU (5-shot), IFEval.
+- **long** — [RULER](https://github.com/NVIDIA/RULER): four needle tasks, variable tracking, common and
+  frequent words extraction, 500 samples per task at 4K / 16K / 64K / 128K.
+- **mm** — [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval): MME, MMBench-EN dev, AI2D, ChartQA,
+  OCRBench, TextVQA val, MuirBench.
 
-Distillation is three steps on packed generic web text (DCLM, prepared on first use). No
-instruction data, no chat template, no supervised fine-tuning:
+`--smoke` keeps the code path and cuts the work to a few items of two tasks per suite. Results
+accumulate in `outputs/eval/<name>/results.{json,md}`, so models can be added to a run or spread over
+GPUs.
 
+## Results
 
-| step    | loss                                                         | tokens | length | lr          |
-| ------- | ------------------------------------------------------------ | ------ | ------ | ----------- |
-| `layer` | swapped layer vs original layer, on the original's own input | 100M   | 512    | 1e-3 → 1e-5 |
-| `kl`    | KL(teacher ‖ student) on next-token distributions            | 500M   | 512    | 1e-5        |
-| `ce`    | cross-entropy, no teacher (context extension)                | 100M   | 16384  | 1e-5        |
+Qwen3.5-0.8B, one seed; the gap is KL(teacher ‖ student) on held-out text, chat, image chats and a 32K
+sequence.
 
+- **Exact kernels need no training.** `kda`, `gdn2` and `rwkv7` at step 0 are at the numerical noise of
+  the comparison on text and on images (gap 0.001; same greedy answers as the teacher).
+- **Inexact kernels: a quarter of a GPU-hour does more than six did.** The earlier recipe (700M tokens,
+  about 6 GPU-hours, the whole model trained on web text) left `gla` at a gap of 0.55, mostly on images
+  (1.70). Training only the swapped layers against the teacher's hidden states brings it to 0.13 in 20M
+  tokens and 0.25 GPU-hours, evenly across text, chat, images and long context.
 
-The `layer` step measures its own loss on one batch before training and **skips itself** when that loss
-is below `--layer_skip_below` (1e-4): a swap that already reproduces the pretrained layer to bf16 noise
-has nothing to align, and training it there degrades the model instead of improving it.  In practice
-`gdn`, `gdn2`, `kda` and `rwkv7` skip it (initial loss 0 to 8e-7) while `gla`, `mamba2`,
-`swa` and `deltanet` run it (1.6e-2 to 1.1e-1).
+The full distillation runs and the standard test sets are in [docs/results.md](docs/results.md).
 
-Adam(0.9, 0.95), clip 1.0, bf16, about 6 GPU-hours per kernel at 0.8B. The first step trains the
-swapped layers, the other two everything. Budgets are tokens (`--kl_tokens 250e6`); every per-step
-knob is a flag.
+## Adding a kernel
 
-`step` in the log and in `checkpoint-N` is the plan's nominal step — a skipped `layer` step keeps its
-range so the numbering does not depend on the skip. The work actually done is logged next to it
-(`updates`, `tokens`, `teacher_tokens`) and saved in each checkpoint's `train_state.json`; the default
-recipe with the `layer` step skipped is 10,235 updates on 599M tokens. (Logs written before November
-2026 carry a `tokens` field that multiplied the global step by the current step's batch; ignore it.)
-`manifest.json` records the code and package revisions, the base model, the corpus and the plan.
-`--init_from` a checkpoint written inside a step continues it with its optimizer state, on the same data.
+Write `src/linswap/kernels/<name>.py` with
 
-Each run writes `outputs/<kernel>/distill/train_log.jsonl` and, with the `tensorboard` extra
-(`uv pip install -e ".[tensorboard]"`), a TensorBoard run next to it:
-`tensorboard --logdir outputs` overlays the kernels' loss, grad norm (total and per parameter group),
-lr, validation KL(teacher ‖ student) and the swapped layers' drift from their init.
+* `build(cfg, layer_idx) -> nn.Module`: a token mixer with the FLA layer interface
+  `forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`;
+* `init_from_gdn(layer, gdn_state, layer_idx, prefix)`: copy or tile the pretrained Gated-DeltaNet
+  tensors (`kernels/common.py` documents their shapes and the recurrence, and has the helpers);
+* `register_kernel(KernelSpec(name=..., build=..., init_from_gdn=..., exact_init=True/False))`, and an
+  import in `kernels/__init__.py`.
 
-Evaluation runs on the students *and* on the unmodified backbone:
-
-```bash
-linswap evaluate --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338 --name rwkv7
-linswap lmeval   --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
-python tools/throughput.py --models gdn rwkv7=outputs/rwkv7/distill/checkpoint-16338
-```
-
-- **Long context** — RULER `niah_single_1/2/3` and `niah_multikey_1` (retrieval), `vt` (multi-hop
-variable tracking), `cwe` / `fwe` (common / frequent words extraction) at 4K–128K, 500 samples,
-cached greedy decoding in left-padded batches (`--batch_size`), RULER's base prompt template
-(`--chat_template` switches).
-- **Short context** — LAMBADA, ARC-c/e, PIQA, WinoGrande, HellaSwag 0-shot, MMLU 5-shot and
-IFEval (chat template, generative), reported as accuracy and as a relative score (s − r)/(t − r) against a reference row.
-
-
-
-## Benchmarks
-
-Backbone Qwen3.5-0.8B, one seed, RULER base prompts, 500 samples per cell.  `gdn` is the **control**: the
-*unswapped* backbone put through the same training.  The control and the exact-init kernels use the recipe
-with the `layer` step skipped; the inexact kernels use the full recipe.
-
-**These tables are selected, not representative.**  `vt` and `cwe` are the only tasks in the 500-sample runs
-where the exact-init kernels differ by 5 points or more at two or more lengths.  On the needle tasks, `fwe`
-and the short-context suite they sit closer together.  All the tables are in
-[docs/results.md](docs/results.md).
-
-**`vt`** (variable tracking)
-
-| model | 4K | 16K | 64K | 128K |
-|---|---|---|---|---|
-| control (`gdn`) | 90.9 | 70.8 | 50.6 | 68.6 |
-| `gdn2` (exact init) | 91.8 | 71.0 | 50.6 | 67.6 |
-| `kda` (exact init) | 90.0 | 71.6 | 51.4 | 69.5 |
-| `rwkv7` (exact init) | 89.8 | 65.0 | 45.5 | 66.4 |
-| *spread, control + exact* | *1.9* | *6.6* | *5.9* | *3.2* |
-| `mamba2` | 78.2 | 36.8 | 19.8 | 19.6 |
-| `swa` | 37.6 | 23.7 | 28.6 | 7.2 |
-| `gla` | 38.8 | 1.6 | 0.2 | 0.2 |
-| `deltanet` | 51.4 | 18.7 | 0.0 | 0.0 |
-
-**`cwe`** (common words extraction)
-
-| model | 4K | 16K | 64K | 128K |
-|---|---|---|---|---|
-| control (`gdn`) | 62.5 | 68.6 | 30.7 | 8.5 |
-| `gdn2` (exact init) | 63.9 | 70.6 | 26.0 | 5.0 |
-| `kda` (exact init) | 62.5 | 69.2 | 31.4 | 11.2 |
-| `rwkv7` (exact init) | 60.6 | 68.7 | 27.7 | 3.9 |
-| *spread, control + exact* | *3.3* | *2.0* | *5.3* | *7.4* |
-| `mamba2` | 38.0 | 4.0 | 0.8 | 0.4 |
-| `swa` | 37.1 | 1.4 | 0.6 | 0.4 |
-| `gla` | 24.7 | 7.3 | 0.3 | 0.1 |
-| `deltanet` | 19.9 | 3.5 | 0.0 | 0.1 |
-
-What the numbers say:
-
-- **`rwkv7` trails on `vt`.**  It is 5.7 / 5.1 / 2.2 points below the control at 16K / 64K / 128K (paired
-  bootstrap over samples, 95% intervals exclude zero).
-- **On `cwe`, `kda` holds up at long context where `gdn2` and `rwkv7` drop.**  Against the control, `gdn2`
-  is 4.6 / 3.5 below and `rwkv7` 3.0 / 4.7 below at 64K / 128K, while `kda` is level at 64K and 2.7 above
-  at 128K.  Every model is near the floor at 128K, the control included.
-- **The inexact kernels are much further away.**  Their gaps to the control reach 50 points or more on
-  `vt` and 60 or more on `cwe`, against at most 7.4 among the exact kernels.
-
-How far to trust them:
-
-- **These intervals cover the RULER samples, not training.**  This is one trained checkpoint per kernel.
-  Two older runs of `gdn`, `gdn2`, `kda` and `rwkv7` under a retired recipe (50 samples) show that the
-  training seed can matter more: `gdn` on `vt` at 16K moves from 92.4 to 60.4 between seeds, while the four
-  kernels stay within 4.8 of each other inside each seed.  `rwkv7` is the lowest of the four at every
-  length in one seed and not in the other.  Do not read these tables as a settled kernel ranking.
-- **The exact and inexact rows differ in recipe as well as kernel**, as described above.
-- **These runs predate the RULER wrapper's `<|endoftext|>` stop** (see the changelog).  That fix was only
-  checked on the backbone and on the control's needle tasks, not on these rows.
-
-Speed on one L20X, bf16, batch 1 (decode is length-independent for all three, constant state):
-
-
-| model    | prefill 8K / 32K  | decode        | peak 8K / 32K |
-| -------- | ----------------- | ------------- | ------------- |
-| `gdn`    | 134K / 141K tok/s | 24.5 ms/token | 2.0 / 3.4 GiB |
-| `mamba2` | 119K / 128K       | 30.5          | 2.0 / 3.3     |
-| `rwkv7`  | 79K / 76K         | 33.3          | 2.7 / 6.1     |
-
-
-Full tables and the approaches that were tried and dropped: [docs/results.md](docs/results.md).
-Per-kernel mappings: [docs/kernels.md](docs/kernels.md).
+`linswap verify --kernel <name>` then says whether the init is function preserving: every number should
+sit at the level of the `gdn` column, which is numerical noise. Where a gate cannot hold the pretrained
+one exactly, fit it rather than leaving it at the library's init (`kernels/gla.py::fit_gate`) — and
+if it is still inexact, `linswap distill` closes what is left.
 
 ## Citation
 
@@ -277,24 +161,14 @@ Per-kernel mappings: [docs/kernels.md](docs/kernels.md).
 }
 ```
 
-
-
 ## Acknowledgements
 
 LinearSwap grew out of the GDN → GDN-2 in-place swap on Qwen3.5-0.8B
 ([write-up](https://lutet.industries/posts/gdn2-swap/),
-[code](https://github.com/lutetjeff/gdn2-in-place)), whose function-preserving gate tiling and
-RULER integration this project generalises. The backbone implementation started from Sebastian
-Raschka's [Qwen3.5 from-scratch notebook](https://github.com/rasbt/LLMs-from-scratch). Kernels
-come from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) (Songlin
-Yang, Yu Zhang and contributors); evaluation uses NVIDIA's
-[RULER](https://github.com/NVIDIA/RULER). The architectures swapped in are Gated DeltaNet-2, Kimi
-Delta Attention (Kimi Linear), RWKV-7, Mamba-2 and DeltaNet, by their respective authors.
-
-The distillation recipe and the evaluation protocol follow
-[RADLADS](https://arxiv.org/abs/2505.03005) (Goldstein et al., *Rapid Attention Distillation to
-Linear Attention Decoders at Scale*): its three steps (hidden-state alignment → logit distillation
-→ context-length extension) with their token budgets, schedules and optimizer settings,
-generic-text distillation data, base-prompt evaluation and the relative score against the teacher.
-RADLADS converts softmax attention into linear attention; here the same recipe is applied to
-swapping one linear sequence mixer for another inside a hybrid backbone.
+[code](https://github.com/lutetjeff/gdn2-in-place)), whose function-preserving gate tiling this project
+generalises. Kernels come from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+(Songlin Yang, Yu Zhang and contributors); the model is `transformers`' Qwen3.5; evaluation uses
+lm-evaluation-harness, lmms-eval and NVIDIA's RULER. Layer-wise matching followed by end-to-end
+distillation on generic text follows [RADLADS](https://arxiv.org/abs/2505.03005) (Goldstein et al.).
+The architectures swapped in are Gated DeltaNet-2, Kimi Delta Attention, RWKV-7, Mamba-2, DeltaNet,
+Gated Linear Attention and sliding-window attention, by their respective authors.

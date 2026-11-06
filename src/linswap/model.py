@@ -1,286 +1,197 @@
-"""Hybrid (Gated-DeltaNet + full attention) backbone with pluggable linear-attention token mixers.
+"""The swapped model: ``transformers``' own Qwen3.5 vision-language model with nothing but each decoder
+layer's ``linear_attn`` replaced by a kernel's layer.
 
-Full-attention layers, MLPs and norms come from ``components.py``; the
-linear-attention layers are built by the kernel registry.
+    from linswap import build_model
+    model = build_model("native")                           # the unmodified backbone
+    model = build_model("gdn")                              # the teacher: Gated DeltaNet on FLA's kernels
+    model = build_model("kda")                              # a swap at step 0, initialised from the backbone
+    model = build_model("outputs/distill/gla")              # a distilled checkpoint
+    model.generate(**processor.apply_chat_template(messages_with_images, ..., return_tensors="pt").to("cuda"))
+
+Decoder, full attention, RoPE (multimodal positions included), vision tower, merger, processor contract
+and ``generate`` stay upstream code and upstream weights, so a swapped model takes text, images and video
+exactly as the backbone does and every standard evaluation harness can drive it.
+
+A checkpoint is the *difference* to the backbone: ``swap.safetensors`` holds the swapped layers (and any
+other tensor that was trained), ``linswap.json`` names the kernel.  Everything else is read from the
+backbone, which distillation never changes.
+
+Limits: the kernel's recurrent / convolution state lives in an FLA cache attached to the upstream cache
+object, which upstream's ``reorder_cache`` / ``crop`` do not see, so decoding is greedy or sampling (no beam
+search).  Padding follows upstream (hidden states of pad positions are zeroed before the mixer), which is
+exact for left padding with every kernel that writes nothing for a zero input — not ``swa``, which is run
+one prompt at a time.
 """
 
 from __future__ import annotations
 
-import re
+import json
+import types
+from pathlib import Path
 
 import torch
-import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
-from .components import FeedForward, GroupedQueryAttention, RMSNorm, compute_rope_params
+from .registry import get_kernel, list_kernels
 
-from .registry import KernelSpec, get_kernel, kernel_map_name, parse_kernel_map
-
-ROPE_MARGIN = 4096  # positions beyond the backbone's max_position_embeddings that the RoPE tables cover
-
-
-class TransformerBlock(nn.Module):
-    """One decoder layer, laid out like Qwen3.5's: input_layernorm -> self_attn | linear_attn -> post_attention_layernorm -> mlp."""
-
-    def __init__(self, cfg, layer_type, layer_idx, kernel: KernelSpec):
-        super().__init__()
-        self.layer_type = layer_type
-        self.layer_idx = layer_idx
-        self.input_layernorm = RMSNorm(cfg["emb_dim"], eps=cfg.get("rms_norm_eps", 1e-6))
-        if layer_type == "full_attention":
-            self.self_attn = GroupedQueryAttention(
-                d_in=cfg["emb_dim"],
-                num_heads=cfg["n_heads"],
-                head_dim=cfg["head_dim"],
-                num_kv_groups=cfg["n_kv_groups"],
-                qk_norm=cfg["qk_norm"],
-                dtype=cfg["dtype"],
-            )
-        elif layer_type == "linear_attention":
-            self.linear_attn = kernel.build(cfg, layer_idx)
-        else:
-            raise ValueError(f"Unsupported layer type: {layer_type}")
-        self.post_attention_layernorm = RMSNorm(cfg["emb_dim"], eps=cfg.get("rms_norm_eps", 1e-6))
-        self.mlp = FeedForward(cfg)
-
-    @property
-    def token_mixer(self):
-        return self.self_attn if self.layer_type == "full_attention" else self.linear_attn
-
-    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, linear_cache=None, use_cache=False, linear_mask=None):
-        shortcut = x
-        x = self.input_layernorm(x)
-        if self.layer_type == "full_attention":
-            h, next_kv_cache = self.self_attn(
-                x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache, use_cache=use_cache,
-            )
-        else:
-            h, _, _ = self.linear_attn(x, attention_mask=linear_mask, past_key_values=linear_cache,
-                                       use_cache=linear_cache is not None)
-            next_kv_cache = None
-        x = h + shortcut
-        return self.mlp(self.post_attention_layernorm(x)) + x, next_kv_cache
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_BASE_MODEL_DIR = REPO_ROOT / "models" / "Qwen3.5-0.8B"
+NATIVE = "native"                      # the unswapped upstream model
+FLA_CACHE_ATTR = "_linswap_fla_cache"
 
 
-class LinearSwapBackbone(nn.Module):
-    """embed_tokens -> layers -> norm (the ``model`` sub-module of a Qwen-style causal LM)."""
+# ------------------------------------------------------------------------------ the swap
+def _mixer_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+    """``Qwen3_5DecoderLayer``'s call of its linear mixer -> the FLA layer interface the kernels implement.
 
-    def __init__(self, cfg, kernel: str | KernelSpec):
-        super().__init__()
-        self.cfg = cfg
-        # ``kernel`` may be a registry name / KernelSpec or a kernel-map string ("gdn;mamba2@3,6,9"):
-        # the default kernel builds every linear-attention layer unless the map overrides that layer.
-        self.kernel, self.kernel_map = parse_kernel_map(kernel)
-        self.embed_tokens = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
-        layer_types = cfg.get("layer_types", ["full_attention"] * cfg["n_layers"])
-        if len(layer_types) != cfg["n_layers"]:
-            raise ValueError("len(layer_types) must equal n_layers")
-        for i in self.kernel_map:
-            if i >= len(layer_types) or layer_types[i] != "linear_attention":
-                raise ValueError(f"kernel map names layer {i}, which is not a linear-attention layer")
-        self.layers = nn.ModuleList([TransformerBlock(cfg, lt, idx, self.layer_kernel(idx))
-                                     for idx, lt in enumerate(layer_types)])
-        self.norm = RMSNorm(cfg["emb_dim"], eps=cfg.get("rms_norm_eps", 1e-6))
-        # RoPE tables are computed lazily per (device, dtype) rather than registered as buffers:
-        # non-persistent buffers are not restored by HF `from_pretrained` (meta-device init).
-        self._rope_tables = {}
-        self.current_pos = 0
-        self.gradient_checkpointing = False
+    ``cache_params`` is the upstream cache of the whole model (or None); the kernel's own state lives in an
+    FLA cache attached to it, so it is created, carried and dropped with that request's cache."""
+    if attention_mask is not None:            # 2D padding mask of the current chunk, as upstream's own layer uses it
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
+    fla_cache = None
+    if cache_params is not None:
+        fla_cache = getattr(cache_params, FLA_CACHE_ATTR, None)
+        if fla_cache is None:
+            from fla.models.utils import Cache as FLACache
 
-    def layer_kernel(self, idx: int) -> KernelSpec:
-        return self.kernel_map.get(idx, self.kernel)
-
-    @property
-    def kernel_name(self) -> str:
-        """Registry name, or the canonical kernel-map string for mixed-kernel models."""
-        return kernel_map_name(self.kernel, self.kernel_map)
-
-    def rope_tables(self, device, dtype):
-        key = (str(device), dtype)
-        if key not in self._rope_tables:
-            cfg = self.cfg
-            head_dim = cfg["emb_dim"] // cfg["n_heads"] if cfg["head_dim"] is None else cfg["head_dim"]
-            cos, sin = compute_rope_params(
-                # A margin beyond max_position_embeddings lets generation continue past a prompt that fills the
-                # native window (RULER at 256K); HF computes RoPE per position and extrapolates the same way.
-                head_dim=head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"] + ROPE_MARGIN,
-                partial_rotary_factor=cfg.get("partial_rotary_factor", 1.0), dtype=torch.float32,
-            )
-            self._rope_tables = {key: (cos.to(device=device, dtype=dtype), sin.to(device=device, dtype=dtype))}
-        return self._rope_tables[key]
-
-    def forward(self, in_idx, cache=None, use_cache=False, apply_norm=True, attention_mask=None):
-        """``attention_mask`` ([B, cached + T], 0 = pad) is for left-padded batches only: full attention hides
-        the pad keys, and the linear layers unpad the current chunk to varlen (``cu_seqlens``) when it holds
-        any pad -- a decode step never does, so it takes the unpadded path."""
-        x = self.embed_tokens(in_idx)
-        num_tokens = x.shape[1]
-        if cache is not None or use_cache:
-            start_pos = self.current_pos
-            self.current_pos = start_pos + num_tokens
-        else:
-            start_pos = 0
-        mask = attention_mask  # key padding only; full attention builds its own compact causal mask
-        linear_mask = None
-        if mask is not None and not bool(mask[:, -num_tokens:].all()):
-            linear_mask = mask[:, -num_tokens:]
-        linear_cache = cache.linear_cache if cache is not None else None
-        cos, sin = self.rope_tables(x.device, x.dtype)
-        for i, block in enumerate(self.layers):
-            kv_cache = cache.get(i) if cache is not None else None
-            if self.gradient_checkpointing and self.training:
-                x, new_kv = checkpoint(block, x, mask, cos, sin, start_pos, kv_cache, linear_cache, use_cache,
-                                       linear_mask, use_reentrant=False)
-            else:
-                x, new_kv = block(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=kv_cache,
-                                  linear_cache=linear_cache, use_cache=use_cache, linear_mask=linear_mask)
-            if cache is not None and new_kv is not None:
-                cache.update(i, new_kv)
-        return self.norm(x) if apply_norm else x
+            fla_cache = FLACache()
+            setattr(cache_params, FLA_CACHE_ATTR, fla_cache)
+    out = self._linswap_forward(hidden_states, past_key_values=fla_cache, use_cache=fla_cache is not None)[0]
+    return out.to(hidden_states.dtype)        # float32 master weights (distill) must not widen the residual stream
 
 
-class LinearSwapModel(nn.Module):
-    """Causal LM: ``model`` (LinearSwapBackbone) + ``lm_head`` — the same module tree and state-dict
-    keys as Qwen3.5's ``Qwen3_5ForCausalLM`` (``model.embed_tokens``, ``model.layers.{i}.self_attn|linear_attn|mlp``,
-    ``model.norm``, ``lm_head``), so unchanged tensors are byte-identical to the backbone checkpoint."""
-
-    def __init__(self, cfg, kernel: str | KernelSpec = "gdn"):
-        super().__init__()
-        self.cfg = cfg
-        self.model = LinearSwapBackbone(cfg, kernel)
-        self.kernel = self.model.kernel            # default kernel (see ``kernel_map`` / ``kernel_name``)
-        self.lm_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
-
-    # ---- convenience accessors
-    @property
-    def layers(self):
-        return self.model.layers
-
-    @property
-    def embed_tokens(self):
-        return self.model.embed_tokens
-
-    @property
-    def out_head(self):  # backwards-compatible alias
-        return self.lm_head
-
-    @property
-    def current_pos(self):
-        return self.model.current_pos
-
-    @current_pos.setter
-    def current_pos(self, v):
-        self.model.current_pos = v
-
-    @property
-    def gradient_checkpointing(self):
-        return self.model.gradient_checkpointing
-
-    @gradient_checkpointing.setter
-    def gradient_checkpointing(self, v):
-        self.model.gradient_checkpointing = v
-
-    @property
-    def linear_layers(self):
-        return [b.linear_attn for b in self.model.layers if b.layer_type == "linear_attention"]
-
-    @property
-    def kernel_map(self):
-        return self.model.kernel_map
-
-    @property
-    def kernel_name(self) -> str:
-        return self.model.kernel_name
-
-    def layer_kernel(self, idx: int) -> KernelSpec:
-        return self.model.layer_kernel(idx)
-
-    @property
-    def supports_activation_checkpointing(self) -> bool:
-        return all(k.supports_activation_checkpointing for k in [self.kernel, *self.kernel_map.values()])
-
-    @property
-    def new_param_names(self) -> tuple:
-        names = []
-        for k in [self.kernel, *self.kernel_map.values()]:
-            names.extend(n for n in k.new_param_names if n not in names)
-        return tuple(names)
-
-    def new_parameters(self):
-        """Named parameters the (per-layer) kernel spec considers new / gate parameters."""
-        out = []
-        for n, p in self.named_parameters():
-            m = re.match(r"model\.layers\.(\d+)\.", n)
-            spec = self.layer_kernel(int(m.group(1))) if m else self.kernel
-            if spec.is_new_param(n):
-                out.append((n, p))
-        return out
-
-    # ---- forward
-    def forward(self, in_idx, cache=None, use_cache=False, return_hidden=False,
-                return_hidden_before_norm=False, last_logits_only=False):
-        x = self.model(in_idx, cache=cache, use_cache=use_cache, apply_norm=not return_hidden_before_norm)
-        if return_hidden_before_norm or return_hidden:
-            return x.to(self.cfg["dtype"])
-        if last_logits_only:
-            return self.lm_head(x[:, -1:, :].to(self.cfg["dtype"])).squeeze(1)
-        return self.lm_head(x.to(self.cfg["dtype"]))
-
-    # ---- generate
-    @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens, eos_token_id=None, temperature=0.0, top_k=1, top_p=1.0,
-                 use_cache=True, pad_token_id=None):
-        """Greedy decoding for a batch of equal-length (unpadded) prompts; sampling arguments are
-        accepted for API compatibility.  Rows that hit ``eos_token_id`` (an int or a list) are
-        frozen and padded with ``pad_token_id`` (default: the EOS id) until every row is finished."""
-        if max_new_tokens <= 0:
-            return input_ids
-        eos = None
-        if eos_token_id is not None:
-            eos = torch.as_tensor(eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id],
-                                  device=input_ids.device)
-        pad = pad_token_id if pad_token_id is not None else (int(eos[0]) if eos is not None else 0)
-        self.reset_cache_state()
-        prefix = input_ids
-        B = input_ids.shape[0]
-        finished = torch.zeros(B, dtype=torch.bool, device=input_ids.device)
-        cache = SwapCache(len(self.model.layers)) if use_cache else None
-        next_token = None
-        for step in range(max_new_tokens):
-            if step == 0:
-                logits = self(prefix, cache=cache, use_cache=use_cache, last_logits_only=True)
-            elif use_cache:
-                logits = self(next_token, cache=cache, use_cache=True, last_logits_only=True)
-            else:
-                logits = self(prefix, last_logits_only=True)
-            next_token = logits.argmax(dim=-1, keepdim=True)
-            if eos is not None:
-                next_token = torch.where(finished[:, None], torch.full_like(next_token, pad), next_token)
-                finished |= (next_token == eos).any(dim=-1)
-            prefix = torch.cat([prefix, next_token], dim=1)
-            if eos is not None and bool(finished.all()):
-                break
-        return prefix
-
-    def reset_cache_state(self):
-        self.model.current_pos = 0
+def kernel_config(text_config) -> dict:
+    """The backbone dimensions a kernel's ``build`` reads, from the upstream text config."""
+    rope = getattr(text_config, "rope_parameters", None) or {}
+    return {"emb_dim": text_config.hidden_size, "rms_norm_eps": text_config.rms_norm_eps,
+            "linear_conv_kernel_dim": text_config.linear_conv_kernel_dim,
+            "linear_key_head_dim": text_config.linear_key_head_dim,
+            "linear_value_head_dim": text_config.linear_value_head_dim,
+            "linear_num_key_heads": text_config.linear_num_key_heads,
+            "linear_num_value_heads": text_config.linear_num_value_heads,
+            "rope_base": float(rope.get("rope_theta", 10_000_000.0)), "dtype": torch.bfloat16}
 
 
-class SwapCache:
-    """Per-layer KV cache for full attention plus an FLA cache for the linear layers."""
+def text_model(model):
+    """The upstream ``Qwen3_5TextModel`` inside a conditional-generation model."""
+    return model.model.language_model
 
-    def __init__(self, n_layers):
-        from fla.models.utils import Cache as FLACache
 
-        self._kv = [None] * n_layers
-        self.linear_cache = FLACache()
+def mixers(model) -> dict:
+    """``{layer index: linear mixer}`` of the swappable layers."""
+    return {i: layer.linear_attn for i, layer in enumerate(text_model(model).layers) if hasattr(layer, "linear_attn")}
 
-    def get(self, layer_idx):
-        return self._kv[layer_idx]
 
-    def update(self, layer_idx, value):
-        self._kv[layer_idx] = value
+def swap_mixers(model, kernel: str):
+    """Replace every ``linear_attn`` in place by ``kernel``'s layer, initialised from the Gated-DeltaNet
+    layer it replaces (function preserving when the kernel's ``exact_init`` says so)."""
+    spec = get_kernel(kernel)
+    text = text_model(model)
+    cfg = kernel_config(text.config)
+    for idx, old in mixers(model).items():
+        ref = old.out_proj.weight
+        source = {f"m.layers.{idx}.linear_attn.{k}": v for k, v in old.state_dict().items()}
+        mixer = spec.init_from_gdn(spec.build(cfg, idx), source, idx, "m").to(device=ref.device, dtype=ref.dtype)
+        mixer._linswap_forward = mixer.forward
+        mixer.forward = types.MethodType(_mixer_forward, mixer)      # parameters and their names are untouched
+        text.layers[idx].linear_attn = mixer
+    model.linswap_kernel = spec.name
+    return model
 
-    def reset(self):
-        self._kv = [None] * len(self._kv)
-        self.linear_cache.reset()
+
+def fast_patch_embed(model):
+    """Compute the vision tower's patch embedding as a matrix product instead of ``torch.conv3d``.
+
+    The convolution's kernel and stride equal its input (one output per patch), so it *is*
+    ``weight.flatten(1) @ patch + bias``; in bf16 ``conv3d`` takes ~15 ms per visual token (16 s for a
+    1024 x 1024 image) against 0.05 s for the product, and the two agree to bf16 rounding.  Applied to every
+    model alike, the unswapped one included."""
+    def forward(self, hidden_states):
+        proj = self.proj
+        patches = hidden_states.reshape(-1, proj.weight[0].numel()).float()
+        bias = None if proj.bias is None else proj.bias.float()
+        return torch.nn.functional.linear(patches, proj.weight.flatten(1).float(), bias).to(proj.weight.dtype)
+
+    for module in model.modules():
+        if type(module).__name__.endswith("VisionPatchEmbed") and isinstance(getattr(module, "proj", None), torch.nn.Conv3d):
+            module.forward = types.MethodType(forward, module)
+    return model
+
+
+# -------------------------------------------------------------------------- checkpoints
+def save_checkpoint(model, out_dir, trained=None, **meta) -> Path:
+    """Write the swapped layers — and the tensors named in ``trained``, if more was trained — in bf16, the
+    precision the model runs in, with the kernel name and ``meta`` in ``linswap.json``."""
+    from safetensors.torch import save_file
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    keep = set(trained or ())
+    state = {k: v.detach().to("cpu", torch.bfloat16).contiguous() for k, v in model.state_dict().items()
+             if ".linear_attn." in k or k in keep}
+    save_file(state, str(out_dir / "swap.safetensors"))
+    with open(out_dir / "linswap.json", "w") as f:
+        json.dump({"kernel": model.linswap_kernel, "tensors": len(state), **meta}, f, indent=1)
+    return out_dir
+
+
+def _legacy_state(ckpt_dir) -> dict:
+    """``model.pt`` of a checkpoint written before the swap moved into the upstream model: the whole
+    language backbone in Qwen's layout, without the ``language_model`` level."""
+    state = torch.load(Path(ckpt_dir) / "model.pt", map_location="cpu", weights_only=True)
+    return {("model.language_model." + k[len("model."):] if k.startswith("model.") else k): v for k, v in state.items()}
+
+
+def checkpoint_kernel(ckpt_dir) -> str:
+    ckpt_dir = Path(ckpt_dir)
+    for name, key in (("linswap.json", "kernel"), ("config.json", "linear_kernel")):
+        if (ckpt_dir / name).exists():
+            with open(ckpt_dir / name) as f:
+                kernel = json.load(f).get(key)
+            if kernel:
+                return kernel
+    raise SystemExit(f"{ckpt_dir}: not a linswap checkpoint (no linswap.json naming a kernel)")
+
+
+def load_checkpoint(model, ckpt_dir):
+    """Load a checkpoint into a model whose mixers are already swapped.  Every tensor of the checkpoint must
+    land, and every tensor of the swapped layers must come from it."""
+    ckpt_dir = Path(ckpt_dir)
+    if (ckpt_dir / "swap.safetensors").exists():
+        from safetensors.torch import load_file
+
+        state = load_file(str(ckpt_dir / "swap.safetensors"))
+    else:
+        state = _legacy_state(ckpt_dir)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    stray = [k for k in missing if ".linear_attn." in k]
+    if unexpected or stray:
+        raise RuntimeError(f"{ckpt_dir} does not fit kernel {model.linswap_kernel!r}: {len(unexpected)} tensors have no "
+                           f"place, {len(stray)} swapped tensors are missing, e.g. {(unexpected + stray)[:3]}")
+    return model
+
+
+# ------------------------------------------------------------------------------ building
+def resolve(spec: str):
+    """``native`` | kernel | checkpoint dir | ``label=<one of those>``  ->  (label, kernel, checkpoint dir | None)."""
+    label, _, target = str(spec).rpartition("=")
+    if target == NATIVE or target in list_kernels():
+        return label or target, target, None
+    ckpt = Path(target).resolve()
+    if not ckpt.is_dir():
+        raise SystemExit(f"{target!r} is neither 'native', a kernel ({', '.join(list_kernels())}) nor a checkpoint directory")
+    kernel = checkpoint_kernel(ckpt)
+    return label or (f"{kernel}-distilled" if ckpt.name == kernel else f"{kernel}@{ckpt.name}"), kernel, ckpt
+
+
+def build_model(spec: str = NATIVE, base_model_dir=DEFAULT_BASE_MODEL_DIR, device="cuda", dtype=torch.bfloat16):
+    """The upstream Qwen3.5 vision-language model for ``spec`` (see ``resolve``), in eval mode."""
+    from transformers import AutoModelForImageTextToText
+
+    _, kernel, ckpt = resolve(spec)
+    model = fast_patch_embed(AutoModelForImageTextToText.from_pretrained(base_model_dir, dtype=dtype))
+    model.linswap_kernel = NATIVE
+    if kernel != NATIVE:
+        swap_mixers(model, kernel)
+        if ckpt is not None:
+            load_checkpoint(model, ckpt)
+    return model.to(device).eval()

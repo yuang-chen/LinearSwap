@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+* **New goal: the student approaches the teacher as efficiently as possible** (AGENTS.md); beating the
+  teacher is dropped.  The project was rebuilt around it and is about half its former size.
+* **One model.**  A swapped model is `transformers`' own Qwen3.5 vision-language model with only each
+  layer's `linear_attn` replaced (`linswap.model`), for training and evaluation alike, so text, images and
+  the standard harnesses work as with the backbone.  The project's own rebuilt backbone, its HF wrapper and
+  `export` are gone.  A checkpoint is `swap.safetensors` (the swapped layers, bf16) plus `linswap.json`;
+  checkpoints of the earlier format (`model.pt`) still load.
+* **`linswap distill` is new** (docs/recipe.md): only the swapped layers are trained, against the teacher's
+  activations, on web text, chat and image chats; a local layer-matching phase, then a closed loop on
+  hidden states; float32 master weights saved as bf16; milestones measure the gap to the
+  teacher and end the run when it stops closing.  Exact kernels are not trained.  Gone: the `layer` / `kl` /
+  `ce` steps, `--ce_kl_weight`, `--replay_data`, `--new_lr_mult`, `--param_dtype`, resume with optimizer
+  state.  The curves go to `train_log.jsonl` and, with `tensorboard` installed, to TensorBoard
+  (`tensorboard --logdir outputs/distill`): loss, gradient norm and learning rate per step, the gap with its
+  four parts and top-1 per milestone, against training tokens.
+* **`linswap eval` replaces `evaluate`, `lmeval`, `mmeval` and `run`**: lm-evaluation-harness for text,
+  RULER's scripts for long context (now in the chat template), lmms-eval for images, each on its full test
+  set; `--smoke` for a functional check.  The hand-written image benchmark code is gone.
+* **`linswap verify`** compares with the unmodified upstream model on text and on an image prompt, with
+  `gdn` as the noise floor, and accepts a checkpoint.
+* **Kernels: `gdn`, `rwkv7`, `kda`, `gdn2`, `mamba2`, `deltanet`, `gla`, `swa`.**  `mamba1`, `mamba3` and
+  `gdn_breg` are removed, as are kernel maps (mixed-kernel models).  `mamba2` runs its kernel in float32,
+  which is what lets it train on Hopper GPUs (fla#640).
+* **Removed:** the state-rank and gate-diagnostics tools and notes, the throughput and table tools, the
+  quickstart notebook, `docs/framework.md` (now in the README), and the earlier tests (one functional test,
+  `tests/test_linswap.py`, covers the path).
+
 * **The recipe trains about a fifth of the weights: the rest cannot move in bf16.**  The student's weights
   are stored and updated in bf16, and an lr 1e-5 Adam step is below half a bf16 grid step for any weight
   above ~2.5e-3 in magnitude, so it rounds away.  In the finished `gdn` / `kda` runs (10,235 updates, 599M

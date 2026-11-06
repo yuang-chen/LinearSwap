@@ -1,100 +1,119 @@
 # Recipe: distillation and evaluation
 
-The three training steps and the two evaluation suites, identical for every kernel.  What the steps do
-to a swapped layer is measured in [gate_diagnostics.md](gate_diagnostics.md); the results are in
-[results.md](results.md).
+How a swapped model is brought to the teacher, and how the distance is measured.  The numbers are in
+[results.md](results.md); the per-kernel mappings in [kernels.md](kernels.md).
+
+## The goal decides the recipe
+
+The target is the **teacher** — the unmodified Qwen3.5 backbone, a vision-language model — and not the
+data.  Three things follow, and each removed a part of the earlier recipe (layer alignment → logit KL →
+cross-entropy on web text, 700M tokens):
+
+* **No ground-truth loss.**  Cross-entropy on web text pulls the student towards the corpus, away from the
+  teacher: it lowered validation loss *below* the teacher's (2.96 against 3.09 for `gla`) and un-taught the
+  end-of-turn token, because packed web text has no chat turns.
+* **The inputs are the teacher's inputs.**  Web text alone leaves the swapped layers unfitted on what a
+  vision-language chat model actually sees.  The old checkpoints are at KL 0.16–0.20 from the teacher on
+  text and at 1.1–1.8 on image chats.
+* **An exact kernel is finished at step 0.**  `kda`, `gdn2` and `rwkv7` reproduce the teacher to numerical
+  noise (`linswap verify`), so `linswap distill` declines to train them.  Any training only moves them away.
+
+## What the old recipe spent its compute on
+
+The `gla` run of the earlier recipe (validation loss on held-out web text; the teacher is at 3.09):
+
+| point in the run | tokens | GPU time | validation loss |
+|---|---|---|---|
+| swap, untrained | 0 | 0 | 7.45 |
+| layer alignment, first 200 steps | 3.3M | ~1 min | 3.39 |
+| layer alignment, end | 100M | 22 min | 3.18 |
+| logit KL, end | 600M | 5.2 h | 3.14 |
+
+94 % of what was gained came in the first minute, and the KL step — 80 % of the GPU time — moved the loss
+by 0.04.  It could hardly do more: the weights were stored in bf16 and updated at lr 1e-5, and such a step
+is below half a bf16 grid step for any weight larger than about 2.5e-3, so it rounds away.  In the finished
+runs 79 % of the weights were bit-identical to the init.  The teacher was also only ever matched at 512
+tokens, while the inexact kernels fail at 16K and beyond.
 
 ## Distillation (`linswap distill`)
 
-Teacher: `gdn`, an exact copy of the original model.  Student: the swapped model.  Three steps on
-packed generic web text (DCLM by default; `--text_data fineweb-edu` is the alternative), no instruction
-data and no chat template anywhere, no supervised fine-tuning afterwards.  Both exact and inexact swaps
-use the same recipe — for an exact swap the first step starts from zero loss and the run is a
-teacher-matched continuation rather than a repair.
+**Only the swapped layers are trained**; everything else is the teacher's and frozen, so the vision
+tower, the chat format and the end-of-turn behaviour cannot drift.  **The target is the teacher's
+activations**, on a stream (`linswap.data`) that gives each kind of input its share of the tokens:
 
-| step | loss | tokens | length | sequences/step | lr | trained |
-|---|---|---|---|---|---|---|
-| `layer` | L2 between each student mixer's output and the teacher's, on the teacher's own layer input, all layers in parallel | 100M | 512 | 32 | 1e-3 → 1e-5 cosine | the swapped layers |
-| `kl` | KL(teacher ‖ student) on next-token distributions, exact, computed 2048 positions at a time | 500M | 512 | 96 | 1e-5 flat | all parameters |
-| `ce` | plain next-token cross-entropy, no teacher (context extension) | 100M | 16384 | 96 (8 × 12) | 1e-5 flat | all parameters |
-
-The `layer` step measures its own loss on one batch before training and skips itself when that loss is
-below `--layer_skip_below` (default 1e-4).  An exact init starts it at bf16 noise (~1e-6) with nothing
-to align, and Adam's normalised update at lr 1e-3 then walks the weights 18-20 % of their norm away from
-a function-preserving solution: its own objective rises by three orders of magnitude, validation loss
-degrades by ~0.16 nats, and the later steps do not recover it.  Skipping it is worth 9-11 points of 128K
-distractor-needle accuracy for `gdn2`, `kda` and `rwkv7` (see [gate_diagnostics.md](gate_diagnostics.md)).
-`gla`, `mamba2`, `swa` and `deltanet` start at 1.6e-2 to 1.1e-1 and run the step as before.
-
-Adam(0.9, 0.95, 1e-8), clip 1.0, bf16.  Budgets are given in tokens and converted to optimizer steps;
-`--stage_length` / `--stage_batch` / `--stage_micro` / `--stage_schedule` override any step.  Freezing
-the MLPs or the embeddings in the KL step costs accuracy, so everything trains.  About 6 GPU-hours per
-kernel at 0.8B on one L20X; the checkpoint under `outputs/<kernel>/distill/` is what gets evaluated.
-
-### Weight precision: what the recipe can and cannot move
-
-The student's weights are stored and updated in bf16 (`--param_dtype bfloat16`, the default and what
-every published row used).  bf16 keeps 8 significant bits, so a weight of magnitude `w` sits on a grid
-of spacing about `w / 128`, and an Adam step of at most the learning rate, 1e-5, is less than half a
-grid step for any weight above ~2.5e-3: the update rounds back to the old value.  Measured against the
-swap init:
-
-| checkpoint | weights that changed at all: backbone / shared projections | `kda` `f_proj.1` entries carrying GDN's decay |
+| source | form | share |
 |---|---|---|
-| `kda_nolayer`, 10,235 updates (500M `kl` + 99M `ce`), bf16 | 20.6 % / 21.4 % | 0.0 % |
-| `gdn_nolayer`, same recipe, bf16 | 21.2 % / 22.2 % | — |
-| `kda`, 63 `ce` updates only, bf16 | 21.0 % / 22.2 % | 0.0 % |
-| `kda`, 63 `ce` updates only, float32 | 100 % / 100 % | 99.7 % |
+| web text (DCLM) | one 16,384-token sequence | 30 % |
+| web text (DCLM) | eight 2,048-token sequences | 30 % |
+| chat (Alpaca, in the chat template) | eight 2,048-token sequences | 20 % |
+| image chats (The Cauldron: photos, scene text, plots, screenshots, image pairs) | one multi-turn chat with four images | 20 % |
 
-The same fifth of the weights — the small ones — is all that moves, after 63 updates or after 10,235.
-Weights initialised at exactly zero (the spare directions of a tiled gate) have a fine grid and do move.
-`--param_dtype float32` keeps full-precision master weights; the forward pass stays bf16 under autocast,
-validation included, and the checkpoint is float32 (`build_model` casts it back on load).
+None of it is used as labels, and the image subsets are not evaluation benchmarks.
 
-A pilot on the `ce` step alone, started from the swap init on the data stream the full recipe's `ce`
-step sees (`linswap distill --kernel <k> --stages ce --seed 16317 [--param_dtype float32]`, 63 updates,
-99M tokens, `outputs/pilot_ce_only/`); validation NLL on the usual 10 held-out sequences, init 3.090:
+Two phases:
 
-| run | `gdn` | `kda` | KL(teacher ‖ student) / top-1 agreement |
+1. **local** (3M tokens, about a minute).  Every swapped layer is given the teacher layer's input and
+   asked for the teacher layer's output — 18 independent regressions on one teacher forward.  There is no
+   vocabulary head and no backward pass through the depth of the model, so a token costs less than half of
+   what it costs in the loop, and the fit starts from a useful place however far the init was.
+2. **loop**.  The student runs on its own hidden states.  They are matched to the teacher's after every one
+   of the 24 blocks (squared error relative to the teacher's power, so each block weighs the same).  This
+   removes the error that accumulates when every layer was only fitted to clean inputs.  The logits are not
+   in the loss, so training never touches the vocabulary head.
+
+**Stopping is measured.**  The gap — KL(teacher ‖ student) of the next-token distribution on held-out
+text, chat, image chats and one 32K sequence, averaged over the four — is taken at token milestones
+(0.3M, 1M, 3M, 10M, ... into the loop).  Positions holding an image token are left out of it: nothing is
+predicted from them, and what they pass on shows at the text positions that follow.  When a milestone improves it by less than 5 %, the learning rate
+is cut once; the second time the run ends, at 100M tokens at the latest.  The best milestone is what is saved.
+
+**Precision.**  The trained layers keep float32 master weights and float32 optimizer state; the forward
+pass, the kernels' recurrent states and everything frozen are bf16, exactly as at inference.  The gap is
+measured with the trained weights cast to bf16, and that cast is what the checkpoint holds, so the stopping
+decision is made on the model that is delivered.
+
+### What the choices are based on
+
+`gla`, 20M tokens each, one run per variant.  "Loop" here is hidden states plus a KL on the logits at 2,048
+sampled positions per batch unless said otherwise.  The first gap column counts every position, as the gap
+did when these ran; the second leaves image tokens out, as it does now (measured for five of the variants).
+
+| variant | gap, all positions | gap | GPU-hours |
 |---|---|---|---|
-| `kl` 500M then `ce` 99M, bf16 (the recipe without `layer`) | 2.9171 | 2.9172 | not logged |
-| `ce` 99M only, bf16 | 2.9158 | 2.9156 | 0.154 / 0.82 |
-| `ce` 99M only, float32 weights | 2.8853 | 2.8854 | 0.196 / 0.80 |
+| local only | 0.256 | 0.211 | 0.14 |
+| loop only | 0.232 | 0.154 | 0.31 |
+| loop only, logit KL alone (no hidden-state loss) | 0.241 | | 0.30 |
+| local 3M, then loop | 0.189 | 0.138 | 0.26 |
+| **local 3M, then loop on hidden states alone** | **0.180** | **0.129** | 0.25 |
+| local 3M, then loop at lr 3e-4 | 0.210 | | 0.25 |
+| local 3M, then loop, training the 18 blocks (MLPs and norms too) | 0.231 | 0.145 | 0.26 |
+| local 3M, then loop, training the whole language model | 0.275 | | 0.27 |
 
-Three things, each one seed and validation NLL only (no RULER, no short-context suite):
+* The two phases together beat either alone at equal compute: the local phase gets from 5.0 to 0.43 in
+  about a minute, and the loop then closes what teacher-forced fitting cannot.
+* Training more than the swapped layers is *worse*, not better, on top of risking the abilities that live
+  outside them.
+* Matching hidden states carries the signal.  The logit KL alone is the weakest loop, and adding it to the
+  hidden states is no better than leaving it out (0.138 against 0.129), so it was removed.
 
-* **For an exact swap the `kl` step does not show up in validation NLL.**  The `ce` step alone lands
-  where 500M tokens of `kl` followed by `ce` land, and its first training loss is the same to four
-  digits (3.0310 vs 3.0311).  What `kl` buys on retrieval and answer format is not measured by this.
-* **Precision is worth more than the kernel here.**  float32 weights gain a further 0.03 nats on the same
-  data and move further from the teacher (KL 0.196 vs 0.154), which the dropped teacher-free
-  continuation in [results.md](results.md) found can cost answer format — so it needs the full
-  evaluation before it becomes the default.
-* **`gdn` and `kda` are indistinguishable in both settings**, to 2e-4 nats at every evaluation.
-  Unfreezing the weights does not by itself separate the kernels on web text.
+For reference, on the same held-out set the earlier 700M-token checkpoints are at 0.43 (`mamba2`) to 0.60
+(`swa`), and `kda` at step 0 is at 0.001.
 
-## Evaluation
+## Evaluation (`linswap eval`)
 
-Two suites, both applied to the students *and* to the unmodified backbone so the comparison is
-like-for-like:
+Three suites, each run by the harness that defines its protocol, on the full test set, thinking disabled,
+greedy decoding.  The swapped model is `transformers`' own model, so the harnesses drive it as they drive
+the backbone.
 
-* **Long context** (`linswap evaluate`): RULER's needle tasks `niah_single_1/2/3` and
-  `niah_multikey_1`, plus `vt` (follow a 4-hop chain of variable assignments through noise) and `cwe` /
-  `fwe` (name the most common words of a list / coded text — aggregation over the whole context rather
-  than retrieval of one span), at 4K / 16K / 64K / 128K, 500 samples each, cached greedy decoding,
-  scored as upstream RULER does (case-insensitive substring recall, no stop words).  Prompts use
-  RULER's own base template (context, question, answer prefix); `--chat_template` switches to the
-  backbone's chat format.  Since the students never see an instruction format during distillation,
-  base prompting is the setting in which teacher and student are scored the same way.
-* **Short context** (`linswap lmeval`): LAMBADA, ARC-c (acc_norm), ARC-e, PIQA, WinoGrande,
-  HellaSwag (acc_norm) 0-shot and MMLU 5-shot through lm-eval-harness, reported both as accuracy and
-  as a relative score (s − r)/(t − r) against a reference row, with r the chance level.  IFEval
-  (prompt-level strict accuracy, plus instruction-level in `ifeval_inst`) runs generatively with the
-  chat template, thinking disabled, as left-padded batches: full attention masks the pad keys and the
-  linear layers run the prompt varlen (`cu_seqlens`), so a batch decodes like each prompt alone (`swa`,
-  whose sinks are absolute positions, stays at batch size 1).
+* **text** — lm-evaluation-harness: LAMBADA, ARC-challenge / easy, PIQA, WinoGrande, HellaSwag (0-shot),
+  MMLU (5-shot), and IFEval (generative, chat template).
+* **long** — RULER's own scripts: `niah_single_1/2/3`, `niah_multikey_1` (needles), `vt` (variable
+  tracking), `cwe` / `fwe` (common / frequent words extraction), 500 samples per task at 4K, 16K, 64K and
+  128K, prompts in the chat template, left-padded batches.
+* **mm** — lmms-eval with its Qwen3 wrapper: MME (perception + cognition, as a share of 2800), MMBench-EN
+  dev (rule-based answer extraction, no GPT judge), AI2D, ChartQA (relaxed accuracy), OCRBench, TextVQA
+  val, MuirBench (multi-image).
 
-`tools/throughput.py` measures prefill and decode speed, `tools/hard_tables.py` turns evaluation logs
-into markdown tables.  [gate_diagnostics.md](gate_diagnostics.md) measures what the training steps do to
-the swapped layers: how far the tiled per-channel gates spread, and which step moves the weights.
-[state_rank.md](state_rank.md) measures the rank of every head's memory state on real text.
+`--smoke` runs two tasks per suite on 8 items and one RULER length with 4 samples: a check that the path
+works, in minutes, never a score.  `swa` cannot mask left padding (its sinks are absolute positions) and is
+evaluated one prompt at a time.

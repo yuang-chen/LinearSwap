@@ -55,11 +55,13 @@ class Mamba2SSDLayer(BackboneMixer):
         T, H = k.shape[1], k.shape[2]
         delta = F.softplus(self.dt_proj(hidden_states).float() + self.dt_bias.float())   # Δ_t  [B, T, H]
         g = -self.A_log.float().exp() * delta                                              # log decay per head
-        k_w = (k.float() * delta.unsqueeze(-1)).to(k.dtype)                                 # Δ_t B_t
+        k_w = k.float() * delta.unsqueeze(-1)                                               # Δ_t B_t
         fn = fused_recurrent_simple_gla if (self.use_recurrent_kernel and T <= 64) else chunk_simple_gla
-        o, state = fn(q=q, k=k_w, v=v, g=g, scale=self.head_k_dim ** -0.5, initial_state=state, output_final_state=use_cache,
-                      cu_seqlens=cu_seqlens)
-        return o + v * self.D.view(1, 1, H, 1).to(v.dtype), state
+        # float32 through the kernel, at inference as in training: simple-GLA keeps its state in float32, and
+        # on Hopper GPUs FLA's only correct backward for it (TileLang, fla#640) needs q/k/v in the state's dtype
+        o, state = fn(q=q.float(), k=k_w, v=v.float(), g=g, scale=self.head_k_dim ** -0.5, initial_state=state,
+                      output_final_state=use_cache, cu_seqlens=cu_seqlens)
+        return o.to(v.dtype) + v * self.D.view(1, 1, H, 1).to(v.dtype), state
 
 
 def build(cfg, layer_idx):
