@@ -26,12 +26,6 @@ from .fla_layer import register_fla_kernel
 
 def dense_f_proj(layer, cfg):
     """GDN2's default low-rank decay MLP cannot hold the tiled scalar decay exactly; use a dense projection."""
-    if layer.num_v_heads != layer.num_heads:
-        raise NotImplementedError(
-            "gdn2: FLA's GatedDeltaNet2 keeps the decay (f) and erase (b) gates per *key* head and repeats them "
-            f"over each group of {layer.num_v_heads // layer.num_heads} value heads, so a GDN backbone with grouped "
-            f"value heads ({layer.num_heads} key / {layer.num_v_heads} value heads) has no exact GDN2 image: the "
-            "value heads of a group carry different pretrained decays.  Use kda or rwkv7 for GVA backbones.")
     ref = layer.q_proj.weight
     layer.f_proj = nn.Linear(layer.hidden_size, layer.key_dim, bias=False, device=ref.device, dtype=ref.dtype)
 
@@ -48,6 +42,7 @@ def init_extra(layer, src):
 register_fla_kernel(
     "gdn2", GatedDeltaNet2,
     description="Gated DeltaNet-2 (FLA GatedDeltaNet2); scalar beta/decay tiled into channel-wise b/w/f gates.",
+    grouped_values=False,              # GDN-2 keeps its decay and erase gates per key head; the backbone's are per value head
     post_build=dense_f_proj, init_extra=init_extra,
     new_param_names=("b_proj", "w_proj", "f_proj", "A_log", "dt_bias"),
     exact_init=True,

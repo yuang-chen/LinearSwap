@@ -12,8 +12,10 @@ Decoder, full attention, RoPE (multimodal positions included), vision tower, mer
 and ``generate`` stay upstream code and upstream weights, so a swapped model takes text, images and video
 exactly as the backbone does and every standard evaluation harness can drive it.
 
+The backbone is any checkpoint of that model class: the Qwen3.5 family and Qwen3.8-27B (``base_model_dir``).
+
 A checkpoint is the *difference* to the backbone: ``swap.safetensors`` holds the swapped layers (and any
-other tensor that was trained), ``linswap.json`` names the kernel.  Everything else is read from the
+other tensor that was trained), ``linswap.json`` names the kernel and the backbone.  Everything else is read from the
 backbone, which distillation never changes.
 
 Limits: the kernel's recurrent / convolution state lives in an FLA cache attached to the upstream cache
@@ -45,8 +47,12 @@ def _mixer_forward(self, hidden_states, cache_params=None, attention_mask=None, 
 
     ``cache_params`` is the upstream cache of the whole model (or None); the kernel's own state lives in an
     FLA cache attached to it, so it is created, carried and dropped with that request's cache."""
-    if attention_mask is not None:            # 2D padding mask of the current chunk, as upstream's own layer uses it
-        hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
+    mask = {}
+    if attention_mask is not None and not attention_mask.all():      # 2D padding mask of the current chunk
+        if getattr(self, "takes_padding_mask", False):               # the layer packs the valid tokens itself
+            mask = {"attention_mask": attention_mask}
+        else:                                                        # as upstream's own layer: zero the pad positions
+            hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
     fla_cache = None
     if cache_params is not None:
         fla_cache = getattr(cache_params, FLA_CACHE_ATTR, None)
@@ -55,7 +61,7 @@ def _mixer_forward(self, hidden_states, cache_params=None, attention_mask=None, 
 
             fla_cache = FLACache()
             setattr(cache_params, FLA_CACHE_ATTR, fla_cache)
-    out = self._linswap_forward(hidden_states, past_key_values=fla_cache, use_cache=fla_cache is not None)[0]
+    out = self._linswap_forward(hidden_states, past_key_values=fla_cache, use_cache=fla_cache is not None, **mask)[0]
     return out.to(hidden_states.dtype)        # float32 master weights (distill) must not widen the residual stream
 
 
@@ -130,7 +136,8 @@ def save_checkpoint(model, out_dir, trained=None, **meta) -> Path:
              if ".linear_attn." in k or k in keep}
     save_file(state, str(out_dir / "swap.safetensors"))
     with open(out_dir / "linswap.json", "w") as f:
-        json.dump({"kernel": model.linswap_kernel, "tensors": len(state), **meta}, f, indent=1)
+        json.dump({"kernel": model.linswap_kernel, "base_model": Path(model.name_or_path).name, "tensors": len(state),
+                   **meta}, f, indent=1)
     return out_dir
 
 
@@ -188,6 +195,11 @@ def build_model(spec: str = NATIVE, base_model_dir=DEFAULT_BASE_MODEL_DIR, devic
     from transformers import AutoModelForImageTextToText
 
     _, kernel, ckpt = resolve(spec)
+    if ckpt is not None and (ckpt / "linswap.json").exists():
+        base = json.loads((ckpt / "linswap.json").read_text()).get("base_model")
+        if base and base != Path(base_model_dir).name:
+            raise SystemExit(f"{ckpt} holds layers of {base}, not of {Path(base_model_dir).name}: pass that backbone "
+                             f"as --base_model_dir")
     model = fast_patch_embed(AutoModelForImageTextToText.from_pretrained(base_model_dir, dtype=dtype))
     model.linswap_kernel = NATIVE
     if kernel != NATIVE:

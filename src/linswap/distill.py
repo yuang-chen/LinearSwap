@@ -54,13 +54,15 @@ from .model import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model, mixers, resol
 from .registry import get_kernel
 
 PHASES = ("local", "loop")
+WARMUP = 10                    # optimizer steps of linear learning-rate warm-up in each phase
 TRAIN = {"mixer": "the swapped layers", "block": "the 18 blocks holding them (MLP and norms too)",
          "all": "the whole language model"}
 
 
 def add_args(ap):
     ap.add_argument("--kernel", required=True, help="kernel, or a checkpoint directory to continue from")
-    ap.add_argument("--output_dir", default=None, help="default: outputs/distill/<kernel>")
+    ap.add_argument("--output_dir", default=None, help="default: outputs/distill/<kernel>, or "
+                    "outputs/distill/<backbone>/<kernel> for another backbone than the default")
     ap.add_argument("--base_model_dir", default=str(DEFAULT_BASE_MODEL_DIR))
     ap.add_argument("--phases", default="local,loop")
     ap.add_argument("--train", default="mixer", choices=tuple(TRAIN), help="what is trained: " + "; ".join(
@@ -128,7 +130,8 @@ class Distiller:
             p.requires_grad_(True)
         ids = {id(p) for p in self.params}
         self.trained = [n for n, p in self.student.named_parameters() if id(p) in ids]
-        self.student.gradient_checkpointing_enable()           # the loop phase back-propagates through 16K tokens
+        if all(getattr(m, "checkpointable", True) for m in mixers(self.student).values()):
+            self.student.gradient_checkpointing_enable()       # the loop phase back-propagates through 16K tokens
         self.val = [(kind, to_device(b, self.device)) for kind, b in data.validation(self.processor, args.base_model_dir)]
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             self.val_ref = [self.teacher.model(**b, use_cache=False).last_hidden_state for _, b in self.val]
@@ -215,7 +218,7 @@ class Distiller:
             norm = torch.nn.utils.clip_grad_norm_(self.params, 1.0)
             step += 1
             for g in optimizer.param_groups:
-                g["lr"] = lr * min(1.0, step / 10)             # ten steps of warm-up
+                g["lr"] = lr * min(1.0, step / WARMUP)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             self.tokens += got
@@ -225,7 +228,7 @@ class Distiller:
             if self.tokens - start >= milestone or self.tokens - start >= budget:
                 gap = self.measure(phase, log, history)
                 milestone *= math.sqrt(10)
-                if len(history) > 1 and gap > (1 - a.min_gain) * history[-2]["gap"]:
+                if step > WARMUP and len(history) > 1 and gap > (1 - a.min_gain) * history[-2]["gap"]:   # not judged while warming up
                     if cut:
                         print(f"[distill] phase {phase}: no further gain, done", flush=True)
                         return
@@ -258,7 +261,9 @@ def main(args) -> Path | None:
               f"train (check with `linswap verify --kernel {kernel}`; --force trains it anyway)")
         return None
     torch.manual_seed(args.seed)
-    out_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "outputs" / "distill" / kernel
+    base = Path(args.base_model_dir).resolve()
+    family = () if base == Path(DEFAULT_BASE_MODEL_DIR).resolve() else (base.name,)
+    out_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT.joinpath("outputs", "distill", *family, kernel)
     out_dir.mkdir(parents=True, exist_ok=True)
     phases = [p for p in args.phases.split(",") if p]
     if any(p not in PHASES for p in phases):

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+* **`mamba3` is back, as an optional kernel** (docs/kernels.md): FLA's Mamba-3 layer on `mamba_ssm`'s
+  kernels, registered when they import (`pip install -e ".[mamba3]"`).  Cached decoding works with
+  `nvidia-cutlass-dsl` ≥ 4.8 once the cached key is handed to the step kernel in the model's dtype; the layer
+  takes the padding mask itself; `distill` skips gradient checkpointing for it.
+* **A second backbone: Qwen3.8-27B** (`--base_model_dir models/Qwen3.8-27B`), which is the same
+  `transformers` class with 48 Gated-DeltaNet layers of 64 and one key head per three value heads.  Kernels
+  without grouped value heads (`gdn2`, `gla`, `deltanet`) are built with one key head per value head and the
+  key projections repeated, which keeps `gdn2` exact.  Tokenised corpora are kept per tokenizer
+  (`data/text/<corpus>-<shards>shard-<tokenizer sha>`), a checkpoint records its backbone and is refused on
+  another, and `distill` writes to `outputs/distill/<backbone>/<kernel>` for a non-default backbone.
+* Thinking is switched off in every chat prompt we build (the text suite of `eval`, `verify`, the distillation
+  data).  Qwen3.5's template has it off by default, so nothing changes there; Qwen3.8's turns it on.
+* **`mamba2` runs on FLA's GLA kernels** (scalar decay repeated over the key channels) instead of simple-GLA,
+  whose backward on Hopper GPUs is FLA's TileLang kernel: that kernel hung three times here (a 16K-token step
+  never returned, after 150–190 good ones).  Same outputs, state and parameters; gradients match float64
+  autograd to 1e-3; the float32 cast around the kernel is gone.
+* `distill`: the plateau rule is not applied during the learning-rate warm-up of a phase (a kernel that starts
+  far away, like `mamba3`, shows no gain at the first milestone and was cut to a third of the rate at once).
+
 * **New goal: the student approaches the teacher as efficiently as possible** (AGENTS.md); beating the
   teacher is dropped.  The project was rebuilt around it and is about half its former size.
 * **One model.**  A swapped model is `transformers`' own Qwen3.5 vision-language model with only each

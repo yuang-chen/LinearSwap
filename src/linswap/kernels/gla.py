@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from fla.layers import GatedLinearAttention
 
 from .common import tile_vec
-from .fla_layer import register_fla_kernel
+from .fla_layer import hidden_relative, register_fla_kernel
 
 GATE_LOGIT_NORMALIZER = 16          # FLA's default; the layer is built with it below
 
@@ -87,15 +87,10 @@ def init_extra(layer, src):
 
 
 def layer_kwargs(cfg):
-    hidden = cfg["emb_dim"]
-    if cfg["linear_num_key_heads"] != cfg["linear_num_value_heads"]:
-        raise ValueError("GLA has a single num_heads; key/value head counts must match")
     return dict(
-        expand_k=cfg["linear_num_key_heads"] * cfg["linear_key_head_dim"] / hidden,
-        expand_v=cfg["linear_num_value_heads"] * cfg["linear_value_head_dim"] / hidden,
-        num_heads=cfg["linear_num_key_heads"],
+        **hidden_relative(cfg),
         gate_logit_normalizer=GATE_LOGIT_NORMALIZER,
-        gate_low_rank_dim=max(16, cfg["linear_num_key_heads"]),
+        gate_low_rank_dim=max(16, cfg["linear_num_value_heads"]),
         use_short_conv=True, use_output_gate=True, gate_fn="swish", fuse_norm=True,
     )
 
@@ -105,6 +100,7 @@ register_fla_kernel(
     description="Gated Linear Attention (FLA GatedLinearAttention); shared weights copied, GDN decay mapped "
                 "per head into the low-rank gate (approximate) — NOT function preserving.",
     layer_kwargs=layer_kwargs, output_gate="native", norm_attr="g_norm_swish_gate",
+    grouped_values=False,              # GLA has a single num_heads
     init_extra=init_extra, new_param_names=("gk_proj",), exact_init=False,
     notes="Inexact swap (no erase, approximate decay, no q/k normalisation): distil before SFT.",
 )

@@ -1,10 +1,10 @@
 ![LinearSwap](docs/logo.png)
 
-**Swap the linear-attention kernel of Qwen3.5 in place, and distil the result back to the teacher as
-cheaply as possible.**
+**Swap the linear-attention kernel of Qwen3.5 / Qwen3.8 in place, and distil the result back to the
+teacher as cheaply as possible.**
 
-Qwen3.5 is a hybrid vision-language model: 18 of its 24 decoder layers are Gated DeltaNet, 6 are full
-attention. LinearSwap replaces the Gated-DeltaNet layers with another sequence mixer and keeps everything
+Qwen3.5 is a hybrid vision-language model: three of every four decoder layers are Gated DeltaNet, the
+fourth is full attention (18 + 6 in Qwen3.5-0.8B, 48 + 16 in Qwen3.8-27B). LinearSwap replaces the Gated-DeltaNet layers with another sequence mixer and keeps everything
 else — `transformers`' own model, vision tower and processor included. The unmodified backbone is the
 **teacher**; a swapped model is a **student**, and the goal is for the student to *approach the teacher*
 on text, long context and images with the least training.
@@ -21,6 +21,7 @@ on text, long context and images with the least training.
 | `kda`      | Kimi Delta Attention                      | decay tiled into the low-rank gate           | yes   |
 | `gdn2`     | Gated DeltaNet-2                          | scalar gates tiled into b/w/f                | yes   |
 | `mamba2`   | Mamba-2 SSD (decay, no erase)             | shared weights copied, erase dropped         | no    |
+| `mamba3`   | Mamba-3 SSM (rotary state, no erase)      | mapped into the fused projection; optional   | no    |
 | `deltanet` | DeltaNet (erase, no decay)                | shared weights copied, decay dropped         | no    |
 | `gla`      | Gated Linear Attention                    | shared weights copied, decay fitted per head | no    |
 | `swa`      | sliding-window softmax, 64 wide + 4 sinks | weight copy; new logit temperature           | no    |
@@ -46,6 +47,13 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 python tests/test_linswap.py                     # every kernel on text and an image, a short distillation
 ```
 
+`mamba3` is optional. It runs on `mamba_ssm`'s kernels and decodes with a CuTe-DSL kernel:
+
+```bash
+uv pip install --no-deps --no-build-isolation mamba_ssm==2.3.2.post1
+uv pip install -e ".[mamba3]"                    # nvidia-cutlass-dsl, quack-kernels
+```
+
 On Hopper GPUs with Triton 3.4–3.7, FLA rejects the Triton backward of its gated chunk kernels
 (fla#640): add `uv pip install -e ".[hopper]"` (TileLang) to train. RULER's haystacks are fetched by
 `RULER/scripts/data/synthetic/json/download_*.{py,sh}`; every other dataset comes from the Hub on first use.
@@ -69,7 +77,9 @@ out = model.generate(**processor.apply_chat_template(messages_with_images, token
 ```
 
 `build_model` loads the backbone with `transformers` and replaces only each decoder layer's
-`linear_attn`; `"native"` is the backbone untouched. A checkpoint holds just the swapped layers
+`linear_attn`; `"native"` is the backbone untouched. The backbone is Qwen3.5-0.8B unless
+`--base_model_dir` (or `build_model(spec, base_model_dir)`) names another checkpoint of the same model
+class, such as `models/Qwen3.8-27B`; a distilled checkpoint records its backbone. A checkpoint holds just the swapped layers
 (`swap.safetensors`, plus `linswap.json` naming the kernel), since nothing else is trained.
 
 ```
@@ -127,10 +137,12 @@ sequence.
 
 - **Exact kernels need no training.** `kda`, `gdn2` and `rwkv7` at step 0 are at the numerical noise of
   the comparison on text and on images (gap 0.001; same greedy answers as the teacher).
-- **Inexact kernels: a quarter of a GPU-hour does more than six did.** The earlier recipe (700M tokens,
+- **Inexact kernels: a quarter of the compute, a gap five times smaller.** The earlier recipe (700M tokens,
   about 6 GPU-hours, the whole model trained on web text) left `gla` at a gap of 0.55, mostly on images
-  (1.70). Training only the swapped layers against the teacher's hidden states brings it to 0.13 in 20M
-  tokens and 0.25 GPU-hours, evenly across text, chat, images and long context.
+  (1.70). Training only the swapped layers against the teacher's hidden states brings it to 0.13 after
+  12.5M tokens (10 GPU-minutes) and to 0.077 at the 100M-token cap (1.35 GPU-hours), evenly across text,
+  chat, images and long context; `deltanet` ends at 0.107 and `swa` at 0.118. The return diminishes
+  steeply: the last two thirds of the tokens move `gla` from 0.106 to 0.077.
 
 The full distillation runs and the standard test sets are in [docs/results.md](docs/results.md).
 

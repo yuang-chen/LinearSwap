@@ -57,7 +57,7 @@ def inputs_for(processor, device):
     ids = processor.tokenizer(PASSAGE * 200, return_tensors="pt").input_ids
     messages = [{"role": "user", "content": [{"type": "image", "image": test_image()}, {"type": "text", "text": QUESTION}]}]
     image = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=True,
-                                          return_tensors="pt")
+                                          return_tensors="pt", enable_thinking=False)
     return {"text@512": {"input_ids": ids[:, :512].to(device)}, "text@4096": {"input_ids": ids[:, :4096].to(device)},
             "image": dict(image.to(device))}
 

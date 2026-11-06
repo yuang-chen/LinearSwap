@@ -18,25 +18,15 @@ L2-normalises q/k and uses scale 1/sqrt(head_k_dim) like GDN."""
 from fla.layers import DeltaNet
 
 from .common import copy_
-from .fla_layer import register_fla_kernel
-
-
-def layer_kwargs(cfg):
-    hidden = cfg["emb_dim"]
-    if cfg["linear_num_key_heads"] != cfg["linear_num_value_heads"]:
-        raise ValueError("FLA DeltaNet has a single num_heads; key/value head counts must match")
-    return dict(
-        expand_k=cfg["linear_num_key_heads"] * cfg["linear_key_head_dim"] / hidden,
-        expand_v=cfg["linear_num_value_heads"] * cfg["linear_value_head_dim"] / hidden,
-        num_heads=cfg["linear_num_key_heads"],
-        use_beta=True, use_gate=True, qk_activation="silu", qk_norm="l2",
-    )
+from .fla_layer import hidden_relative, register_fla_kernel
 
 
 register_fla_kernel(
     "deltanet", DeltaNet,
     description="DeltaNet (FLA DeltaNet, no decay); GDN weights copied, decay branch dropped — NOT function preserving.",
-    layer_kwargs=layer_kwargs, output_gate="native",          # use_gate=True gives g_proj + swish-gated o_norm
+    layer_kwargs=lambda cfg: dict(**hidden_relative(cfg), use_beta=True, use_gate=True, qk_activation="silu", qk_norm="l2"),
+    output_gate="native",              # use_gate=True gives g_proj + swish-gated o_norm
+    grouped_values=False,              # DeltaNet has a single num_heads
     init_extra=lambda layer, src: copy_(layer.b_proj.weight, src["b"], "b_proj"),
     new_param_names=("b_proj",), exact_init=False,
     notes="Inexact swap: expect a large deviation from HF at init; full SFT is required.",

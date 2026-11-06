@@ -36,6 +36,10 @@ eval = ["accelerate", "lm_eval", "lmms-eval", "tenacity", "nltk", "wonderwords",
 # Hopper-class GPUs (compute capability 9.x) with Triton 3.4–3.7: FLA refuses the Triton backward of gated
 # chunk kernels (incorrect results, fla-org/flash-linear-attention#640) and uses TileLang instead.
 hopper = ["tilelang>=0.1.8"]
+# the `mamba3` kernel: FLA's Mamba-3 layer runs on mamba_ssm's kernels, and decodes token by token with a
+# CuTe-DSL kernel.  Install mamba_ssm itself with `--no-deps --no-build-isolation` first: resolved normally it
+# pins another TileLang and pulls another torch build.
+mamba3 = ["nvidia-cutlass-dsl>=4.8", "quack-kernels>=0.6.5"]
 # `distill` then also writes its curves as TensorBoard scalars (without it: train_log.jsonl only).
 tensorboard = ["tensorboard"]
 

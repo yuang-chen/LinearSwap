@@ -8,7 +8,11 @@ Distil a swapped model so that it **approaches the teacher as efficiently as pos
 the unmodified backbone, a vision-language model (its linear layers are `gdn`), so "the teacher's ability"
 covers text, long context and image inputs.  Beating the teacher is not a goal.
 
-* Kernels: `gdn` (the teacher), `rwkv7`, `kda`, `gdn2`, `mamba2`, `deltanet`, `gla`, `swa`.
+* Kernels: `gdn` (the teacher), `rwkv7`, `kda`, `gdn2`, `mamba2`, `mamba3` (optional dependency), `deltanet`,
+  `gla`, `swa`.
+* Backbones: the Qwen3.5 family and Qwen3.8-27B (`--base_model_dir`); they share `transformers`' model class.
+  Results are for Qwen3.5-0.8B; the 27B only has to be usable (build, verify, eval), it is not distilled or
+  benchmarked.
 * Report the training tokens and GPU-hours a kernel needs and the gap that remains.  Training that does not
   close the gap is waste; a kernel whose init is exact needs none.
 * Evaluate with the standard harnesses on the standard test sets (`linswap eval`); use `--smoke` only to

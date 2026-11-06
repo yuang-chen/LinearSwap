@@ -22,6 +22,36 @@ training.  `gdn` is the same recurrence on FLA's kernels, i.e. the numerical noi
 The three exact kernels are the teacher to numerical noise on text and on images, so they need no
 training; the other four start as noise.
 
+### Qwen3.8-27B
+
+The same comparison on the second backbone (48 Gated-DeltaNet layers of 64; 16 key heads shared by 48 value
+heads), KL / top-1.  The noise floor is two orders of magnitude higher than on the 0.8B model: 48 swapped
+layers in bf16, each within 1e-4 – 3e-4 of the backbone's own layer when compared alone in float32.
+The image prompt of this table was built with the chat template's default, which on this backbone turns
+thinking on; `linswap verify` now switches it off, as the evaluations do.
+
+| kernel | text, 512 tokens | text, 4096 tokens | image chat prompt | greedy answer to the image prompt | swapped layers |
+|---|---|---|---|---|---|
+| `gdn` | 8.6e-3 / 0.998 | 1.4e-2 / 0.997 | 0.14 / 0.947 | identical to the teacher's | 5.56B parameters |
+| `kda` | 5.4e-3 / 1.000 | 1.2e-2 / 0.997 | 0.043 / 0.932 | identical | 5.62B |
+| `rwkv7` | 7.2e-3 / 0.996 | 9.4e-3 / 0.997 | 0.044 / 0.958 | identical | 5.68B |
+| `gdn2` | 1.3e-2 / 0.998 | 1.2e-2 / 0.997 | 0.070 / 0.932 | identical | 12.08B |
+| `mamba2` | 0.37 / 0.924 | 0.29 / 0.941 | 7.9 / 0.303 | 17 % of the tokens agree | 5.55B |
+| `gla` | 0.42 / 0.924 | 0.62 / 0.874 | 7.7 / 0.136 | 75 % | 7.58B |
+| `deltanet` | 1.3 / 0.740 | 7.2 / 0.116 | 8.2 / 0.360 | 12 % | 7.57B |
+| `swa` | 11.9 / 0.020 | 11.6 / 0.004 | 11.1 / 0.019 | none | 5.54B |
+| `mamba3` | 12.9 / 0.000 | 13.3 / 0.000 | 10.8 / 0.000 | none | 5.58B |
+
+* The three exact kernels are at the floor here too.  `gdn2`, `gla` and `deltanet` have no grouped value
+  heads and get one key head per value head with the key projections repeated (`kernels/common.py`), which
+  is what makes `gdn2` exact and what makes these three larger; `gdn2` more than doubles the swapped layers.
+* On text the kernels without an erase start far closer than on the 0.8B model (`mamba2` 0.37 against 5.7),
+  on images just as far.
+* This backbone is supported for use — `build_model`, `linswap verify` and `linswap eval` run on it — but it
+  is not distilled or benchmarked here.  `linswap distill` as it stands would not fit it on one 140 GiB GPU
+  (an estimate, not a run): the float32 master weights, their gradients and the two Adam moments of 5.6B
+  parameters take 89 GB next to two copies of the 51 GiB model.
+
 ## Distillation
 
 The gap is KL(teacher ‖ student) on held-out text, chat, image chats and a 32K sequence (mean of the four).
@@ -33,10 +63,23 @@ The gap is KL(teacher ‖ student) on held-out text, chat, image chats and a 32K
 | `mamba2`, earlier recipe | 700M tokens | ~6 | 0.425 | 0.159 | 0.165 | 1.210 | 0.167 |
 | `deltanet`, earlier recipe | 700M tokens | 5.6 | 0.491 | 0.200 | 0.255 | 1.117 | 0.391 |
 | `swa`, earlier recipe | 700M tokens | ~6 | 0.604 | 0.190 | 0.275 | 1.760 | 0.191 |
-| `gla`, this recipe (pilot, 20M-token cap) | 20M tokens | 0.25 | 0.129 | 0.150 | 0.115 | 0.125 | 0.128 |
 
-The full runs of the four inexact kernels (up to 100M tokens, stopped by the gap) are in progress as of
-2026-11-06; this table will hold their curves.
+The runs of this recipe (`linswap distill`, swapped layers only, cap 100M tokens), gap at the milestones:
+
+| kernel | step 0 | 3M (end of local) | 12.5M | 33M | 100M | GPU-hours | text / chat / image / long at 100M |
+|---|---|---|---|---|---|---|---|
+| `gla` | 5.01 | 0.377 | 0.134 | 0.106 | **0.077** | 1.35 | 0.083 / 0.061 / 0.099 / 0.066 |
+| `deltanet` | 10.95 | 1.049 | 0.261 | 0.172 | **0.107** | 1.30 | 0.129 / 0.088 / 0.084 / 0.126 |
+| `swa` | 11.77 | 0.569 | 0.197 | 0.153 | **0.118** | 1.76 | 0.149 / 0.096 / 0.112 / 0.115 |
+
+* Each run reached the cap: after one learning-rate cut the gap still fell by more than 5 % per milestone,
+  so none was stopped by the plateau rule.  The return is steeply diminishing — from 33M to 100M tokens,
+  two thirds of the compute, `gla` goes from 0.106 to 0.077.
+* Against the earlier recipe (first table): about a quarter of the GPU time, a gap 4.6 to 7 times smaller, and
+  the image gap in line with the others instead of an order of magnitude above them.
+* `mamba2` and `mamba3` are still training as of 2026-11-06.  `mamba2`'s first run hung at 17M tokens inside
+  FLA's TileLang backward kernel for simple-GLA; its recurrence now runs on the GLA kernels
+  (`kernels/mamba2.py`) and the run was restarted.
 
 ## Standard test sets
 

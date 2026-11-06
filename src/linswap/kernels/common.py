@@ -90,15 +90,25 @@ def init_lowrank_tiled(seq: nn.Sequential, rows: torch.Tensor, reps: int, name: 
 def copy_qkv_and_conv(layer: nn.Module, src: dict) -> None:
     """Split the fused q/k/v projection of the pretrained layer and depthwise conv into the separate
     ``q_proj/k_proj/v_proj`` and ``q_conv1d/k_conv1d/v_conv1d`` modules used by
-    FLA layers.  Depthwise conv + SiLU is channel-wise, so the split is exact."""
-    key_dim, value_dim = layer.key_dim, layer.value_dim
+    FLA layers.  Depthwise conv + SiLU is channel-wise, so the split is exact.
+
+    The larger backbones share one key head among several value heads.  A layer built without that
+    grouping (``key_dim`` a multiple of the backbone's) gets the key head's rows once per value head of
+    its group, in the order the backbone repeats them, which computes the same function."""
+    value_dim = layer.value_dim
+    key_dim = (src["qkv"].shape[0] - value_dim) // 2            # the backbone's
+    reps, K = layer.key_dim // key_dim, layer.key_dim // layer.num_heads
+
+    def per_value_head(w):
+        return w if reps == 1 else w.view(key_dim // K, K, *w.shape[1:]).repeat_interleave(reps, 0).flatten(0, 1)
+
     qw, kw, vw = torch.split(src["qkv"], [key_dim, key_dim, value_dim], dim=0)
-    copy_(layer.q_proj.weight, qw, "q_proj")
-    copy_(layer.k_proj.weight, kw, "k_proj")
+    copy_(layer.q_proj.weight, per_value_head(qw), "q_proj")
+    copy_(layer.k_proj.weight, per_value_head(kw), "k_proj")
     copy_(layer.v_proj.weight, vw, "v_proj")
     cq, ck, cv = torch.split(src["conv"], [key_dim, key_dim, value_dim], dim=0)
-    copy_(layer.q_conv1d.weight, cq, "q_conv1d")
-    copy_(layer.k_conv1d.weight, ck, "k_conv1d")
+    copy_(layer.q_conv1d.weight, per_value_head(cq), "q_conv1d")
+    copy_(layer.k_conv1d.weight, per_value_head(ck), "k_conv1d")
     copy_(layer.v_conv1d.weight, cv, "v_conv1d")
 
 

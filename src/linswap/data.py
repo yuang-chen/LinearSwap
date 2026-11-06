@@ -43,15 +43,12 @@ MIX = (("text", 16384, 1, 0.3), ("text", 2048, 8, 0.3), ("chat", 2048, 8, 0.2), 
 
 # ----------------------------------------------------------------------------- corpora
 def text_corpus(name, base_model_dir) -> Path:
-    """Tokenised documents of a text or chat corpus (``train`` / ``validation``), prepared on first use and
-    refused when they were tokenised for another backbone."""
+    """Tokenised documents of a text or chat corpus (``train`` / ``validation``), prepared on first use; one
+    copy per tokenizer, so backbones with different vocabularies do not share token ids."""
     shards = TEXT[name][3] if name in TEXT else 1
-    out = DATA_DIR / "text" / f"{name}-{shards}shard"
     want = tokenizer_fingerprint(base_model_dir)
+    out = DATA_DIR / "text" / f"{name}-{shards}shard-{(want or 'unknown')[:8]}"
     if (out / "info.json").exists():
-        have = json.loads((out / "info.json").read_text()).get("tokenizer_sha256")
-        if have and want and have != want:
-            raise SystemExit(f"{out} was tokenised with another tokenizer than {base_model_dir}'s; delete it to rebuild")
         return out
     from datasets import load_dataset
     from huggingface_hub import hf_hub_download
@@ -65,7 +62,7 @@ def text_corpus(name, base_model_dir) -> Path:
         def tokenize(batch):
             chats = [[{"role": "user", "content": i + ("\n\n" + x if x else "")}, {"role": "assistant", "content": o}]
                      for i, x, o in zip(batch["instruction"], batch["input"], batch["output"])]
-            text = [tok.apply_chat_template(c, tokenize=False) for c in chats]
+            text = [tok.apply_chat_template(c, tokenize=False, enable_thinking=False) for c in chats]
             return {"input_ids": tok(text, add_special_tokens=False)["input_ids"]}
     else:
         repo, pattern, col, _ = TEXT[name]
@@ -162,7 +159,8 @@ class ImageChats(torch.utils.data.IterableDataset):
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": qa["assistant"]}]})
             n += len(row["images"])
             if n >= self.images:
-                batch = self.processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
+                batch = self.processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt",
+                                                           enable_thinking=False)
                 yield {k: v for k, v in batch.items() if k != "attention_mask"}     # nothing is padded
                 messages, n = [], 0
 

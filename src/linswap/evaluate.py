@@ -85,7 +85,7 @@ def run_text(model, tokenizer, tasks, limit, batch_size):
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
-    lm = HFLM(pretrained=model, tokenizer=tokenizer, backend="causal", batch_size=batch_size)
+    lm = HFLM(pretrained=model, tokenizer=tokenizer, backend="causal", batch_size=batch_size, enable_thinking=False)
     groups = {}
     for t in tasks:                               # one harness call per (shots, chat template)
         groups.setdefault((TEXT_FEWSHOT.get(t, 0), t in TEXT_CHAT), []).append(t)

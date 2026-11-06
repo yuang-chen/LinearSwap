@@ -1,4 +1,4 @@
-"""Mamba-2 kernel: the SSD (state space duality) recurrence, on FLA's simple-GLA kernel.
+"""Mamba-2 kernel: the SSD (state space duality) recurrence, on FLA's GLA kernels.
 
 Mamba-2 (arXiv:2405.21060) is a scalar-decay linear RNN per head:
 
@@ -6,8 +6,12 @@ Mamba-2 (arXiv:2405.21060) is a scalar-decay linear RNN per head:
     S_t   = exp(-Δ_t·exp(A_log)) S_{t-1} + Δ_t B_t x_t^T     (state [N, P])
     y_t   = C_t^T S_t + D ⊙ x_t
 
-which is exactly ``chunk_simple_gla`` (``S_t = exp(g_t) S_{t-1} + k_t v_t^T``)
-with ``g_t = -Δ_t exp(A_log)``, ``k_t = Δ_t B_t``, ``q_t = C_t``, ``v_t = x_t``.
+which is linear attention with a scalar decay (``S_t = exp(g_t) S_{t-1} + k_t v_t^T``) with
+``g_t = -Δ_t exp(A_log)``, ``k_t = Δ_t B_t``, ``q_t = C_t``, ``v_t = x_t``.  It runs on FLA's GLA kernels with
+the scalar decay repeated over the key channels, not on the simple-GLA kernel that states exactly this: on
+Hopper GPUs simple-GLA's backward goes through FLA's TileLang kernel (fla#640), which now and then never
+returns (a 16K-token step hung after 150–190 good ones, three times).  The GLA kernels give the same
+outputs and state, gradients that match float64 autograd to 1e-3, and take bf16 inputs.
 Compared with GDN (``S_t = α_t (I - β_t k̂ k̂^T) S_{t-1} + β_t k̂ v^T``) it has the
 *same decay* (``α_t = exp(-exp(A_log)·softplus(a_t + dt_bias))``) but **no
 delta-rule erase** and the write is scaled by Δ_t instead of beta_t.  The
@@ -30,7 +34,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fla.ops.simple_gla import chunk_simple_gla, fused_recurrent_simple_gla
+from fla.ops.gla import chunk_gla, fused_recurrent_gla
 
 from ..registry import KernelSpec, register_kernel
 from .base import BackboneMixer, build_backbone_mixer
@@ -52,15 +56,16 @@ class Mamba2SSDLayer(BackboneMixer):
         self.D._no_weight_decay = True
 
     def recurrence(self, hidden_states, q, k, v, state, use_cache, cu_seqlens=None):
-        T, H = k.shape[1], k.shape[2]
+        T, H, K = k.shape[1], k.shape[2], k.shape[3]
         delta = F.softplus(self.dt_proj(hidden_states).float() + self.dt_bias.float())   # Δ_t  [B, T, H]
-        g = -self.A_log.float().exp() * delta                                              # log decay per head
-        k_w = k.float() * delta.unsqueeze(-1)                                               # Δ_t B_t
-        fn = fused_recurrent_simple_gla if (self.use_recurrent_kernel and T <= 64) else chunk_simple_gla
-        # float32 through the kernel, at inference as in training: simple-GLA keeps its state in float32, and
-        # on Hopper GPUs FLA's only correct backward for it (TileLang, fla#640) needs q/k/v in the state's dtype
-        o, state = fn(q=q.float(), k=k_w, v=v.float(), g=g, scale=self.head_k_dim ** -0.5, initial_state=state,
-                      output_final_state=use_cache, cu_seqlens=cu_seqlens)
+        g = (-self.A_log.float().exp() * delta).unsqueeze(-1).expand(-1, -1, -1, K)       # log decay, on every key channel
+        k_w = k * delta.unsqueeze(-1).to(k.dtype)                                           # Δ_t B_t
+        common = dict(q=q, k=k_w, v=v, scale=self.head_k_dim ** -0.5, initial_state=state, output_final_state=use_cache,
+                      cu_seqlens=cu_seqlens)
+        if self.use_recurrent_kernel and T <= 64:
+            o, state = fused_recurrent_gla(gk=g, **common)
+        else:
+            o, state = chunk_gla(g=g, **common)
         return o.to(v.dtype) + v * self.D.view(1, 1, H, 1).to(v.dtype), state
 
 

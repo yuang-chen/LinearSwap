@@ -29,13 +29,16 @@ from ..registry import KernelSpec, register_kernel
 from .common import copy_shared_from_gdn, get_gdn_source, mark_hf_initialized, use_qwen_output_gate
 
 
-def fla_default_kwargs(cfg: dict, layer_idx: int) -> dict:
+def fla_default_kwargs(cfg: dict, layer_idx: int, grouped_values: bool = True) -> dict:
+    """``grouped_values=False`` for a layer that cannot share a key head among value heads (or keeps its gates
+    per key head): it is built with one key head per value head, initialised as ``copy_qkv_and_conv`` says."""
+    HV = cfg["linear_num_value_heads"]
     return dict(
         hidden_size=cfg["emb_dim"],
         expand_v=1.0,
         head_dim=cfg["linear_key_head_dim"],
-        num_heads=cfg["linear_num_key_heads"],
-        num_v_heads=cfg["linear_num_value_heads"],
+        num_heads=cfg["linear_num_key_heads"] if grouped_values else HV,
+        num_v_heads=HV,
         mode="chunk",
         use_short_conv=True,
         conv_size=cfg["linear_conv_kernel_dim"],
@@ -45,9 +48,17 @@ def fla_default_kwargs(cfg: dict, layer_idx: int) -> dict:
     )
 
 
+def hidden_relative(cfg: dict) -> dict:
+    """``expand_k`` / ``expand_v`` for the FLA layers that size keys and values relative to the hidden size and
+    have a single ``num_heads`` (GLA, DeltaNet): one key head per value head."""
+    HV, hidden = cfg["linear_num_value_heads"], cfg["emb_dim"]
+    return dict(expand_k=HV * cfg["linear_key_head_dim"] / hidden, expand_v=HV * cfg["linear_value_head_dim"] / hidden)
+
+
 def build_fla_layer(layer_cls, cfg: dict, layer_idx: int, layer_kwargs: dict | Callable[[dict], dict] | None = None,
-                    output_gate: str = "qwen", gate_attr: str = "g_proj", norm_attr: str = "o_norm") -> nn.Module:
-    kwargs = fla_default_kwargs(cfg, layer_idx)
+                    output_gate: str = "qwen", gate_attr: str = "g_proj", norm_attr: str = "o_norm",
+                    grouped_values: bool = True) -> nn.Module:
+    kwargs = fla_default_kwargs(cfg, layer_idx, grouped_values)
     if layer_kwargs is not None:
         kwargs.update(layer_kwargs(cfg) if callable(layer_kwargs) else layer_kwargs)
     params = inspect.signature(layer_cls.__init__).parameters
@@ -63,10 +74,11 @@ def build_fla_layer(layer_cls, cfg: dict, layer_idx: int, layer_kwargs: dict | C
 
 def register_fla_kernel(name: str, layer_cls, *, description: str, new_param_names=(), exact_init: bool,
                         layer_kwargs=None, output_gate: str = "qwen", gate_attr: str = "g_proj",
-                        norm_attr: str = "o_norm", post_build: Callable[[nn.Module, dict], None] | None = None,
+                        norm_attr: str = "o_norm", grouped_values: bool = True,
+                        post_build: Callable[[nn.Module, dict], None] | None = None,
                         init_extra: Callable[[nn.Module, dict], None] | None = None, notes: str = "") -> KernelSpec:
     def build(cfg, layer_idx):
-        layer = build_fla_layer(layer_cls, cfg, layer_idx, layer_kwargs, output_gate, gate_attr, norm_attr)
+        layer = build_fla_layer(layer_cls, cfg, layer_idx, layer_kwargs, output_gate, gate_attr, norm_attr, grouped_values)
         if post_build is not None:
             post_build(layer, cfg)
         return layer

@@ -74,6 +74,42 @@ float32 at inference as in training: simple-GLA keeps its state in float32, and 
 GPUs FLA's only correct backward for it (TileLang, fla#640) needs q/k/v in the same dtype.
 ``mamba_ssm`` is not required.
 
+## Mamba-3 swap (inexact, optional)
+
+FLA's `Mamba3` layer on `mamba_ssm`'s kernels (`pip install -e ".[mamba3]"`; the kernel registers only when
+they import).  Mamba-3 is a diagonal state-space model with data-dependent decay `A`, step `Δ`, a
+trapezoidal update and a rotary (complex-valued) state, read out through per-group `B` / `C` vectors.  The
+layer fuses `[z, x, B, C, dd_dt, dd_A, trap, angles]` into one `in_proj` and has no short convolution.
+
+| pretrained GDN | Mamba-3 | how |
+|---|---|---|
+| `in_proj_z` | `z` rows of `in_proj` | copied (output gate) |
+| `v` rows of `in_proj_qkv` | `x` rows | copied |
+| `k`, `q` rows of `in_proj_qkv` | `B`, `C` rows, one group per key head | copied; Mamba-3 expands groups to value heads as GDN does |
+| `in_proj_a`, `dt_bias` | `dd_dt` rows, `dt_bias` | copied, so `Δ` equals GDN's |
+| `A_log` | bias of the `dd_A` rows (weights zero) | `A = -softplus(bias) = -exp(A_log)`: the decay `exp(A·Δ)` starts at GDN's |
+| — | `trap`, rotary `angles` rows | zero: neutral mixing, no rotation |
+| q / k L2 normalisation, `1/√K` | `B_norm`, `C_norm` weights | `1/√S`, with the query scale folded into `C_norm` |
+| `norm`, `out_proj` | per-head gated `norm`, `out_proj` | tiled per head, copied |
+
+Still different from GDN: no erase, `Δ`-scaled instead of `β`-scaled writes, and no short convolution on
+q / k / v, so the untrained swap is far from the teacher (step-0 KL 15 on text, 12 on an image).
+
+Three things the layer needs from us (`kernels/mamba3.py`, `linswap.model`, `linswap.distill`):
+
+* **Cached decoding.**  The prefill kernel returns the last key in float32; the single-token kernel is
+  compiled for one dtype shared by the cached key, the new key and the new query, which the layer computes
+  in the model's dtype.  Our subclass hands the cached key over in the model's dtype, as the layer's own
+  `allocate_inference_cache` does.  It needs `nvidia-cutlass-dsl` ≥ 4.8 with `quack-kernels` 0.6.5; with
+  4.7 the kernel did not compile.  On a trained checkpoint cached decoding then matches a full forward as
+  closely as the teacher kernel's does (KL 7e-4 against 1e-3).
+* **Padding.**  With a bias in the fused projection a zeroed hidden state still writes, so the layer gets the
+  padding mask and packs the valid tokens (`takes_padding_mask`); left-padded batches then match unpadded
+  rows (KL 7e-4, the teacher kernel's level).
+* **No gradient checkpointing.**  `mamba_ssm`'s backward reads its saved tensors twice, which
+  `torch.utils.checkpoint` refuses (`checkpointable = False`), so the closed-loop phase keeps all
+  activations.
+
 ## DeltaNet swap (inexact)
 
 DeltaNet (arXiv:2406.06484) is the delta rule *without* a forget gate,

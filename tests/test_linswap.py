@@ -19,6 +19,7 @@ from linswap import DEFAULT_BASE_MODEL_DIR, NATIVE, build_model, distill, get_ke
 from linswap.model import mixers  # noqa: E402
 
 KERNELS = ("gdn", "rwkv7", "kda", "gdn2", "mamba2", "deltanet", "gla", "swa")
+OPTIONAL = ("mamba3",)                  # registered only with its kernels installed (the `mamba3` extra)
 results = []
 
 
@@ -29,9 +30,11 @@ def check(ok, what):
 
 def check_kernels(processor):
     print("every kernel inside transformers' Qwen3.5 model, on text and on an image")
-    check(tuple(sorted(list_kernels())) == tuple(sorted(KERNELS)), f"the registry holds exactly {', '.join(KERNELS)}")
+    extra = tuple(k for k in OPTIONAL if k in list_kernels())
+    check(set(list_kernels()) == set(KERNELS + extra),
+          f"the registry holds exactly {', '.join(KERNELS)}" + (f" and the optional {', '.join(extra)}" if extra else ""))
     measured = {}
-    for name in (NATIVE,) + KERNELS:
+    for name in (NATIVE,) + KERNELS + extra:
         model = build_model(name)
         measured[name] = verify.measure(model, verify.inputs_for(processor, model.device))
         if name == "gla":
@@ -46,7 +49,7 @@ def check_kernels(processor):
     floor = verify.compare(measured[NATIVE], measured["gdn"])
     check(floor["text@512"]["top1"] == 1.0 and floor["generation"]["vs_native"] == 1.0,
           f"gdn on FLA's kernels is the backbone: text KL {floor['text@512']['kl']:.1e}, image KL {floor['image']['kl']:.1e}")
-    for name in KERNELS[1:]:
+    for name in KERNELS[1:] + extra:
         rows, spec = verify.compare(measured[NATIVE], measured[name]), get_kernel(name)
         finite = all(torch.isfinite(v).all() for k, v in measured[name].items() if k not in ("cached", "uncached"))
         fails = verify.judge(rows, floor, spec.exact_init)
