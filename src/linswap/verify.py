@@ -1,7 +1,7 @@
 """verify: is the swap a faithful replacement of the backbone, on text and on images?
 
     linswap verify --kernel kda
-    linswap verify --kernel outputs/distill/gla          # a distilled checkpoint: how far is it still?
+    linswap verify --kernel outputs/distill/gla          # a distilled checkpoint: does its cache decode right?
 
 The swapped model is compared with the unmodified upstream model on identical inputs: a text passage at
 512 and 4096 tokens, and a chat prompt with an image run through the upstream processor.  The ``gdn``
@@ -12,10 +12,15 @@ noise floor of the comparison in the same run.
   generation   greedy decoding of the image prompt: agreement with native, and with its own uncached decode
 
 A kernel whose init is exact must stay within ``--tolerance`` (3x) of the floor, and ``verify`` exits
-non-zero when it does not.  For an inexact kernel the numbers are its distance from the teacher at step 0 —
-what ``distill`` has to close — and for a checkpoint what is left of it; they are reported, and only the
-checkpoint's cached decoding is judged (an untrained inexact model emits noise, on which cached and
-uncached decoding need not agree).
+non-zero when it does not.  For an inexact kernel the numbers show how far it starts from the teacher; they
+are reported, and only a checkpoint's cached decoding is judged (an untrained inexact model emits noise, on
+which cached and uncached decoding need not agree).
+
+These inputs test exactness; they are not the distance of a distilled checkpoint.  The passage is two
+sentences repeated, which any trained student predicts (KL 1e-3 for a checkpoint whose held-out text KL is
+5e-2), and the image row counts the image-token positions, where nothing is predicted and which the gap of
+``linswap distill`` leaves out (KL 0.4 for the same checkpoint, held-out image chats 0.06).  For a
+checkpoint the distance is that gap and ``linswap eval``.
 """
 
 from __future__ import annotations

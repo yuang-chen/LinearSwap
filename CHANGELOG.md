@@ -2,10 +2,56 @@
 
 ## Unreleased
 
+Review of 2026-11-06 (code, procedure, records, docs).  Faults that changed results, and what was done:
+
+* **Every image batch was trained on twice.**  The image chats come from a `DataLoader` with two workers,
+  and both yielded the same stream.  Each worker now takes every second row of the common order
+  (`data.ImageChats.rows`).
+* **The image part of the gap was 32 VQAv2 rows.**  The held-out set took the first 8 image chats, and the
+  held-out rows are ordered by subset.  It now holds 8 chats of each of the five subsets (40 chats, 8.2K
+  scored positions); the per-subset KL is logged beside the gap (`image_<subset>`).  Gaps measured before
+  and after are comparable on text, chat and long context, and on `image_vqav2`, not on `image`.
+* **A step weighted its batches equally**, so the image chats (many small batches) carried about 60 % of the
+  gradient for 20 % of the tokens.  A step now weighs each batch by its tokens (`--weight batches` is the
+  old behaviour), and **the learning rate decays linearly to zero** over a phase (`--no-decay`).  Measured on
+  `gla` at 20M tokens: 0.114 (old weighting) → 0.100 ± 0.004 over three seeds (token weights) → 0.086 (with
+  decay); docs/recipe.md.
+* **`gla` and `mamba2` are re-distilled** with the above: gap 0.050 and 0.044 at 100M tokens (1.3 and 1.4
+  GPU-hours, each alone on its GPU).  Held-out text KL went from 0.083 to 0.054 (`gla`) and from 0.078 to
+  0.050 (`mamba2`) for the same tokens.  `mamba3`, `deltanet` and `swa` were not rerun; their numbers and
+  the earlier runs' records are in `outputs/distill/_prefix/` and are marked as such in docs/results.md.
+* **Claims corrected.**  No run was ever trained at a cut learning rate or stopped by the plateau rule
+  (results.md said each run had one cut); with a constant rate the last reading moved by 4–12 % over the
+  final 2 % of the tokens, so differences of that size between kernels were never resolved; the earlier
+  GPU-hours were timed on GPUs shared with evaluation jobs.
+* **The standard test sets are in docs/results.md**, per task with the difference to the teacher, next to the
+  gap: the re-distilled `gla` and `mamba2` are up to 6 points below the teacher on the likelihood benchmarks,
+  10–14 on IFEval and 10 on ChartQA; the earlier checkpoints fail RULER's variable tracking and word
+  counting; and a student words its answers differently from the teacher — which is what the
+  multiple-choice image scores (MuirBench, MMBench, AI2D) mostly measure.  Against the earlier checkpoints
+  the re-distilled ones are closer to the teacher on text (mean −4.9 → −4.2 and −4.7 → −3.2) and MMBench,
+  and **further on ChartQA** (63 → 60, both kernels).
+* `eval` keeps the harnesses' standard errors and per-item records (`samples/<label>/<task>.jsonl`), stores
+  the code revision, package versions and checkpoint hash per model and suite, refuses a label whose
+  checkpoint has changed, and prints per-task differences to the reference (starred beyond two standard
+  errors) and, for multiple-choice image tasks, how the replies are worded.  MME's sum no longer depends on
+  which keys the harness returns.
+* `distill` records wall-clock time with the measurements, the GPU and the other processes on it
+  (`manifest.json`), logs the learning rate it applied, and refuses to write a checkpoint over the one it
+  loads.
+* Records that were missing are saved: `outputs/verify/Qwen3.5-0.8B/` (all nine kernels and the distilled
+  checkpoints) and the step-0 gap of `kda` (`outputs/distill/step0/`).
+* `verify`'s docstring no longer offers its numbers as the distance of a distilled checkpoint (a repeated
+  passage and image-token positions; see the module).  Stale docstrings and doc statements corrected
+  (`gdn2` on the 27B backbone, `mamba2`'s kernels, removed-recipe numbers in kernel modules, the README's
+  `KernelSpec` example, AGENTS.md's pointer to a removed file).
+
+Earlier on 2026-11-06 (newest first; where a later entry reverses an earlier one, the later one holds):
+
 * **`mamba3` keeps the backbone's short convolutions** in front of FLA's Mamba-3 layer.  The layer has none,
   and the pretrained keys and values depend on the previous token through them: as it stood the swap started
-  at NMSE 70 per layer from the teacher (now 0.56) and was at a gap of 0.88 after 12.5M tokens (now 0.13,
-  with `mamba2`).  A better init of the unchanged layer (the current-token tap folded in) did not help
+  at NMSE 70 per layer from the teacher (now 0.56) and was at a gap of 0.88 after 12.5M tokens (now 0.12,
+  with `mamba2`); the full run ends at 0.068 after 100M tokens and 2.05 GPU-hours (`mamba2`: 0.071, 1.42).  A better init of the unchanged layer (the current-token tap folded in) did not help
   training.  Checkpoints of the earlier `mamba3` do not load.
 * **`mamba3` is back, as an optional kernel** (docs/kernels.md): FLA's Mamba-3 layer on `mamba_ssm`'s
   kernels, registered when they import (`pip install -e ".[mamba3]"`).  Cached decoding works with
@@ -17,6 +63,9 @@
   key projections repeated, which keeps `gdn2` exact.  Tokenised corpora are kept per tokenizer
   (`data/text/<corpus>-<shards>shard-<tokenizer sha>`), a checkpoint records its backbone and is refused on
   another, and `distill` writes to `outputs/distill/<backbone>/<kernel>` for a non-default backbone.
+* `eval --mm_batch_size` batches the image suite (default 1, as before; see docs/recipe.md for what batching
+  changes).  Each image task runs in its own harness call: lmms-eval's wrapper reads a batch's images with the
+  first item's task, so a batch that mixed tasks crashed.
 * Thinking is switched off in every chat prompt we build (the text suite of `eval`, `verify`, the distillation
   data).  Qwen3.5's template has it off by default, so nothing changes there; Qwen3.8's turns it on.
 * **`mamba2` runs on FLA's GLA kernels** (scalar decay repeated over the key channels) instead of simple-GLA,
@@ -52,6 +101,8 @@
 * **Removed:** the state-rank and gate-diagnostics tools and notes, the throughput and table tools, the
   quickstart notebook, `docs/framework.md` (now in the README), and the earlier tests (one functional test,
   `tests/test_linswap.py`, covers the path).
+
+Before the rewrite around `linswap distill` (the modules, flags and recipe these entries name are gone):
 
 * **The recipe trains about a fifth of the weights: the rest cannot move in bf16.**  The student's weights
   are stored and updated in bf16, and an lr 1e-5 Adam step is below half a bf16 grid step for any weight

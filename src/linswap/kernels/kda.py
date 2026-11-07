@@ -20,7 +20,7 @@ is representable *exactly* in that low-rank form:
     W2[c,h] = 1 if c // head_k_dim == h else 0             W2[:, H:] = 0
 
 With ``W2[:, H:] = 0`` the extra rank is invisible at init but receives
-gradient (grad W2[:, H:] = dL/da ⊗ (W1[H:] x) != 0), so SFT can use it.
+gradient (grad W2[:, H:] = dL/da ⊗ (W1[H:] x) != 0), so training can use it.
 
 KDA's default output gate is a low-rank *sigmoid*-gated norm; the backbone's is a
 full-rank *SiLU*-gated norm, which is not representable, so ``g_proj`` and

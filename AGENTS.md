@@ -1,5 +1,5 @@
-See README.md for the layout and workflow, docs/framework.md for the framework, docs/kernels.md for the
-per-kernel mappings, docs/recipe.md for distillation and evaluation, docs/results.md for the numbers.
+See README.md for the layout and workflow, docs/kernels.md for the per-kernel mappings, docs/recipe.md for
+distillation and evaluation, docs/results.md for the numbers.
 Work autonomously.
 
 ## Goal

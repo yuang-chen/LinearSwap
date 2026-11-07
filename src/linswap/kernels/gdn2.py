@@ -8,14 +8,14 @@ channels) and makes the decay channel-wise (``f_proj``, key_dim channels):
 
 With ``b_t = w_t = beta_t·1`` and ``g_t`` constant across channels this is GDN,
 so tiling the pretrained scalar projections across channels is exact
-(docs/gdn2_swap_notes.md).  As for KDA, GDN2's default low-rank gate MLPs and
+(docs/kernels.md).  As for KDA, GDN2's default low-rank gate MLPs and
 sigmoid-gated output norm are replaced by the backbone's parameterisation (dense
 ``f_proj``/``g_proj``, SiLU-gated RMSNorm) so the init is representable.
 New parameters: ~113M (three dense 2048×1024 gates per layer).
 
-Limitation: FLA's layer shares ``f``/``b`` across the value heads of a query-head group,
-so backbones with grouped value heads (e.g. Qwen3.8-27B, 16 key / 48 value heads) are
-rejected at build time — the exact tiled init does not exist there."""
+Grouped value heads (Qwen3.8-27B: 16 key heads shared by 48 value heads): FLA's layer keeps ``f``/``b`` per
+key head, so the layer is built with one key head per value head and the backbone's key projections
+repeated (``common.copy_qkv_and_conv``), which keeps the init exact and more than doubles the layer."""
 
 import torch.nn as nn
 from fla.layers import GatedDeltaNet2

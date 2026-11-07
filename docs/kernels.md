@@ -57,8 +57,8 @@ and Qwen's projections, convolutions and SiLU-gated output norm for the rest
 ``RWKV7Attention`` layer cannot be used: it fixes ``key_dim = hidden_size`` and
 bounds the per-step decay to ≥ 0.545, which the pretrained decays exceed.
 New parameters: 14M.  ``verify`` puts every check at the ``gdn`` noise level
-(top-1 agreement 1.0 at 8/512/4096 tokens, KL ≤ 1.6e-3, cached decode and
-generation identical).
+(top-1 agreement 1.0 on text at 512 and 4096 tokens, KL 8.0e-5 / 1.0e-5; 3.8e-3 on the
+image prompt, where the floor is 2.7e-3; cached decode and generation identical).
 
 ## Mamba-2 swap (inexact)
 
@@ -100,18 +100,20 @@ Still different from GDN: no erase and `Δ`-scaled instead of `β`-scaled writes
 causal convolution and SiLU, with small taps of either sign per channel, and for keys and values the tap on
 the *previous* token is as large as the one on the current token: the pretrained layer writes pairs that
 span two tokens.  Three variants, each layer fed the teacher layer's input (mean over the 18 layers) and
-then distilled:
+then distilled — with the recipe as it was before its faults were fixed ([results.md](results.md),
+"The runs before the fixes"), so the gaps are comparable with each other and not with the current
+`gla` / `mamba2` runs; `mamba3` has not been re-distilled:
 
 | variant | layer output vs the teacher's at step 0 | gap at 12.5M tokens | at 100M |
 |---|---|---|---|
 | FLA's layer as is, projections copied | NMSE 70.6, cosine −0.02, 3–13× too large | 0.884 | 0.245 (2.12 GPU-hours) |
 | the same, current-token tap folded into the projections | NMSE 3.1, cosine 0.26 | 0.931 | — |
-| **short convolutions kept (the kernel)** | NMSE 0.56, cosine 0.74 | 0.134 ¹ | running |
+| **short convolutions kept (the kernel)** | NMSE 0.56, cosine 0.74 | 0.122 | 0.068 (2.05 GPU-hours) |
 | `mamba2`, for reference | NMSE 0.73, cosine 0.74 | 0.127 | 0.071 |
 
-¹ measured with the trapezoid logit at +12 (a pure Euler step, exactly `mamba2`'s function at step 0); the
-kernel leaves it at 0, which is ahead at every milestone up to 6M tokens (0.166 against 0.174) and keeps
-the coefficient trainable.
+The trapezoid logit starts at 0, the library's even mix.  At +12 (a pure Euler step, exactly `mamba2`'s
+function at step 0) a trial run was behind at every milestone: 0.174 against 0.169 at 6M tokens, 0.135
+against 0.122 at 12.5M.
 
 * The scale: the teacher's readout before its output norm has an RMS of 5e-4 – 1e-2, comparable to the
   norm's epsilon, so the norm passes magnitude through.  Without the convolution's small taps the values were

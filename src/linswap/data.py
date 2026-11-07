@@ -11,8 +11,9 @@ evaluation benchmarks.
 
 ``stream`` interleaves the sources so that each receives its share of the tokens; a batch is the keyword
 arguments of the upstream model's forward (``input_ids`` and, with images, ``pixel_values`` /
-``image_grid_thw``), never padded.  ``validation`` is a fixed held-out set of the same kinds plus one long
-sequence.  Corpora are fetched from the Hub and tokenised on first use, under ``data/``.
+``image_grid_thw``), never padded.  ``validation`` is a fixed held-out set of the same kinds — image chats
+from every subset — plus one long sequence.  Corpora are fetched from the Hub and tokenised on first use,
+under ``data/``.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ CHAT = {"alpaca": ("yahma/alpaca-cleaned", "alpaca_data_cleaned.json")}
 CAULDRON = ("HuggingFaceM4/the_cauldron", ("vqav2", "textcaps", "plotqa", "screen2words", "nlvr2"))
 VAL_DOCS = 512                 # documents held out of each text corpus
 VAL_ROWS = 64                  # rows held out of each image subset
+VAL_CHATS = 8                  # held-out chats of each image subset in the validation set (four images each)
 MAX_PIXELS = 768 * 768         # per training image: at most 576 visual tokens
 # (source, sequence length, sequences per batch, share of the tokens)
 MIX = (("text", 16384, 1, 0.3), ("text", 2048, 8, 0.3), ("chat", 2048, 8, 0.2), ("image", None, None, 0.2))
@@ -126,11 +128,12 @@ class ImageChats(torch.utils.data.IterableDataset):
         index = [(t, i) for t, span in enumerate(spans) for i in span]
         groups = [t.metadata.row_group(0).num_rows for t in tables]
         rng = random.Random(self.seed)
-        cache = {}
+        worker = torch.utils.data.get_worker_info()        # each DataLoader worker holds a copy of this dataset:
+        cache = {}                                         # it takes every num_workers-th row of the common order
         while True:
             if not self.held_out:
                 rng.shuffle(index)
-            for t, i in index:
+            for t, i in index if worker is None else index[worker.id::worker.num_workers]:
                 g = i // groups[t]                             # row groups are equal-sized except the last
                 if (t, g) not in cache:
                     cache.clear()                              # shuffled access: keep one decoded group
@@ -188,12 +191,14 @@ def stream(processor, base_model_dir, seed):
 
 
 def validation(processor, base_model_dir):
-    """The held-out set: ``[(source, batch)]`` — text, chat, image chats, and one 32K text sequence."""
+    """The held-out set: ``[(source, batch)]`` — text, chat, image chats (``VAL_CHATS`` of every Cauldron
+    subset, named ``image:<subset>``), and one 32K text sequence."""
     import itertools
 
     text, chat = _docs("dclm", base_model_dir, "validation"), _docs("alpaca", base_model_dir, "validation")
     out = [("text", b) for b in itertools.islice(packed(text, 8192, 1, 0), 4)]
     out += [("chat", b) for b in itertools.islice(packed(chat, 2048, 4, 0), 2)]
-    out += [("image", b) for b in itertools.islice(ImageChats(image_corpus(), processor, 0, held_out=True), 8)]
+    for f in image_corpus():                           # per subset: the held-out rows come subset after subset
+        out += [(f"image:{f.parent.name}", b) for b in itertools.islice(ImageChats([f], processor, 0, held_out=True), VAL_CHATS)]
     out += [("long", b) for b in itertools.islice(packed(text, 32768, 1, 1), 1)]
     return out

@@ -87,11 +87,11 @@ def init_from_gdn(layer, gdn_state, layer_idx, model_prefix="model"):
 
 register_kernel(KernelSpec(
     name="mamba2",
-    description="Mamba-2 SSD recurrence (FLA simple-GLA kernel); GDN decay/projections copied, delta-rule erase "
+    description="Mamba-2 SSD recurrence (on FLA's GLA kernels); GDN decay/projections copied, delta-rule erase "
                 "and beta dropped — NOT function preserving.",
     build=build,
     init_from_gdn=init_from_gdn,
     new_param_names=("dt_proj", "A_log", "dt_bias", "D"),
     exact_init=False,
-    notes="Inexact swap (no delta rule, Δ-scaled writes): distil before SFT.",
+    notes="Inexact swap (no delta rule, Δ-scaled writes): distil.",
 ))

@@ -107,8 +107,9 @@ and no ground-truth loss, and the rest of the model stays the teacher's, frozen.
 2. **loop** — the student runs on its own hidden states, which are matched to the teacher's after every
    block.
 
-The gap to the teacher is measured on held-out text, chat, images and a 32K sequence at token
-milestones, and the run ends when more tokens stop closing it. The trained layers keep float32 master
+A step weighs each batch by its tokens, and the learning rate decays linearly to zero over the token
+budget (`--max_tokens`, 100M by default), which is what ends a run. The gap to the teacher is measured on
+held-out text, chat, image chats of every subset and a 32K sequence at token milestones. The trained layers keep float32 master
 weights (a small step on a bf16 weight rounds away) while the forward pass runs in bf16; the gap is
 measured on, and the checkpoint holds, the bf16 cast. An exact kernel is not trained at all. Every run
 writes `train_log.jsonl` and, with `tensorboard` installed, the same curves as scalars:
@@ -136,15 +137,21 @@ Qwen3.5-0.8B, one seed; the gap is KL(teacher ‖ student) on held-out text, cha
 sequence.
 
 - **Exact kernels need no training.** `kda`, `gdn2` and `rwkv7` at step 0 are at the numerical noise of
-  the comparison on text and on images (gap 0.001; same greedy answers as the teacher).
-- **Inexact kernels: a quarter of the compute, a gap five times smaller.** The earlier recipe (700M tokens,
-  about 6 GPU-hours, the whole model trained on web text) left `gla` at a gap of 0.55, mostly on images
-  (1.70). Training only the swapped layers against the teacher's hidden states brings it to 0.13 after
-  12.5M tokens (10 GPU-minutes) and to 0.077 at the 100M-token cap (1.35 GPU-hours), evenly across text,
-  chat, images and long context; `mamba2` ends at 0.071, `deltanet` at 0.107 and `swa` at 0.118. The return diminishes
-  steeply: the last two thirds of the tokens move `gla` from 0.106 to 0.077.
+  the comparison (same greedy answers as the teacher; `kda`'s gap is 0.001), and within one standard error
+  of the teacher on every text, image and RULER task measured.
+- **Inexact kernels: 1.3–1.4 GPU-hours to a gap of 0.05.** Training only the swapped layers against the
+  teacher's hidden states brings `gla` from 5.3 to 0.11 after 12.6M tokens (9 GPU-minutes) and to 0.050 at
+  100M tokens (1.3 GPU-hours); `mamba2` ends at 0.044 (1.4 GPU-hours). The return diminishes steeply: the
+  last two thirds of the tokens move `gla` from 0.078 to 0.050.
+- **A gap of 0.05 is not the teacher.** On the standard test sets these two students are up to 6 points
+  below it on the likelihood benchmarks, 10–14 on IFEval and 10 on ChartQA, and they word their answers
+  differently (a letter where the teacher explains), which is what MuirBench, AI2D and MMBench then score.
+  On RULER the earlier checkpoints find needles and fail at variable tracking and word counting.
+- `mamba3`, `deltanet` and `swa` were distilled with an earlier, faulty version of the recipe (gap 0.068,
+  0.107, 0.118) and have not been rerun.
 
-The full distillation runs and the standard test sets are in [docs/results.md](docs/results.md).
+All tables, the records behind them and what they do not establish are in
+[docs/results.md](docs/results.md).
 
 ## Adding a kernel
 
@@ -154,8 +161,8 @@ Write `src/linswap/kernels/<name>.py` with
   `forward(x, past_key_values=None, use_cache=False) -> (out, None, cache)`;
 * `init_from_gdn(layer, gdn_state, layer_idx, prefix)`: copy or tile the pretrained Gated-DeltaNet
   tensors (`kernels/common.py` documents their shapes and the recurrence, and has the helpers);
-* `register_kernel(KernelSpec(name=..., build=..., init_from_gdn=..., exact_init=True/False))`, and an
-  import in `kernels/__init__.py`.
+* `register_kernel(KernelSpec(name=..., description=..., build=..., init_from_gdn=..., exact_init=True/False))`,
+  and an import in `kernels/__init__.py`.
 
 `linswap verify --kernel <name>` then says whether the init is function preserving: every number should
 sit at the level of the `gdn` column, which is numerical noise. Where a gate cannot hold the pretrained
@@ -182,5 +189,5 @@ generalises. Kernels come from [flash-linear-attention](https://github.com/fla-o
 (Songlin Yang, Yu Zhang and contributors); the model is `transformers`' Qwen3.5; evaluation uses
 lm-evaluation-harness, lmms-eval and NVIDIA's RULER. Layer-wise matching followed by end-to-end
 distillation on generic text follows [RADLADS](https://arxiv.org/abs/2505.03005) (Goldstein et al.).
-The architectures swapped in are Gated DeltaNet-2, Kimi Delta Attention, RWKV-7, Mamba-2, DeltaNet,
+The architectures swapped in are Gated DeltaNet-2, Kimi Delta Attention, RWKV-7, Mamba-2, Mamba-3, DeltaNet,
 Gated Linear Attention and sliding-window attention, by their respective authors.

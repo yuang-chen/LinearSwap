@@ -1,9 +1,10 @@
 """Run manifests: what a training run was made of, written next to its checkpoints.
 
-``linswap distill`` writes ``manifest.json`` (``manifest_resume<step>.json`` for a resumed run) with the
-code revision, the versions of the packages that decide the numerics, the identity of the base model
-and of the tokenised corpus, and the stage plan with its hand-checkable token totals.  Nothing here is
-read back by the pipeline; it is the record that lets a result be traced to its inputs.
+``linswap distill`` writes ``manifest.json`` with the code revision, the versions of the packages that
+decide the numerics, the identity of the base model, the data mix and held-out set, and the GPU it ran on
+with whatever else was running there (a GPU-hour measured on a shared GPU is not one).  ``linswap eval``
+stores the revision and package versions with every suite.  Nothing here is read back by training; it is
+the record that lets a result be traced to its inputs.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from pathlib import Path
 MANIFEST_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGES = ("torch", "triton", "transformers", "flash-linear-attention", "datasets", "tokenizers", "tilelang",
-            "safetensors", "numpy")
+            "safetensors", "numpy", "lm_eval", "lmms_eval", "mamba_ssm")
 TOKENIZER_FILES = ("tokenizer.json", "vocab.json", "tokenizer.model", "spiece.model")
 
 
@@ -90,6 +91,33 @@ def model_identity(model_dir) -> dict:
                 out["hub_commit"], entry["etag"] = lines[0].strip(), lines[1].strip()
         weights[path.name] = entry
     out["weights"] = weights
+    return out
+
+
+def gpu_state(device=0) -> dict:
+    """The GPU a run is on — name, index, memory in use, utilisation — and the other compute processes on it
+    when the run starts.  Jobs of another container may not be listed, hence memory and utilisation."""
+    import os
+
+    import torch
+
+    def smi(query):
+        try:
+            done = subprocess.run(["nvidia-smi", f"--query-{query}", "--format=csv,noheader,nounits"], capture_output=True,
+                                  text=True, timeout=30)
+            return [line.split(", ") for line in done.stdout.splitlines()]
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+    props = torch.cuda.get_device_properties(device)
+    uuid = str(props.uuid)                                      # nvidia-smi prints it as GPU-<uuid>
+    out = {"name": props.name, "uuid": uuid, "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+    for row in smi("gpu=index,uuid,memory.used,utilization.gpu"):
+        if len(row) == 4 and row[1].endswith(uuid):
+            out.update(index=int(row[0]), memory_used_mib=row[2], utilization=row[3])
+    out["other_processes"] = [dict(zip(("pid", "memory_mib", "name"), row[1:]))
+                              for row in smi("compute-apps=gpu_uuid,pid,used_memory,process_name")
+                              if len(row) == 4 and row[0].endswith(uuid) and row[1] != str(os.getpid())]
     return out
 
 

@@ -19,9 +19,9 @@ buys is that every channel of a head starts with the *same* decay: the state's g
 repeated writes is then a per-head scalar which the per-head RMSNorm cancels (as in Mamba-2).
 With FLA's random per-channel gate init, channels of one head have different horizons, the slow
 ones never saturate, and the layer's output keeps changing with the repeat count — which is what
-breaks RULER's repeated-noise needle (``niah_single_1``).
-FLA's random gate init gave 87.5 / 64.8 / 43.2 / 1.6 (RULER task average at 4K-128K) and 94.3
-relative on short context on the same recipe; the mapped init gives 99.1 / 85.4 / 76.0 / 68.8 and 99.2.
+breaks RULER's repeated-noise needle (``niah_single_1``).  (Measured with an earlier training recipe
+whose runs are no longer kept: the random init lost the RULER average at 128K almost entirely, the mapped
+init did not.  Not re-measured with ``linswap distill``.)
 """
 
 import math
@@ -102,5 +102,5 @@ register_fla_kernel(
     layer_kwargs=layer_kwargs, output_gate="native", norm_attr="g_norm_swish_gate",
     grouped_values=False,              # GLA has a single num_heads
     init_extra=init_extra, new_param_names=("gk_proj",), exact_init=False,
-    notes="Inexact swap (no erase, approximate decay, no q/k normalisation): distil before SFT.",
+    notes="Inexact swap (no erase, approximate decay, no q/k normalisation): distil.",
 )

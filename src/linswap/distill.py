@@ -2,8 +2,8 @@
 
     linswap distill --kernel gla                      # -> outputs/distill/gla/{swap.safetensors,linswap.json}
 
-A kernel whose init is exact (``kda``, ``gdn2``, ``rwkv7``) already *is* the teacher and is not trained:
-``distill`` says so and stops.  For the others, only the swapped layers are trained — the rest of the model
+A kernel whose init is exact (``kda``, ``gdn2``, ``rwkv7``, and ``gdn`` itself) already *is* the teacher and
+is not trained: ``distill`` says so and stops.  For the others, only the swapped layers are trained — the rest of the model
 is the teacher's, frozen, so nothing outside them can drift — against the teacher's activations on the
 inputs it handles (``linswap.data``: web text up to 16K tokens, chat, image chats).  No labels and no
 ground-truth loss: the target is the teacher, not the data.
@@ -18,20 +18,32 @@ Two phases, each ending by measurement:
           clean inputs.  The logits are not part of the loss — adding a KL on them bought nothing — so
           training never touches the vocabulary head.
 
+A step is ``--step_tokens`` tokens of batches, each weighted by its tokens (``--weight tokens``), so the
+objective is the mean loss per token of the stream's mix — a four-image chat of 2.4K tokens does not weigh as
+much as a 16K-token sequence.
+
 The gap — KL(teacher ‖ student) of the next-token distribution on the held-out set, averaged over its four
-kinds (text, chat, image chats, one 32K sequence) — is measured at token milestones (0.3M, 1M, 3M, ... of
-each phase).  Positions holding an image token are left out of it: nothing is ever predicted from them, so
-their logits are arbitrary, while what they pass on is seen at the text positions that follow.  The local
-phase is a warm start and ends at ``--local_tokens``; when a milestone of the loop improves the gap by less
-than ``--min_gain``, the learning rate is cut once, and the second time the run ends.  It stops at
-``--max_tokens`` at the latest and keeps the weights of its best milestone.
+kinds (text, chat, image chats of every subset, one 32K sequence) — is measured at token milestones (0.3M,
+1M, 3M, ... of each phase).  Positions holding an image token are left out of it: nothing is ever predicted
+from them, so their logits are arbitrary, while what they pass on is seen at the text positions that follow.
+The local phase is a warm start of at most ``--local_tokens``.  In either phase, when a milestone improves
+the gap by less than ``--min_gain``, the learning rate is cut once, and the second time the phase ends; the
+run stops at ``--max_tokens`` at the latest and keeps the weights of its best milestone.  The milestones grow
+apart by sqrt(10), so a 100M-token run is judged six times in the loop: the rule is a safeguard against
+training on a plateau, and a run that reaches the cap was not stopped by it.  The learning rate is warmed
+up and then lowered linearly to zero over the phase's token budget (``--no-decay`` keeps it constant, and
+then the gap of a single milestone moves by several percent with the last batches trained on).  Seeds differ
+by a few percent, and the best milestone is chosen on the set it is reported on: read differences of that
+size between two runs as none.
 
 Precision.  The trained layers keep float32 master weights, because a small step on a bf16 weight rounds
 away; the forward pass and the kernels' states run in bf16 as at inference.  The gap is measured with the
 trained weights cast to bf16, and that cast is what ``swap.safetensors`` holds.
 
-``train_log.jsonl`` records every step and milestone with the work done so far (tokens, GPU seconds);
-``linswap.json`` in the output directory carries the totals and the gap curve.  With ``tensorboard``
+``train_log.jsonl`` records every step and milestone with the work done so far (tokens, GPU seconds of the
+training steps, and the wall clock including the measurements); ``linswap.json`` in the output directory
+carries the totals and the gap curve, ``manifest.json`` what the run was made of and what else was on its
+GPU — the seconds are only GPU-seconds if nothing was.  With ``tensorboard``
 installed the same values go to the output directory as scalars against training tokens — ``train/*`` per
 step (loss, gradient norm, learning rate), ``gap/*`` per milestone (the gap, its four parts, top-1) — so
 ``tensorboard --logdir outputs/distill`` shows the runs side by side while they train.
@@ -39,6 +51,7 @@ step (loss, gradient norm, learning rate), ``gap/*`` per milestone (the gap, its
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import math
@@ -49,7 +62,7 @@ import torch
 import torch.nn.functional as F
 
 from . import data
-from .manifest import model_identity, write_manifest
+from .manifest import gpu_state, model_identity, write_manifest
 from .model import DEFAULT_BASE_MODEL_DIR, REPO_ROOT, build_model, mixers, resolve, save_checkpoint
 from .registry import get_kernel
 
@@ -72,6 +85,11 @@ def add_args(ap):
     ap.add_argument("--local_lr", type=float, default=1e-3)
     ap.add_argument("--loop_lr", type=float, default=1e-4)
     ap.add_argument("--step_tokens", type=int, default=65536, help="tokens per optimizer step")
+    ap.add_argument("--weight", default="tokens", choices=("tokens", "batches"), help="what a batch counts for in a "
+                    "step's gradient: its tokens (the objective is the mean over the step's tokens), or one (a "
+                    "four-image chat then weighs as much as a 16K-token sequence)")
+    ap.add_argument("--decay", action=argparse.BooleanOptionalAction, default=True, help="lower the learning rate "
+                    "linearly to zero over a phase's budget (--no-decay: constant after the warm-up)")
     ap.add_argument("--first_milestone", type=float, default=0.3e6, help="tokens into a phase at its first "
                     "measurement; each next one is sqrt(10) times further")
     ap.add_argument("--min_gain", type=float, default=0.05, help="relative improvement of the gap a milestone must bring")
@@ -116,6 +134,7 @@ class Distiller:
         from transformers import AutoProcessor
 
         self.args = args
+        self.started = time.time()                             # wall clock of the run, measurements included
         self.device = torch.device("cuda")
         self.processor = AutoProcessor.from_pretrained(args.base_model_dir)
         self.teacher = build_model("gdn", args.base_model_dir, self.device)
@@ -155,16 +174,19 @@ class Distiller:
                 for s, t in zip(hidden.flatten(0, 1)[at].split(4096), ref.flatten(0, 1)[at].split(4096)):
                     ls = F.log_softmax(self.student.lm_head(s).float(), -1)
                     lt = F.log_softmax(self.teacher.lm_head(t).float(), -1)
-                    kl[kind] = kl.get(kind, 0.0) + F.kl_div(ls, lt, log_target=True, reduction="sum").item()
-                    top1[kind] = top1.get(kind, 0) + (ls.argmax(-1) == lt.argmax(-1)).sum().item()
-                    count[kind] = count.get(kind, 0) + len(s)
-        out = {f"kl_{k}": kl[k] / count[k] for k in kl}
+                    for k in dict.fromkeys((kind.split(":")[0], kind)):      # "image:vqav2" counts for image and for itself
+                        kl[k] = kl.get(k, 0.0) + F.kl_div(ls, lt, log_target=True, reduction="sum").item()
+                        top1[k] = top1.get(k, 0) + (ls.argmax(-1) == lt.argmax(-1)).sum().item()
+                        count[k] = count.get(k, 0) + len(s)
+        kinds = [k for k in kl if ":" not in k]
+        out = {f"kl_{k}": kl[k] / count[k] for k in kinds}
         out["gap"] = sum(out.values()) / len(out)
-        out["top1"] = sum(top1[k] / count[k] for k in top1) / len(top1)
+        out["top1"] = sum(top1[k] / count[k] for k in kinds) / len(kinds)
+        out.update({k.replace(":", "_"): kl[k] / count[k] for k in kl if ":" in k})    # the parts of a kind, not in the mean
         return out
 
     # ---------------------------------------------------------------------------- losses
-    def local_loss(self, batch):
+    def local_loss(self, batch, weight=1.0):
         """Teacher-forced: each student mixer on the teacher mixer's input.  Backward per layer."""
         seen = {}
         hooks = [m.register_forward_hook(lambda _, a, kw, out, i=i: seen.__setitem__(i, (kw["hidden_states"], out)),
@@ -177,17 +199,17 @@ class Distiller:
         for i, mixer in mixers(self.student).items():
             x, want = seen.pop(i)
             loss = nmse(mixer(hidden_states=x), want)
-            loss.backward()
+            (loss * weight).backward()
             total += loss.item()
         return {"loss": total / len(mixers(self.student))}
 
-    def loop_loss(self, batch):
+    def loop_loss(self, batch, weight=1.0):
         """Student-forced: the hidden states after every block against the teacher's."""
         with torch.no_grad():
             want = self.teacher.model(**batch, use_cache=False, output_hidden_states=True).hidden_states[1:]
         got = self.student.model(**batch, use_cache=False, output_hidden_states=True).hidden_states[1:]
         loss = sum(nmse(s, t) for s, t in zip(got, want)) / len(want)
-        loss.backward()
+        (loss * weight).backward()
         return {"loss": loss.item()}
 
     # ----------------------------------------------------------------------------- phase
@@ -201,29 +223,18 @@ class Distiller:
         print(f"[distill] phase {phase}: lr {lr:g}, {a.step_tokens:,} tokens per step, up to {budget / 1e6:.0f}M tokens", flush=True)
         while self.tokens - start < budget:
             self.student.train()
-            t0, got, batches, parts = time.time(), 0, 0, {}
-            while got < a.step_tokens:
-                kind, batch = next(stream)
-                batch = to_device(batch, self.device)
-                n = batch["input_ids"].numel()
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    out = loss_fn(batch)
-                for k, v in out.items():                       # token-weighted over the step's batches
-                    parts[k] = parts.get(k, 0.0) + v * n
-                got += n
-                batches += 1
-            for p in self.params:                              # gradients were summed over the batches
-                if p.grad is not None:
-                    p.grad.div_(batches)
+            t0 = time.time()
+            got, parts = self.accumulate(loss_fn, stream)
             norm = torch.nn.utils.clip_grad_norm_(self.params, 1.0)
             step += 1
+            now = lr * min(1.0, step / WARMUP) * (max(0.0, 1 - (self.tokens - start) / budget) if a.decay else 1.0)
             for g in optimizer.param_groups:
-                g["lr"] = lr * min(1.0, step / WARMUP)
+                g["lr"] = now
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             self.tokens += got
             self.seconds += time.time() - t0
-            log({"phase": phase, "step": step, "tokens": self.tokens, "seconds": round(self.seconds, 1), "lr": lr,
+            log({"phase": phase, "step": step, "tokens": self.tokens, "seconds": round(self.seconds, 1), "lr": now,
                  "grad_norm": float(norm), **{k: v / got for k, v in parts.items()}})
             if self.tokens - start >= milestone or self.tokens - start >= budget:
                 gap = self.measure(phase, log, history)
@@ -235,8 +246,31 @@ class Distiller:
                     cut, lr = True, lr * 0.3
                     print(f"[distill] phase {phase}: gain under {a.min_gain:.0%}, learning rate -> {lr:g}", flush=True)
 
+    def accumulate(self, loss_fn, stream):
+        """The gradient of one optimizer step, left in ``.grad``: batches are drawn until they hold
+        ``--step_tokens`` and weighted by their tokens (``--weight tokens``: the gradient of the mean loss per
+        token, which is also what is logged) or equally.  Returns the tokens drawn and the summed, token-weighted
+        losses."""
+        a, got, total, parts = self.args, 0, 0.0, {}
+        while got < a.step_tokens:
+            _, batch = next(stream)
+            batch = to_device(batch, self.device)
+            n = batch["input_ids"].numel()
+            weight = n / a.step_tokens if a.weight == "tokens" else 1.0
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = loss_fn(batch, weight)
+            for k, v in out.items():
+                parts[k] = parts.get(k, 0.0) + v * n
+            got += n
+            total += weight
+        for p in self.params:                                  # gradients were summed over the batches
+            if p.grad is not None:
+                p.grad.div_(total)
+        return got, parts
+
     def measure(self, phase, log, history):
-        rec = {"phase": phase, "tokens": self.tokens, "seconds": round(self.seconds, 1), **self.gap()}
+        rec = {"phase": phase, "tokens": self.tokens, "seconds": round(self.seconds, 1),
+               "wall": round(time.time() - self.started, 1), **self.gap()}
         history.append(rec)
         log(rec)
         best = min(h["gap"] for h in history)
@@ -250,7 +284,8 @@ class Distiller:
     def save(self, history):
         with deployed(self.params):
             save_checkpoint(self.student, self.out_dir, trained=self.trained, train=self.args.train, tokens=self.tokens,
-                            gpu_hours=round(self.seconds / 3600, 3), gap=history[-1]["gap"], history=history)
+                            gpu_hours=round(self.seconds / 3600, 3), wall_hours=round((time.time() - self.started) / 3600, 3),
+                            weight=self.args.weight, decay=self.args.decay, gap=history[-1]["gap"], history=history)
 
 
 def main(args) -> Path | None:
@@ -264,12 +299,17 @@ def main(args) -> Path | None:
     base = Path(args.base_model_dir).resolve()
     family = () if base == Path(DEFAULT_BASE_MODEL_DIR).resolve() else (base.name,)
     out_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT.joinpath("outputs", "distill", *family, kernel)
+    if ckpt is not None and out_dir.resolve() == ckpt:
+        raise SystemExit(f"distill: {ckpt} is the checkpoint to continue from; writing there would replace its "
+                         f"linswap.json and append to its train_log.jsonl — pass another --output_dir")
     out_dir.mkdir(parents=True, exist_ok=True)
     phases = [p for p in args.phases.split(",") if p]
     if any(p not in PHASES for p in phases):
         raise SystemExit(f"distill: phases are {PHASES}")
     write_manifest(out_dir / "manifest.json", kernel=kernel, args=vars(args), base_model=model_identity(args.base_model_dir),
-                   mix=[dict(zip(("source", "length", "batch", "share"), m)) for m in data.MIX])
+                   mix=[dict(zip(("source", "length", "batch", "share"), m)) for m in data.MIX],
+                   validation={"image_subsets": list(data.CAULDRON[1]), "image_chats_per_subset": data.VAL_CHATS},
+                   gpu=gpu_state())
     d = Distiller(args)
     d.out_dir = out_dir
     print(f"[distill] {kernel} -> {out_dir}; training {TRAIN[args.train]}: {sum(p.numel() for p in d.params) / 1e6:.1f}M "
@@ -292,5 +332,6 @@ def main(args) -> Path | None:
         board.close()
     best = min(history, key=lambda h: h["gap"])
     print(f"[distill] done: gap {history[0]['gap']:.4f} -> {best['gap']:.4f} at {best['tokens'] / 1e6:.1f}M tokens "
-          f"({best['seconds'] / 3600:.2f} GPU-h); trained {d.tokens / 1e6:.1f}M tokens in all -> {out_dir}")
+          f"({best['seconds'] / 3600:.2f} GPU-h); trained {d.tokens / 1e6:.1f}M tokens in all, "
+          f"{(time.time() - d.started) / 3600:.2f} h wall with the measurements -> {out_dir}")
     return out_dir

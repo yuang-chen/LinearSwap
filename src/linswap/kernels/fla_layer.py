@@ -7,11 +7,12 @@ particular layer does not accept, and can swap in the backbone's output gate.
 ``register_fla_kernel`` turns that plus an init recipe into a ``KernelSpec``:
 
     register_fla_kernel(
-        "gla", GatedLinearAttention, description="…",
-        layer_kwargs=lambda cfg: dict(expand_k=2.0, expand_v=2.0, num_heads=16, use_short_conv=True),
-        norm_attr="g_norm_swish_gate", output_gate="native",      # GLA already has the Qwen-style gate
-        init_extra=None,                                           # only the shared weights are copied
-        new_param_names=("gk_proj",), exact_init=False)
+        "deltanet", DeltaNet, description="…",
+        layer_kwargs=lambda cfg: dict(**hidden_relative(cfg), use_beta=True, use_gate=True, qk_norm="l2"),
+        output_gate="native",                                      # the layer already has the Qwen-style gate
+        grouped_values=False,                                      # it has a single num_heads
+        init_extra=lambda layer, src: copy_(layer.b_proj.weight, src["b"], "b_proj"),
+        new_param_names=("b_proj",), exact_init=False)
 
 The init recipe is ``copy_shared_from_gdn`` (q/k/v, convolutions, output gate) followed by
 ``init_extra(layer, src)`` for the recurrence-specific parameters; kernels whose init is

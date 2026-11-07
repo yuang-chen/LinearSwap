@@ -7,9 +7,8 @@ DeltaNet (arXiv:2406.06484) is the delta rule without a forget gate:
 i.e. GDN with ``exp(g_t) ≡ 1``.  The pretrained GDN layers rely on their decay
 (``exp(g_t) < 1``), so this swap is **not** function preserving: everything
 except the decay branch (``in_proj_a``, ``A_log``, ``dt_bias``) is copied and the
-decay is simply dropped.  ``verify.py`` therefore reports a real deviation for
-this kernel and SFT has to recover the function.  It is included as the
-example of an *inexact* swap in the framework (``exact_init=False``).
+decay is simply dropped.  ``linswap verify`` therefore reports a real deviation for
+this kernel and ``linswap distill`` has to recover the function (``exact_init=False``).
 
 q/k/v projections, short convolutions, ``beta`` (``b_proj``), the SiLU-gated
 output norm (``use_gate=True``) and ``o_proj`` map one-to-one; the kernel
@@ -29,5 +28,5 @@ register_fla_kernel(
     grouped_values=False,              # DeltaNet has a single num_heads
     init_extra=lambda layer, src: copy_(layer.b_proj.weight, src["b"], "b_proj"),
     new_param_names=("b_proj",), exact_init=False,
-    notes="Inexact swap: expect a large deviation from HF at init; full SFT is required.",
+    notes="Inexact swap: a large deviation from the backbone at init; distil.",
 )
